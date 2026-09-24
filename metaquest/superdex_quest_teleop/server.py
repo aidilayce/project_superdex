@@ -1,0 +1,504 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""PC-side teleoperation server.
+
+Serves the WebXR client to the Quest browser (and a desktop spectator
+view), receives hand tracking over a WebSocket, runs SuperDex on a
+dedicated physics thread and streams the simulated scene back.
+
+Wire protocol (all WebSocket):
+
+client -> server (JSON text)
+  {"type": "hello", "role": "headset" | "viewer"}
+  {"type": "hands", "head": [px,py,pz,qx,qy,qz,qw],
+   "left":  {"tracked": bool, "p": [75 floats], "q": [100 floats], "r": [25 floats]},
+   "right": {...}}          positions/rotations already in the physics frame
+  {"type": "cmd", "cmd": "load_scene", "scene": "<id>"}
+  {"type": "cmd", "cmd": "reset" | "next_scene" | "prev_scene" |
+                         "record_start" | "record_stop" | "record_toggle"}
+
+server -> client
+  JSON  {"type": "hello", "scenes": [...], ...}
+  JSON  {"type": "geometry", "scene": {...}, "actors": [...]}
+  JSON  {"type": "status", ...}
+  binary state frame: uint32 LE header length, UTF-8 JSON header, zero
+        padding to a 4-byte boundary, then float32 payload:
+        poses (N x 7) | deformable vertices (sum V_i x 3) |
+        contact points (C x 3) | contact forces (C x 3)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import queue
+import ssl
+import struct
+import subprocess
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+from aiohttp import WSMsgType, web
+
+from . import hand_skeleton as hs
+from .scenes import AssetRoots, SceneSpec, scene_registry
+from .session import TeleopSession
+
+log = logging.getLogger("superdex_quest_teleop")
+
+WEB_DIR = Path(__file__).resolve().parent / "web"
+THREE_CDN = "https://cdn.jsdelivr.net/npm/three@0.160.0/"
+INPUT_TIMEOUT = 0.5  # [s] without hand messages -> hands untracked
+DISPLAY_CONTACTS = 256
+DISPLAY_CONTACT_EVERY = 6  # steps, when not recording
+
+
+@dataclass
+class ServerConfig:
+    host: str = "0.0.0.0"
+    port: int = 8443
+    https: bool = False
+    cert_dir: Path = Path.home() / ".superdex_quest_teleop"
+    out_dir: Path = Path("recordings")
+    scene: str = "box_and_blocks"
+    contact_mode: str = "hand"
+    min_contact_force: float = 0.0
+    keep_self_contacts: bool = False
+    hand_variant: str = "lowpoly"
+    stream_hz: float = 60.0
+    num_threads: int = -1
+    synthetic: bool = False  # drive the right hand with a scripted grasp
+    autostart_record: bool = False
+
+
+# ----------------------------------------------------------------------------
+# Physics thread
+# ----------------------------------------------------------------------------
+
+
+class PhysicsRunner(threading.Thread):
+    """Owns every SuperDex object; runs the fixed-step loop in real time."""
+
+    def __init__(self, config: ServerConfig, roots: AssetRoots, publish) -> None:
+        super().__init__(name="superdex-physics", daemon=True)
+        self.config = config
+        self.roots = roots
+        self.publish = publish  # (kind, payload) -> None, thread-safe
+        self.registry: dict[str, SceneSpec] = scene_registry(roots)
+        self.commands: queue.Queue = queue.Queue()
+        self.session: TeleopSession | None = None
+        self.running = True
+        self.rtf = 1.0
+        self._last_input_time = 0.0
+        self._synthetic = None
+        self._geometry_message: dict | None = None
+        self.ready = threading.Event()
+
+    # Thread-safe entry points ----------------------------------------------
+
+    def submit(self, command: dict) -> None:
+        self.commands.put(command)
+
+    def set_hands(self, hands: dict[str, hs.HandFrame], head: np.ndarray | None) -> None:
+        self._last_input_time = time.monotonic()
+        session = self.session
+        if session is not None and self._synthetic is None:
+            session.set_input(hands, head)
+
+    def scene_list(self) -> list[dict]:
+        return [
+            {"id": s.id, "name": s.name, "category": s.category,
+             "description": s.description, "time_step": s.time_step}
+            for s in self.registry.values()
+        ]
+
+    def geometry_message(self) -> dict | None:
+        return self._geometry_message
+
+    # Physics thread ----------------------------------------------------------
+
+    def run(self) -> None:
+        import superdex.physics as physics
+
+        if not physics.is_initialized():
+            physics.initialize(num_worker_threads=self.config.num_threads)
+        physics.enable_file_cache(True)
+        try:
+            self._load(self.config.scene)
+        except Exception:  # noqa: BLE001
+            log.exception("could not load scene %s", self.config.scene)
+            self._load(next(iter(self.registry)))
+        if self.config.autostart_record:
+            self._record_start()
+        self.ready.set()
+
+        next_time = time.monotonic()
+        stream_period = 1.0 / self.config.stream_hz
+        next_stream = next_time
+        window_sim, window_start = 0.0, time.monotonic()
+        steps_since_contacts = 0
+        while self.running:
+            self._drain_commands()
+            session = self.session
+            if session is None:
+                time.sleep(0.01)
+                continue
+            dt = session.time_step
+            now = time.monotonic()
+            if next_time > now:
+                time.sleep(next_time - now)
+            elif now - next_time > 0.25:
+                next_time = now  # fell behind: slow motion, never spiral
+            next_time += dt
+
+            if self._synthetic is not None:
+                t = session.sim_time
+                session.set_input({"right": self._synthetic.frame(t), "left": hs.HandFrame.untracked()})
+            elif time.monotonic() - self._last_input_time > INPUT_TIMEOUT:
+                session.set_input({side: hs.HandFrame.untracked() for side in session.hands})
+
+            steps_since_contacts += 1
+            want_contacts = steps_since_contacts >= DISPLAY_CONTACT_EVERY
+            try:
+                data = session.step(with_contacts=want_contacts)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("physics step failed")
+                self.publish("status", {"type": "status", "error": f"step failed: {exc}"})
+                self._reset()
+                continue
+            if want_contacts or session.recorder is not None:
+                steps_since_contacts = 0
+
+            window_sim += dt
+            elapsed = time.monotonic() - window_start
+            if elapsed > 1.0:
+                self.rtf = window_sim / elapsed
+                window_sim, window_start = 0.0, time.monotonic()
+
+            if time.monotonic() >= next_stream:
+                next_stream = time.monotonic() + stream_period
+                self.publish("frame", self._encode_frame(session, data))
+
+        if self.session is not None:
+            self._finish_recording()
+            self.session.close()
+
+    def _drain_commands(self) -> None:
+        while True:
+            try:
+                cmd = self.commands.get_nowait()
+            except queue.Empty:
+                return
+            name = cmd.get("cmd")
+            try:
+                if name == "load_scene":
+                    self._load(cmd["scene"])
+                elif name in ("next_scene", "prev_scene"):
+                    ids = list(self.registry)
+                    current = ids.index(self.session.spec.id) if self.session else 0
+                    step = 1 if name == "next_scene" else -1
+                    self._load(ids[(current + step) % len(ids)])
+                elif name == "reset":
+                    self._reset()
+                elif name == "record_start":
+                    self._record_start(cmd.get("metadata"))
+                elif name == "record_stop":
+                    self._finish_recording()
+                elif name == "record_toggle":
+                    if self.session and self.session.recorder:
+                        self._finish_recording()
+                    else:
+                        self._record_start(cmd.get("metadata"))
+                elif name == "stop":
+                    self.running = False
+                else:
+                    log.warning("unknown command %r", name)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("command %r failed", name)
+                self.publish("status", {"type": "status", "error": f"{name} failed: {exc}"})
+
+    def _load(self, scene_id: str) -> None:
+        spec = self.registry[scene_id]
+        self._finish_recording()
+        if self.session is not None:
+            self.session.close()
+            self.session = None
+        self.publish("status", {"type": "status", "message": f"loading {spec.name}..."})
+        t0 = time.monotonic()
+        session = TeleopSession(
+            spec,
+            self.roots,
+            contact_mode=self.config.contact_mode,
+            min_contact_force=self.config.min_contact_force,
+            keep_self_contacts=self.config.keep_self_contacts,
+            hand_variant=self.config.hand_variant,
+        )
+        self._synthetic = None
+        if self.config.synthetic:
+            from .synthetic import ScriptedGrasp
+
+            tops = [r.actor.get_aabb_world().max[1] for r in session.object_records]
+            self._synthetic = ScriptedGrasp(
+                "right",
+                object_top=float(min(max(tops), 0.2)) if tops else 0.05,
+                kinematics=session.hands["right"].kinematics,
+            )
+        self._geometry_message = {
+            "type": "geometry",
+            "scene": {"id": spec.id, "name": spec.name, "description": spec.description,
+                      "time_step": spec.time_step},
+            "actors": [_jsonable_actor(a) for a in session.geometry()],
+        }
+        self.session = session
+        log.info("loaded %s in %.1fs (%d actors)", spec.name, time.monotonic() - t0, len(session.actors))
+        self.publish("geometry", self._geometry_message)
+        self.publish("status", self.status())
+
+    def _reset(self) -> None:
+        if self.session is not None:
+            self._load(self.session.spec.id)
+
+    def _record_start(self, metadata: dict | None = None) -> None:
+        if self.session is None:
+            return
+        meta = {"operator_input": "synthetic" if self._synthetic else "quest_webxr"}
+        meta.update(metadata or {})
+        path = self.session.start_recording(self.config.out_dir, meta)
+        log.info("recording to %s", path)
+        self.publish("status", self.status())
+
+    def _finish_recording(self) -> None:
+        if self.session is None:
+            return
+        result = self.session.stop_recording()
+        if result is not None:
+            path, steps = result
+            log.info("saved %s (%d steps)", path, steps)
+            status = self.status()
+            status["saved"] = str(path)
+            status["saved_steps"] = steps
+            self.publish("status", status)
+
+    def status(self) -> dict:
+        s = self.session
+        return {
+            "type": "status",
+            "scene": s.spec.id if s else None,
+            "recording": bool(s and s.recorder),
+            "file": str(s.recorder.path) if s and s.recorder else None,
+            "contact_mode": self.config.contact_mode,
+        }
+
+    def _encode_frame(self, session: TeleopSession, data: dict) -> bytes:
+        pose = data["pose"].astype(np.float32)
+        verts = [d["surface_positions"].astype(np.float32) for d in data["deformables"]]
+        contacts = session.last_contacts
+        forces = contacts["force"]
+        points = contacts["pos_owner"]
+        if len(forces) > DISPLAY_CONTACTS:
+            keep = np.argsort(-np.einsum("ij,ij->i", forces, forces))[:DISPLAY_CONTACTS]
+            forces, points = forces[keep], points[keep]
+        rec = session.recorder
+        header = {
+            "step": data["step"],
+            "sim_time": round(data["sim_time"], 4),
+            "rtf": round(self.rtf, 3),
+            "recording": rec is not None,
+            "recorded_steps": rec.num_steps if rec else 0,
+            "num_actors": len(pose),
+            "deformables": [[d.index, int(len(v))] for d, v in zip(session.deformables, verts)],
+            "num_contacts": int(len(points)),
+            "total_contacts": int(len(contacts["force"])),
+            "tracked": {side: bool(h["tracked"]) for side, h in data["hands"].items()},
+        }
+        head = json.dumps(header, separators=(",", ":")).encode()
+        pad = (-(4 + len(head))) % 4
+        payload = np.concatenate(
+            [pose.reshape(-1)]
+            + [v.reshape(-1) for v in verts]
+            + [np.asarray(points, np.float32).reshape(-1), np.asarray(forces, np.float32).reshape(-1)]
+        ).astype("<f4")
+        return struct.pack("<I", len(head)) + head + b"\0" * pad + payload.tobytes()
+
+
+def _jsonable_actor(actor: dict) -> dict:
+    out = {k: v for k, v in actor.items() if k not in ("positions", "indices")}
+    if "positions" in actor:
+        out["positions"] = np.round(actor["positions"].astype(np.float64), 5).tolist()
+        out["indices"] = actor["indices"].astype(np.int64).tolist()
+    return out
+
+
+def parse_hands(message: dict) -> tuple[dict[str, hs.HandFrame], np.ndarray | None]:
+    hands = {}
+    for side in hs.SIDES:
+        entry = message.get(side)
+        if not entry or not entry.get("tracked") or len(entry.get("p", ())) != 3 * hs.NUM_JOINTS:
+            hands[side] = hs.HandFrame.untracked()
+            continue
+        hands[side] = hs.HandFrame.from_flat(True, entry["p"], entry.get("q"), entry.get("r"))
+    head = message.get("head")
+    head_pose = np.asarray(head, dtype=np.float64) if head is not None and len(head) == 7 else None
+    return hands, head_pose
+
+
+# ----------------------------------------------------------------------------
+# Web server
+# ----------------------------------------------------------------------------
+
+
+class TeleopServer:
+    def __init__(self, config: ServerConfig, roots: AssetRoots | None = None) -> None:
+        self.config = config
+        self.roots = roots or AssetRoots()
+        self.clients: dict[web.WebSocketResponse, asyncio.Queue] = {}
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.runner = PhysicsRunner(config, self.roots, self._publish_threadsafe)
+
+    # Physics thread -> event loop.
+    def _publish_threadsafe(self, kind: str, payload) -> None:
+        if self.loop is not None and not self.loop.is_closed():
+            self.loop.call_soon_threadsafe(self._broadcast, kind, payload)
+
+    def _broadcast(self, kind: str, payload) -> None:
+        for q in self.clients.values():
+            if kind == "frame":
+                # Frames are lossy: keep only the newest for slow clients.
+                while q.qsize() >= 2:
+                    try:
+                        q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+            q.put_nowait((kind, payload))
+
+    async def _index(self, request: web.Request) -> web.Response:
+        html = (WEB_DIR / "index.html").read_text()
+        vendor = WEB_DIR / "vendor" / "three" / "build" / "three.module.js"
+        base = "/vendor/three/" if vendor.exists() else THREE_CDN
+        return web.Response(text=html.replace("{{THREE_BASE}}", base), content_type="text/html")
+
+    async def _scenes(self, request: web.Request) -> web.Response:
+        return web.json_response(self.runner.scene_list())
+
+    async def _ws(self, request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse(max_msg_size=16 * 1024 * 1024, heartbeat=20)
+        await ws.prepare(request)
+        q: asyncio.Queue = asyncio.Queue()
+        self.clients[ws] = q
+        sender = asyncio.create_task(self._sender(ws, q))
+        await ws.send_json(
+            {"type": "hello", "scenes": self.runner.scene_list(),
+             "out_dir": str(Path(self.config.out_dir).resolve()),
+             "synthetic": self.config.synthetic}
+        )
+        geometry = self.runner.geometry_message()
+        if geometry is not None:
+            await ws.send_json(geometry)
+            await ws.send_json(self.runner.status())
+        role = "viewer"
+        try:
+            async for msg in ws:
+                if msg.type != WSMsgType.TEXT:
+                    continue
+                try:
+                    message = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    continue
+                kind = message.get("type")
+                if kind == "hands":
+                    hands, head = parse_hands(message)
+                    self.runner.set_hands(hands, head)
+                elif kind == "cmd":
+                    self.runner.submit(message)
+                elif kind == "hello":
+                    role = message.get("role", "viewer")
+                    log.info("client connected as %s from %s", role, request.remote)
+        finally:
+            sender.cancel()
+            self.clients.pop(ws, None)
+            log.info("%s disconnected", role)
+        return ws
+
+    async def _sender(self, ws: web.WebSocketResponse, q: asyncio.Queue) -> None:
+        try:
+            while not ws.closed:
+                kind, payload = await q.get()
+                if kind == "frame":
+                    await ws.send_bytes(payload)
+                else:
+                    await ws.send_json(payload)
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
+
+    def make_app(self) -> web.Application:
+        app = web.Application()
+        app.router.add_get("/", self._index)
+        app.router.add_get("/api/scenes", self._scenes)
+        app.router.add_get("/ws", self._ws)
+        app.router.add_static("/static/", WEB_DIR)
+        if (WEB_DIR / "vendor").exists():
+            app.router.add_static("/vendor/", WEB_DIR / "vendor")
+
+        async def on_startup(app: web.Application) -> None:
+            self.loop = asyncio.get_running_loop()
+            self.runner.start()
+
+        async def on_cleanup(app: web.Application) -> None:
+            self.runner.submit({"cmd": "stop"})
+            await asyncio.get_running_loop().run_in_executor(None, self.runner.join, 10.0)
+
+        app.on_startup.append(on_startup)
+        app.on_cleanup.append(on_cleanup)
+        return app
+
+    def ssl_context(self) -> ssl.SSLContext | None:
+        if not self.config.https:
+            return None
+        cert, key = ensure_self_signed_cert(self.config.cert_dir)
+        ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ctx.load_cert_chain(cert, key)
+        return ctx
+
+    def run(self) -> None:
+        web.run_app(
+            self.make_app(),
+            host=self.config.host,
+            port=self.config.port,
+            ssl_context=self.ssl_context(),
+            print=None,
+        )
+
+
+def ensure_self_signed_cert(cert_dir: Path) -> tuple[Path, Path]:
+    """A self-signed certificate for serving WebXR over the LAN (WebXR needs
+    a secure context; the Quest browser lets you accept the warning once)."""
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    cert, key = cert_dir / "cert.pem", cert_dir / "key.pem"
+    if cert.exists() and key.exists():
+        return cert, key
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(key), "-out", str(cert), "-days", "825",
+            "-subj", "/CN=superdex-quest-teleop",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return cert, key

@@ -78,6 +78,8 @@ SuperDex Teleop is the next major module coming to Project SuperDex. Initial com
 
 SuperDex Teleop runs natively on-device on Quest 3. No remote PC, no streaming. Includes support for both hand tracking and controllers including mixed mode. Runs in pure C++ for low-latency, real-time, scalable virtual teleop.
 
+For PC-hosted data collection today, [`metaquest/`](metaquest/README.md) streams Quest hand tracking over WebXR to a PC running SuperDex, drives two physical Meta XR hands in any scene from the asset library, and records per-point contacts and forces to HDF5.
+
 ![Android Teleop](https://github.com/user-attachments/assets/53639e05-5f6c-4cc6-b693-b3ae6e87ff2f)
 
 ---

@@ -1,0 +1,51 @@
+<!doctype html>
+<!--
+  Copyright (c) Meta Platforms, Inc. and affiliates.
+  Licensed under the Apache License, Version 2.0.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SuperDex Quest Teleop</title>
+  <link rel="icon" href="data:,">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "{{THREE_BASE}}build/three.module.js",
+        "three/addons/": "{{THREE_BASE}}examples/jsm/"
+      }
+    }
+  </script>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #15171c;
+      font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; color: #e8e8ea; }
+    #hud { position: absolute; top: 12px; left: 12px; right: 12px; display: flex; flex-wrap: wrap;
+      gap: 8px; align-items: center; pointer-events: none; }
+    #hud > * { pointer-events: auto; }
+    select, button { font: inherit; color: inherit; background: #2a2e37; border: 1px solid #444a57;
+      border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+    button:hover { background: #343945; }
+    button.rec { border-color: #c0392b; }
+    button.rec.on { background: #c0392b; }
+    button.xr { background: #1f6feb; border-color: #1f6feb; }
+    button:disabled { opacity: .45; cursor: default; }
+    #status { position: absolute; left: 12px; bottom: 12px; right: 12px; white-space: pre-wrap;
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; color: #b8bcc6; pointer-events: none; }
+    #desc { color: #9aa0ac; }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <select id="scene" title="Scene"></select>
+    <button id="reset" title="Rebuild the scene (R)">Reset</button>
+    <button id="rec" class="rec" title="Start/stop recording (Space)">● Record</button>
+    <button id="enter-vr" class="xr" disabled>Enter VR</button>
+    <button id="enter-ar" class="xr" disabled>Enter passthrough</button>
+    <span id="desc"></span>
+  </div>
+  <div id="status">connecting…</div>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

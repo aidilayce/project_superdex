@@ -29,3 +29,7 @@ SuperDexStudio.ini
 audit_reports/
 default.profraw
 *.egg-info/
+# Meta Quest teleop example: vendored three.js and recorded episodes
+metaquest/superdex_quest_teleop/web/vendor/
+recordings/
+__pycache__/
