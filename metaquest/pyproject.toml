@@ -29,6 +29,7 @@ dependencies = [
     "numpy",
     "aiohttp>=3.9",
     "h5py>=3.10",
+    "cryptography",  # self-signed HTTPS certificate when the openssl CLI is missing
 ]
 
 [project.optional-dependencies]

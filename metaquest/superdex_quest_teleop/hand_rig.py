@@ -25,6 +25,7 @@ with the scene, so hand/object forces come from the contact solver.
 from __future__ import annotations
 
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 import superdex.physics as physics
@@ -109,6 +110,18 @@ class HandUnit:
         self.num_links = self.kinematics.num_links
         self.link_actors = [scene.get_actor(h) for h in self.actor.get_nested_link_actors()]
         self.link_names = [a.get_name() for a in self.link_actors]
+        # Smooth render meshes (GLB, relative to the oculus_xr asset dir) per
+        # link actor name, for display only.
+        hand_dir = roots.assets / "bots" / "hands" / "oculus_xr"
+        self.render_models: dict[str, str] = {}
+        for link in prefab.links:
+            path = str(link.render_model_file or "")
+            if path:
+                try:
+                    rel = Path(path).resolve().relative_to(hand_dir.resolve())
+                except ValueError:
+                    continue
+                self.render_models[f"{self.name}/{link.name}"] = rel.as_posix()
 
         n = self.num_links
         link_pos = [physics.PoseTrackingParams() for _ in range(n)]

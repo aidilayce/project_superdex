@@ -336,6 +336,15 @@ class TeleopSession:
                 "index": r.index, "name": r.name, "kind": r.kind, "static": r.is_static,
                 "hand": r.hand_side, "deformable": r.deformable, "mesh": r.mesh_kind,
             }
+            if r.hand_side:
+                model = self.hands[r.hand_side].render_models.get(r.name)
+                if model:
+                    # The GLBs are Y-up exports of the Z-up link frames:
+                    # link-frame vertices are the GLB's rotated +90 deg about X.
+                    entry["render"] = {
+                        "url": f"/hand_assets/{model}",
+                        "rotation": [float(np.sin(np.pi / 4)), 0.0, 0.0, float(np.cos(np.pi / 4))],
+                    }
             if r.mesh_kind in ("surface", "visual"):
                 view = r.actor.get_visual_mesh() if r.mesh_kind == "visual" else r.actor.get_surface_mesh()
                 coords = np.asarray(view.coordinates, np.float32)

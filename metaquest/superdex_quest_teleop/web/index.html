@@ -9,6 +9,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SuperDex Quest Teleop</title>
   <link rel="icon" href="data:,">
+  <script>window.SUPERDEX = {{CLIENT_CONFIG}};</script>
   <script type="importmap">
     {
       "imports": {
@@ -20,20 +21,27 @@
   <style>
     :root { color-scheme: dark; }
     html, body { margin: 0; height: 100%; overflow: hidden; background: #15171c;
-      font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; color: #e8e8ea; }
+      font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; color: #e8e8ea; }
     #hud { position: absolute; top: 12px; left: 12px; right: 12px; display: flex; flex-wrap: wrap;
-      gap: 8px; align-items: center; pointer-events: none; }
+      gap: 8px; align-items: center; pointer-events: none; z-index: 2; }
     #hud > * { pointer-events: auto; }
     select, button { font: inherit; color: inherit; background: #2a2e37; border: 1px solid #444a57;
-      border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+      border-radius: 8px; padding: 8px 12px; cursor: pointer; }
     button:hover { background: #343945; }
     button.rec { border-color: #c0392b; }
-    button.rec.on { background: #c0392b; }
-    button.xr { background: #1f6feb; border-color: #1f6feb; }
-    button:disabled { opacity: .45; cursor: default; }
+    button.rec.on, button.on { background: #c0392b; border-color: #c0392b; }
+    button.toggle.on { background: #1f6feb; border-color: #1f6feb; }
+    button.xr { background: #1f6feb; border-color: #1f6feb; font-weight: 600; padding: 10px 18px; }
     #status { position: absolute; left: 12px; bottom: 12px; right: 12px; white-space: pre-wrap;
-      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; color: #b8bcc6; pointer-events: none; }
-    #desc { color: #9aa0ac; }
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; color: #cfd3dc; pointer-events: none;
+      text-shadow: 0 1px 2px #000; z-index: 2; }
+    #desc { color: #b8bdc8; text-shadow: 0 1px 2px #000; }
+    #banner { display: none; position: absolute; top: 72px; left: 50%; transform: translateX(-50%);
+      max-width: min(760px, calc(100% - 32px)); background: #3a1f1f; border: 1px solid #c0392b;
+      border-radius: 10px; padding: 14px 18px; z-index: 3; box-shadow: 0 8px 30px rgba(0,0,0,.5); }
+    #banner.info { background: #1d2a3d; border-color: #1f6feb; }
+    #banner a { color: #8ab4ff; font-weight: 600; }
+    #banner button { float: right; margin: -4px -8px 0 12px; padding: 2px 10px; }
   </style>
 </head>
 <body>
@@ -41,11 +49,37 @@
     <select id="scene" title="Scene"></select>
     <button id="reset" title="Rebuild the scene (R)">Reset</button>
     <button id="rec" class="rec" title="Start/stop recording (Space)">● Record</button>
-    <button id="enter-vr" class="xr" disabled>Enter VR</button>
-    <button id="enter-ar" class="xr" disabled>Enter passthrough</button>
+    <button id="camview" class="toggle" title="See the table from the headset's point of view (V)">Cam view</button>
+    <button id="enter-vr" class="xr">Enter VR</button>
+    <button id="enter-ar" class="xr">Enter passthrough</button>
     <span id="desc"></span>
   </div>
-  <div id="status">connecting…</div>
+  <div id="banner"><button id="banner-close" title="Dismiss">✕</button><div id="banner-text"></div></div>
+  <div id="status">loading…</div>
+  <script>
+    // Plain script (runs even if the module below fails to load): surface
+    // problems instead of leaving dead buttons.
+    (function () {
+      function show(html) {
+        var b = document.getElementById('banner');
+        document.getElementById('banner-text').innerHTML = html;
+        b.className = '';
+        b.style.display = 'block';
+      }
+      window.superdexBanner = show;
+      document.getElementById('banner-close').onclick = function () {
+        document.getElementById('banner').style.display = 'none';
+      };
+      window.addEventListener('error', function (e) {
+        if (!window.superdexAppReady) show('Failed to start the app: ' + (e.message || e.filename || 'script error') +
+          '. Reload the page; if it persists, check the server log.');
+      });
+      setTimeout(function () {
+        if (!window.superdexAppReady) show('The app did not load (three.js modules unreachable?). ' +
+          'Reload the page. The server must be reachable from this device.');
+      }, 8000);
+    })();
+  </script>
   <script type="module" src="/static/app.js"></script>
 </body>
 </html>

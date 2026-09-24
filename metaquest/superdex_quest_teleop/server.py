@@ -72,9 +72,17 @@ DISPLAY_CONTACT_EVERY = 6  # steps, when not recording
 @dataclass
 class ServerConfig:
     host: str = "0.0.0.0"
-    port: int = 8443
-    https: bool = False
+    # Plain HTTP: the desktop viewer and the Quest over USB (`adb reverse`
+    # makes the PC reachable as http://localhost, which WebXR accepts).
+    http_port: int = 8080
+    # HTTPS with a self-signed certificate: the Quest over Wi-Fi. WebXR only
+    # exists on secure pages, so plain-HTTP LAN requests are redirected here.
+    https_port: int = 8443
+    https: bool = True
     cert_dir: Path = Path.home() / ".superdex_quest_teleop"
+    # Optional backdrop: a .glb/.gltf model or an equirectangular 360 photo
+    # (.jpg/.png) of a kitchen; default is the built-in procedural kitchen.
+    environment: Path | None = None
     out_dir: Path = Path("recordings")
     scene: str = "box_and_blocks"
     contact_mode: str = "hand"
@@ -327,6 +335,9 @@ class PhysicsRunner(threading.Thread):
             "total_contacts": int(len(contacts["force"])),
             "tracked": {side: bool(h["tracked"]) for side, h in data["hands"].items()},
         }
+        head_pose = data.get("head_pose")
+        if head_pose is not None and np.all(np.isfinite(head_pose)):
+            header["head"] = [round(float(v), 5) for v in head_pose]
         head = json.dumps(header, separators=(",", ":")).encode()
         pad = (-(4 + len(head))) % 4
         payload = np.concatenate(
@@ -388,10 +399,35 @@ class TeleopServer:
             q.put_nowait((kind, payload))
 
     async def _index(self, request: web.Request) -> web.Response:
+        host = (request.url.host or "").lower()
+        local = host in ("localhost", "127.0.0.1", "::1", "[::1]")
+        if request.secure is False and not local and self.config.https:
+            # WebXR is unavailable on insecure pages: send LAN visitors to HTTPS.
+            raise web.HTTPFound(f"https://{host}:{self.config.https_port}/")
         html = (WEB_DIR / "index.html").read_text()
         vendor = WEB_DIR / "vendor" / "three" / "build" / "three.module.js"
         base = "/vendor/three/" if vendor.exists() else THREE_CDN
-        return web.Response(text=html.replace("{{THREE_BASE}}", base), content_type="text/html")
+        client = {
+            "httpPort": self.config.http_port,
+            "httpsPort": self.config.https_port if self.config.https else None,
+            "environment": self._environment_info(),
+        }
+        html = html.replace("{{THREE_BASE}}", base).replace("{{CLIENT_CONFIG}}", json.dumps(client))
+        return web.Response(text=html, content_type="text/html",
+                            headers={"Cache-Control": "no-cache"})
+
+    def _environment_info(self) -> dict | None:
+        env = self.config.environment
+        if env is None:
+            return None
+        kind = "model" if env.suffix.lower() in (".glb", ".gltf") else "panorama"
+        return {"url": f"/environment/{env.name}", "kind": kind}
+
+    async def _environment(self, request: web.Request) -> web.StreamResponse:
+        env = self.config.environment
+        if env is None or request.match_info["name"] != env.name or not env.exists():
+            raise web.HTTPNotFound()
+        return web.FileResponse(env)
 
     async def _scenes(self, request: web.Request) -> web.Response:
         return web.json_response(self.runner.scene_list())
@@ -451,9 +487,14 @@ class TeleopServer:
         app.router.add_get("/", self._index)
         app.router.add_get("/api/scenes", self._scenes)
         app.router.add_get("/ws", self._ws)
+        app.router.add_get("/environment/{name}", self._environment)
         app.router.add_static("/static/", WEB_DIR)
         if (WEB_DIR / "vendor").exists():
             app.router.add_static("/vendor/", WEB_DIR / "vendor")
+        # Render meshes of the Meta XR hand (read-only, hand assets only).
+        hand_dir = self.roots.assets / "bots" / "hands" / "oculus_xr"
+        if hand_dir.exists():
+            app.router.add_static("/hand_assets/", hand_dir)
 
         async def on_startup(app: web.Application) -> None:
             self.loop = asyncio.get_running_loop()
@@ -475,30 +516,107 @@ class TeleopServer:
         ctx.load_cert_chain(cert, key)
         return ctx
 
+    async def serve(self) -> None:
+        """Serve HTTP (and HTTPS) until cancelled."""
+        runner = web.AppRunner(self.make_app())
+        await runner.setup()
+        sites = [web.TCPSite(runner, self.config.host, self.config.http_port)]
+        try:
+            ctx = self.ssl_context()
+        except Exception as exc:  # noqa: BLE001 - keep serving HTTP
+            log.error("HTTPS disabled (%s); the Quest must connect over USB with adb reverse", exc)
+            ctx = None
+        if ctx is not None:
+            sites.append(web.TCPSite(runner, self.config.host, self.config.https_port, ssl_context=ctx))
+        try:
+            for site in sites:
+                await site.start()
+            await asyncio.Event().wait()
+        finally:
+            await runner.cleanup()
+
     def run(self) -> None:
-        web.run_app(
-            self.make_app(),
-            host=self.config.host,
-            port=self.config.port,
-            ssl_context=self.ssl_context(),
-            print=None,
-        )
+        try:
+            asyncio.run(self.serve())
+        except KeyboardInterrupt:
+            pass
 
 
-def ensure_self_signed_cert(cert_dir: Path) -> tuple[Path, Path]:
-    """A self-signed certificate for serving WebXR over the LAN (WebXR needs
-    a secure context; the Quest browser lets you accept the warning once)."""
+def ensure_self_signed_cert(cert_dir: Path, addresses: list[str] | None = None) -> tuple[Path, Path]:
+    """A self-signed certificate for serving WebXR over the LAN (WebXR needs a
+    secure context; the Quest browser lets you accept the warning once). It
+    lists this machine's addresses so browsers only warn about the issuer."""
     cert_dir.mkdir(parents=True, exist_ok=True)
     cert, key = cert_dir / "cert.pem", cert_dir / "key.pem"
-    if cert.exists() and key.exists():
+    names = sorted(set(["127.0.0.1"] + (addresses if addresses is not None else lan_addresses())))
+    stamp = cert_dir / "cert.names"
+    if cert.exists() and key.exists() and stamp.exists() and stamp.read_text() == ",".join(names):
         return cert, key
-    subprocess.run(
-        [
-            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-            "-keyout", str(key), "-out", str(cert), "-days", "825",
-            "-subj", "/CN=superdex-quest-teleop",
-        ],
-        check=True,
-        capture_output=True,
-    )
+    san = ",".join(["DNS:localhost"] + [f"IP:{a}" for a in names])
+    try:
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(key), "-out", str(cert), "-days", "825",
+                "-subj", "/CN=superdex-quest-teleop", "-addext", f"subjectAltName={san}",
+            ],
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        _self_signed_with_cryptography(cert, key, names)
+    stamp.write_text(",".join(names))
     return cert, key
+
+
+def _self_signed_with_cryptography(cert: Path, key: Path, addresses: list[str]) -> None:
+    """Fallback when the openssl CLI is missing (e.g. Windows)."""
+    import datetime
+    import ipaddress
+
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+    except ImportError as exc:
+        raise RuntimeError(
+            "HTTPS needs either the `openssl` command or `pip install cryptography`"
+        ) from exc
+    private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "superdex-quest-teleop")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    alt = [x509.DNSName("localhost")] + [x509.IPAddress(ipaddress.ip_address(a)) for a in addresses]
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name).issuer_name(name)
+        .public_key(private.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=825))
+        .add_extension(x509.SubjectAlternativeName(alt), critical=False)
+        .sign(private, hashes.SHA256())
+    )
+    key.write_bytes(private.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption()))
+    cert.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+
+
+def lan_addresses() -> list[str]:
+    """IPv4 addresses other devices on the LAN can reach this PC at."""
+    import socket
+
+    addresses = set()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))
+            addresses.add(s.getsockname()[0])
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            addresses.add(info[4][0])
+    except OSError:
+        pass
+    return sorted(a for a in addresses if not a.startswith("127."))

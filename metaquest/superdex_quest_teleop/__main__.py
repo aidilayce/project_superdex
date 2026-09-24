@@ -18,23 +18,11 @@ from __future__ import annotations
 
 import argparse
 import logging
-import socket
 from pathlib import Path
 
 from .scenes import AssetRoots, default_repo_root, scene_registry
-from .server import ServerConfig, TeleopServer
+from .server import ServerConfig, TeleopServer, lan_addresses
 from .session import CONTACT_MODES
-
-
-def _lan_addresses() -> list[str]:
-    addresses = set()
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("10.255.255.255", 1))
-            addresses.add(s.getsockname()[0])
-    except OSError:
-        pass
-    return sorted(a for a in addresses if not a.startswith("127."))
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -46,10 +34,14 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--scene", default="box_and_blocks", help="initial scene id (see --list-scenes)")
     parser.add_argument("--list-scenes", action="store_true", help="print the available scenes and exit")
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8443)
-    parser.add_argument("--https", action="store_true",
-                        help="serve over HTTPS with a self-signed certificate (Wi-Fi use; "
-                        "not needed with `adb reverse` over USB)")
+    parser.add_argument("--http-port", "--port", type=int, default=8080,
+                        help="plain HTTP port (desktop viewer, Quest over USB via adb reverse)")
+    parser.add_argument("--https-port", type=int, default=8443,
+                        help="HTTPS port with a self-signed certificate (Quest over Wi-Fi)")
+    parser.add_argument("--no-https", action="store_true", help="serve plain HTTP only")
+    parser.add_argument("--environment", type=Path, default=None,
+                        help="backdrop instead of the built-in kitchen: a .glb/.gltf model or an "
+                        "equirectangular 360 photo (.jpg/.png), e.g. of your own kitchen")
     parser.add_argument("--out", type=Path, default=Path("recordings"), help="episode output directory")
     parser.add_argument("--contacts", choices=CONTACT_MODES, default="hand",
                         help="hand: contacts involving the hands; all: also object/object and object/table")
@@ -81,10 +73,14 @@ def main(argv: list[str] | None = None) -> None:
     if args.scene not in registry:
         parser.error(f"unknown scene {args.scene!r}; use --list-scenes")
 
+    if args.environment is not None and not args.environment.is_file():
+        parser.error(f"environment file not found: {args.environment}")
     config = ServerConfig(
         host=args.host,
-        port=args.port,
-        https=args.https,
+        http_port=args.http_port,
+        https_port=args.https_port,
+        https=not args.no_https,
+        environment=args.environment.resolve() if args.environment else None,
         out_dir=args.out,
         scene=args.scene,
         contact_mode=args.contacts,
@@ -96,14 +92,14 @@ def main(argv: list[str] | None = None) -> None:
         synthetic=args.synthetic,
         autostart_record=args.record,
     )
-    scheme = "https" if args.https else "http"
     print("SuperDex Quest teleop server")
-    print(f"  desktop viewer : {scheme}://localhost:{args.port}/")
-    print(f"  Quest over USB : adb reverse tcp:{args.port} tcp:{args.port}, "
-          f"then open http://localhost:{args.port}/ in the Quest browser")
-    for address in _lan_addresses():
-        print(f"  Quest over LAN : {scheme}://{address}:{args.port}/"
-              + ("" if args.https else "   (needs --https for WebXR)"))
+    print(f"  desktop viewer : http://localhost:{args.http_port}/")
+    print(f"  Quest over USB : adb reverse tcp:{args.http_port} tcp:{args.http_port}, then open "
+          f"http://localhost:{args.http_port}/ in the Quest browser")
+    if not args.no_https:
+        for address in lan_addresses():
+            print(f"  Quest over LAN : https://{address}:{args.https_port}/   "
+                  "(accept the self-signed certificate once: Advanced -> Proceed)")
     print(f"  recordings     : {args.out.resolve()}")
     TeleopServer(config, roots).run()
 

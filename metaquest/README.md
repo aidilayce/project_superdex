@@ -46,15 +46,13 @@ From the repository root:
 
 ```bash
 uv venv
-uv pip install superdex aiohttp h5py      # or: uv pip install -e metaquest
+uv pip install superdex aiohttp h5py cryptography   # or: uv pip install -e metaquest
 cd metaquest
 uv run --no-project python -m superdex_quest_teleop --list-scenes
 ```
 
-By default the client loads three.js from `cdn.jsdelivr.net`, so the headset
-needs internet access. On an offline or locked-down network, run
-`python metaquest/tools/vendor_three.py` once and the PC serves three.js
-itself.
+The PC serves everything the headset needs, including a bundled copy of
+three.js, so the headset doesn't need internet access.
 
 ## Run
 
@@ -63,34 +61,43 @@ cd metaquest
 uv run --no-project python -m superdex_quest_teleop --scene duck_lamp --out ../recordings
 ```
 
-On startup, the server prints the URLs to open.
+The server listens on two ports and prints the URLs to open:
 
-**Over USB (recommended: low latency, no certificate).** WebXR only runs on
-`https://` or `http://localhost` pages, and `adb reverse` makes the PC reachable
-as `localhost` from the headset:
+* `http://…:8080`: the desktop viewer, and the Quest over USB.
+* `https://…:8443`: the Quest over Wi-Fi. The server creates a self-signed
+  certificate for this PC's IP addresses on first use.
+
+WebXR, and therefore hand tracking and the **Enter VR** button, only works on
+`https://` pages or on `http://localhost`. If the Quest opens
+`http://<pc-ip>:8080`, it is redirected to the HTTPS address.
+
+**Over Wi-Fi.** On the Quest, open `https://<pc-ip>:8443/`. The first time,
+the browser warns about the certificate: tap *Advanced → Proceed*. Then tap
+**Enter VR**, or **Enter passthrough** on Quest 3 to overlay the table on your
+room. Allow hand tracking when the browser asks, and put the controllers
+down. Use 5 GHz or 6 GHz Wi-Fi.
+
+**Over USB (lowest latency, no certificate).**
 
 ```bash
-adb reverse tcp:8443 tcp:8443
+adb reverse tcp:8080 tcp:8080
 ```
 
-In the Quest browser, open `http://localhost:8443/` and tap **Enter VR** (or
-**Enter passthrough** to overlay the table on your room on Quest 3).
+Then open `http://localhost:8080/` in the Quest browser.
 
-**Over Wi-Fi.** Start the server with `--https`. It creates a self-signed
-certificate on first use. Open `https://<pc-ip>:8443/` on the Quest and accept
-the certificate warning once. Use 5 GHz or 6 GHz Wi-Fi.
-
-**Without a headset.** Open `http://localhost:8443/` on the PC to watch. Add
+**Without a headset.** Open `http://localhost:8080/` on the PC to watch. Add
 `--synthetic` and a scripted Quest-format hand reaches, grasps, lifts and
 releases the object, which exercises the whole pipeline.
 
 ### In the headset
 
 When the session starts, the virtual table (the physics origin) is placed
-0.42 m in front of your eyes and 0.5 m below them, facing where you look. Your
-real hands appear as small blue joint spheres. The simulated Meta XR hands
-follow them physically. They stop at objects instead of passing through, so
-what you feel visually matches the forces being recorded.
+0.42 m in front of your eyes and 0.5 m below them, facing where you look. It
+is drawn as the butcher-block top of an island in a kitchen. Your real hands
+appear as small blue joint spheres ("ghost"). The simulated Meta XR hands
+(skin-textured, with forearms) follow them physically. They stop at objects
+instead of passing through, so what you see matches the forces being
+recorded.
 
 A button panel floats to the left of the table. Poke a button with an index
 fingertip:
@@ -100,12 +107,51 @@ fingertip:
 | ● Rec / ■ Stop | Start or stop recording an episode |
 | Reset | Rebuild the current scene |
 | ◀ Scene / Scene ▶ | Previous or next scene |
-| Recenter | Move the table in front of you again |
+| Cam view | Put the table back in front of you (re-center on your current view) |
 | Table ▲ / ▼ | Raise or lower the table by 3 cm |
 | Contacts | Show or hide contact points and force vectors |
+| Ghost | Show or hide your tracked joints |
+| Exit VR | Leave the immersive session |
 
-In the desktop view: scene menu, Reset, Record, `Space` records, `R` resets,
-`N`/`P` changes scene, `C` toggles contacts.
+The panel also shows the scene, the simulation's real-time factor, the
+headset frame rate and the recording state. It warns when no hands are
+tracked, for example while you still hold the controllers.
+
+**Desktop view:** a scene menu, **Reset**, **Record** and **Cam view**. Cam
+view looks through the operator's eyes: it follows the headset live while one
+is connected; otherwise it shows the default operator viewpoint. Dragging the
+view returns to orbiting.
+
+Keys: `Space` records, `R` resets, `V` toggles Cam view, `N`/`P` changes
+scene, `C` toggles contacts.
+
+### Environment
+
+By default, the scene is a procedural kitchen: counters with a sink and a
+cooktop, cabinets, a tiled backsplash, a window, a fridge, shelves and pendant
+lights. The physics table is the kitchen island. Passthrough mode hides the
+kitchen so you see your real room.
+
+To use your own kitchen instead, pass either of these to `--environment`:
+
+* an equirectangular 360° photo (`.jpg` or `.png`, for example from a phone's
+  panorama mode or a 360 camera), taken from where you stand;
+* a `.glb` or `.gltf` model, whose origin is placed on the floor under the
+  table center with -Z facing away from you.
+
+```bash
+uv run --no-project python -m superdex_quest_teleop --environment ~/my_kitchen_360.jpg
+```
+
+### Troubleshooting
+
+| Symptom | Fix |
+| :-- | :-- |
+| **Enter VR** shows "WebXR only works on secure pages" | Open the `https://<pc-ip>:8443/` address (accept the certificate), or use USB with `adb reverse` and `http://localhost:8080/` |
+| The certificate page keeps coming back | The PC's IP changed. Restart the server: it re-issues the certificate for the new address |
+| In VR, but the simulated hands don't move | Put the controllers down. Turn on *Settings → Movement tracking → Hand and body tracking*. Allow hand tracking when the browser asks. The panel says "No hands" or "Put the controllers down" when this is the problem |
+| Hands move, but jerkily or late | Use USB or 5/6 GHz Wi-Fi. Check the RTF in the HUD: below 1 means the PC can't simulate the scene in real time |
+| "Not connected to the PC" | The PC firewall must allow TCP 8080 and 8443 |
 
 ### Options
 
@@ -119,7 +165,9 @@ In the desktop view: scene menu, Reset, Record, `Space` records, `R` resets,
 | `--hand-mesh lowpoly\|highpoly` | `lowpoly` | Meta XR hand collision mesh |
 | `--record` | off | Start recording immediately |
 | `--synthetic` | off | Scripted right hand instead of the headset |
-| `--https` | off | Self-signed HTTPS for Wi-Fi use |
+| `--http-port N` / `--https-port N` | `8080` / `8443` | Listening ports |
+| `--no-https` | off | Serve plain HTTP only |
+| `--environment FILE` | built-in kitchen | 360° photo or `.glb` model shown around the table |
 | `--threads N` | `-1` | SuperDex worker threads |
 
 ## Scenes

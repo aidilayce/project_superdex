@@ -40,7 +40,16 @@ def test_headset_protocol_and_recording(roots, tmp_path):
         server = TeleopServer(ServerConfig(scene="cube", out_dir=tmp_path), roots)
         async with TestClient(TestServer(server.make_app())) as client:
             index = await client.get("/")
-            assert "importmap" in await index.text()
+            html = await index.text()
+            assert "importmap" in html and "/vendor/three/" in html  # three.js served locally
+            assert '"httpsPort": 8443' in html
+            # WebXR needs a secure page: plain-HTTP LAN visitors go to HTTPS.
+            lan = await client.get("/", headers={"Host": "192.168.1.20:8080"}, allow_redirects=False)
+            assert lan.status == 302 and lan.headers["Location"] == "https://192.168.1.20:8443/"
+            for path in ("/static/app.js", "/static/kitchen.js", "/static/skin.js",
+                         "/vendor/three/build/three.module.js",
+                         "/vendor/three/examples/jsm/loaders/GLTFLoader.js"):
+                assert (await client.get(path)).status == 200, path
             ws = await client.ws_connect("/ws")
             await ws.send_json({"type": "hello", "role": "headset"})
             hello = await ws.receive_json(timeout=60)
@@ -78,6 +87,9 @@ def test_headset_protocol_and_recording(roots, tmp_path):
                         saved = data["saved"]
                 await asyncio.sleep(0.005)
             assert geometry is not None and len(geometry["actors"]) == 40
+            renders = [a["render"]["url"] for a in geometry["actors"] if a.get("render")]
+            assert len(renders) == 38  # every link of both hands has a smooth mesh
+            assert (await client.get(renders[0])).status == 200
             await ws.close()
         return saved
 
@@ -86,5 +98,19 @@ def test_headset_protocol_and_recording(roots, tmp_path):
 
     with h5py.File(saved) as f:
         assert f.attrs["num_steps"] > 60
+        assert np.allclose(f["head/pose"][-1], [0.0, 0.5, 0.45, 0.0, 0.0, 0.0, 1.0])
         assert np.isfinite(f["head/pose"][-1]).all()
         assert f["hands/right/tracked"][-1]
+
+
+def test_self_signed_certificate_lists_addresses(tmp_path):
+    import subprocess
+
+    from superdex_quest_teleop.server import ensure_self_signed_cert
+
+    cert, key = ensure_self_signed_cert(tmp_path, ["192.168.1.20"])
+    assert cert.exists() and key.exists()
+    text = subprocess.run(["openssl", "x509", "-in", str(cert), "-noout", "-text"],
+                          capture_output=True, text=True).stdout
+    if text:  # openssl CLI available
+        assert "192.168.1.20" in text and "localhost" in text

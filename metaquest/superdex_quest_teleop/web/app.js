@@ -5,61 +5,131 @@
 // with hand tracking, streams both 25-joint hand skeletons (in the physics
 // frame) to the PC, and renders the simulated scene the PC streams back. On
 // a desktop browser the same page is a spectator view with the same
-// controls.
+// controls, including a "Cam view" that looks through the headset.
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { buildKitchen, makeIsland } from './kitchen.js';
+import { makeSkinMaterial } from './skin.js';
 
+const CONFIG = window.SUPERDEX || {};
 const JOINTS = 25;
 const TIP_INDEX = 9;              // index-finger-tip
 const SEND_PERIOD_MS = 1000 / 72; // hand message rate cap
-const TABLE_BELOW_HEAD = 0.5;     // [m] default table height below the eyes
+const TABLE_BELOW_HEAD = 0.5;     // [m] table height below the eyes on recenter
 const TABLE_AHEAD = 0.42;         // [m] table center in front of the eyes
+const DESKTOP_TABLE_HEIGHT = 0.9; // [m] kitchen counter height
+// Where the operator's eyes are, in the physics frame, right after a recenter.
+const DEFAULT_HEAD = new THREE.Vector3(0, TABLE_BELOW_HEAD, TABLE_AHEAD);
+
+// --------------------------------------------------------------------------
+// Messages
+// --------------------------------------------------------------------------
+
+function banner(html, kind = 'error') {
+  const b = document.getElementById('banner');
+  document.getElementById('banner-text').innerHTML = html;
+  b.className = kind === 'info' ? 'info' : '';
+  b.style.display = 'block';
+}
+function hideBanner() { document.getElementById('banner').style.display = 'none'; }
+
+let flashText = '', flashUntil = 0;
+function flash(text) { flashText = text; flashUntil = performance.now() + 5000; }
+
+function isLocalHost() {
+  return ['localhost', '127.0.0.1', '[::1]', '::1'].includes(location.hostname);
+}
+function secureContextHelp() {
+  const https = CONFIG.httpsPort ? `https://${location.hostname}:${CONFIG.httpsPort}/` : null;
+  const http = CONFIG.httpPort || location.port || 8080;
+  return 'WebXR (and hand tracking) only works on secure pages. ' +
+    (https ? `On the Quest open <a href="${https}">${https}</a> and accept the certificate warning once ` +
+      '(<i>Advanced → Proceed</i>), or ' : '') +
+    `connect by USB: run <code>adb reverse tcp:${http} tcp:${http}</code> on the PC and open ` +
+    `<code>http://localhost:${http}/</code> in the Quest browser.`;
+}
 
 // --------------------------------------------------------------------------
 // Renderer and scene graph
 // --------------------------------------------------------------------------
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.8;
 renderer.xr.enabled = true;
 renderer.xr.setReferenceSpaceType('local-floor');
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-const background = new THREE.Color(0x15171c);
+const background = new THREE.Color(0xb9c6d2);
 scene.background = background;
-scene.add(new THREE.HemisphereLight(0xffffff, 0x404050, 1.6));
-const sun = new THREE.DirectionalLight(0xffffff, 1.6);
-sun.position.set(0.6, 2.0, 1.0);
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.04).texture;
+scene.add(new THREE.HemisphereLight(0xfff6ea, 0x8a7a68, 0.45));
+const sun = new THREE.DirectionalLight(0xfff1dc, 1.1);
+sun.position.set(-1.0, 2.6, -1.2);
 scene.add(sun);
 
-const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.01, 50);
-camera.position.set(0, 1.35, 0.75);
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.01, 60);
+camera.position.set(0, 1.55, 0.85);
 const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, DESKTOP_TABLE_HEIGHT, -0.05);
+controls.update();
 
-// Physics frame (Y-up, meters, table top at y = 0). Its placement in the
-// room is the workspace anchor; everything simulated lives under it.
+// Physics frame (Y-up, meters, table top at y = 0). Its placement in the room
+// is the workspace anchor; everything simulated lives under it.
 const workspace = new THREE.Group();
 workspace.matrixAutoUpdate = false;
 scene.add(workspace);
-let anchor = new THREE.Matrix4().makeTranslation(0, 0.8, 0);
-setAnchor(anchor);
-controls.target.set(0, 0.8, 0);
-controls.update();
 
+const kitchen = buildKitchen();
+kitchen.group.matrixAutoUpdate = false;
+scene.add(kitchen.group);
+const island = makeIsland();
+workspace.add(island.group);
+
+let anchor = new THREE.Matrix4();
 function setAnchor(m) {
   anchor = m.clone();
   workspace.matrix.copy(anchor);
   workspace.matrixWorldNeedsUpdate = true;
+  // The kitchen stands on the floor under the table, turned with it.
+  const p = new THREE.Vector3().setFromMatrixPosition(anchor);
+  const yaw = Math.atan2(anchor.elements[8], anchor.elements[10]);
+  kitchen.group.matrix.makeRotationY(yaw).setPosition(p.x, 0, p.z);
+  kitchen.group.matrixWorldNeedsUpdate = true;
+  island.setHeight(p.y);
 }
+setAnchor(new THREE.Matrix4().makeTranslation(0, DESKTOP_TABLE_HEIGHT, 0));
 
-const table = new THREE.Mesh(
-  new THREE.BoxGeometry(1.0, 0.03, 0.7),
-  new THREE.MeshStandardMaterial({ color: 0x6b5b4b, roughness: 0.85 }));
-table.position.y = -0.015;
-workspace.add(table);
+// Optional user-supplied backdrop (e.g. a scan or a 360 photo of a kitchen).
+if (CONFIG.environment) {
+  const env = CONFIG.environment;
+  if (env.kind === 'panorama') {
+    new THREE.TextureLoader().load(env.url, (texture) => {
+      texture.colorSpace = THREE.SRGBColorSpace;
+      const sphere = new THREE.SphereGeometry(20, 64, 32);
+      sphere.scale(-1, 1, 1);  // faces inward, image not mirrored
+      const dome = new THREE.Mesh(sphere, new THREE.MeshBasicMaterial({ map: texture, toneMapped: false }));
+      dome.position.y = 1.6;
+      kitchen.room.visible = false;
+      kitchen.group.add(dome);
+      flash(`environment: ${env.url}`);
+    }, undefined, () => banner(`Could not load the environment panorama ${env.url}.`));
+  } else {
+    new GLTFLoader().load(env.url, (gltf) => {
+      kitchen.room.visible = false;
+      kitchen.group.add(gltf.scene);
+      flash(`environment: ${env.url}`);
+    }, undefined, () => banner(`Could not load the environment model ${env.url}.`));
+  }
+}
 
 const actorRoot = new THREE.Group();
 workspace.add(actorRoot);
@@ -83,10 +153,11 @@ let showContacts = true;
 // Raw tracked joints (the operator's real hands) as small ghost spheres.
 const ghost = new THREE.InstancedMesh(
   new THREE.SphereGeometry(0.004, 8, 6),
-  new THREE.MeshBasicMaterial({ color: 0x7fd3ff, transparent: true, opacity: 0.55 }), 2 * JOINTS);
+  new THREE.MeshBasicMaterial({ color: 0x7fd3ff, transparent: true, opacity: 0.5 }), 2 * JOINTS);
 ghost.count = 0;
 ghost.frustumCulled = false;
 scene.add(ghost);
+let showGhost = true;
 
 // --------------------------------------------------------------------------
 // Scene geometry from the server
@@ -98,14 +169,49 @@ let currentScene = null;
 let lastHeader = null;
 let statusInfo = { recording: false };
 
+const skin = makeSkinMaterial();
+const gltfLoader = new GLTFLoader();
+const renderMeshCache = new Map();  // url -> Promise<BufferGeometry>
+
+function loadRenderGeometry(url) {
+  if (!renderMeshCache.has(url)) {
+    renderMeshCache.set(url, new Promise((resolve, reject) => {
+      gltfLoader.load(url, (gltf) => {
+        let geometry = null;
+        gltf.scene.traverse((o) => { if (!geometry && o.isMesh) geometry = o.geometry; });
+        geometry ? resolve(geometry) : reject(new Error('no mesh'));
+      }, undefined, reject);
+    }));
+  }
+  return renderMeshCache.get(url);
+}
+
+// Display-only forearm behind the wrist link (the hand model ends at the
+// wrist). Right wrist frame: fingers along +Y, palm width along X, back of
+// the hand toward -Z; the left asset is mirrored (fingers along -Y).
+function makeForearm(side) {
+  const length = 0.16;
+  const geometry = new THREE.CylinderGeometry(0.92, 1.15, length, 28);
+  geometry.translate(0, -length / 2 + 0.02, 0);
+  const forearm = new THREE.Mesh(geometry, skin);
+  forearm.scale.set(0.029, 1, 0.021);
+  forearm.position.z = -0.011;
+  const holder = new THREE.Group();
+  holder.add(forearm);
+  if (side === 'left') holder.rotation.x = Math.PI;
+  return holder;
+}
+
 const PALETTE = [0xe4572e, 0x29a19c, 0xf3a712, 0x6c8ead, 0xa8c686, 0xd183c9, 0x4f86c6, 0xf08a4b];
 function colorFor(name) {
   let h = 0;
   for (const c of name) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-  if (/block_red|red/i.test(name)) return 0xd64541;
+  if (/red/i.test(name)) return 0xd64541;
   if (/green/i.test(name)) return 0x4caf50;
   if (/blue/i.test(name)) return 0x3f7fd6;
   if (/yellow/i.test(name)) return 0xf2c230;
+  if (/duck/i.test(name)) return 0xf5c518;
+  if (/cup/i.test(name)) return 0xf1eee6;
   return PALETTE[h % PALETTE.length];
 }
 
@@ -114,30 +220,45 @@ function buildGeometry(msg) {
   actors = [];
   currentScene = msg.scene;
   document.getElementById('desc').textContent = msg.scene.description || '';
-  const sel = document.getElementById('scene');
-  sel.value = msg.scene.id;
+  document.getElementById('scene').value = msg.scene.id;
   for (const a of msg.actors) {
     const entry = { object: null, deformable: a.deformable };
+    const hand = a.hand !== '';
     if (a.mesh === 'surface' || a.mesh === 'visual') {
       const g = new THREE.BufferGeometry();
       g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(a.positions), 3));
       g.setIndex(a.indices);
       g.computeVertexNormals();
-      const hand = a.hand !== '';
-      const mat = new THREE.MeshStandardMaterial({
-        color: hand ? 0xd9a88b : (a.static ? 0x9aa0a8 : colorFor(a.name)),
-        roughness: hand ? 0.6 : 0.5,
+      const material = hand ? skin : new THREE.MeshStandardMaterial({
+        color: a.static ? 0x9aa0a8 : colorFor(a.name),
+        roughness: 0.45,
         metalness: 0.0,
-        transparent: hand,
-        opacity: hand ? 0.92 : 1.0,
         side: a.deformable ? THREE.DoubleSide : THREE.FrontSide,
-        flatShading: !a.deformable && !hand,
+        flatShading: !a.deformable,
       });
-      const mesh = new THREE.Mesh(g, mat);
+      const mesh = new THREE.Mesh(g, material);
       mesh.frustumCulled = false;
-      if (a.deformable) mesh.matrixAutoUpdate = false;  // world-space vertices
-      actorRoot.add(mesh);
-      entry.object = mesh;
+      if (a.deformable) {
+        mesh.matrixAutoUpdate = false;  // vertices stream in world coordinates
+        actorRoot.add(mesh);
+        entry.object = mesh;
+      } else {
+        const holder = new THREE.Group();
+        holder.add(mesh);
+        actorRoot.add(holder);
+        entry.object = holder;
+        if (hand && /bone_00_wrist_root$/.test(a.name)) holder.add(makeForearm(a.hand));
+        if (hand && a.render) {
+          // Swap the coarse collision mesh for the smooth render mesh.
+          loadRenderGeometry(a.render.url).then((geometry) => {
+            const smooth = new THREE.Mesh(geometry, skin);
+            smooth.quaternion.fromArray(a.render.rotation);
+            smooth.frustumCulled = false;
+            holder.remove(mesh);
+            holder.add(smooth);
+          }).catch(() => {});
+        }
+      }
     }
     actors[a.index] = entry;
   }
@@ -204,10 +325,14 @@ function updateContacts(points, forces, n) {
 // --------------------------------------------------------------------------
 
 let ws = null;
+let connected = false;
 function connect() {
   ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
   ws.binaryType = 'arraybuffer';
-  ws.onopen = () => ws.send(JSON.stringify({ type: 'hello', role: xrSession ? 'headset' : 'viewer' }));
+  ws.onopen = () => {
+    connected = true;
+    ws.send(JSON.stringify({ type: 'hello', role: xrSession ? 'headset' : 'viewer' }));
+  };
   ws.onmessage = (event) => {
     if (typeof event.data !== 'string') { applyFrame(event.data); return; }
     const msg = JSON.parse(event.data);
@@ -233,7 +358,7 @@ function connect() {
       rec.textContent = statusInfo.recording ? '■ Stop' : '● Record';
     }
   };
-  ws.onclose = () => { flash('disconnected, retrying…'); setTimeout(connect, 1000); };
+  ws.onclose = () => { connected = false; flash('disconnected from the PC, retrying…'); setTimeout(connect, 1000); };
 }
 connect();
 
@@ -242,21 +367,51 @@ function send(obj) {
 }
 function command(cmd, extra = {}) { send({ type: 'cmd', cmd, ...extra }); }
 
-let flashText = '', flashUntil = 0;
-function flash(text) { flashText = text; flashUntil = performance.now() + 4000; }
+// --------------------------------------------------------------------------
+// Desktop controls and Cam view
+// --------------------------------------------------------------------------
 
-// --------------------------------------------------------------------------
-// Desktop controls
-// --------------------------------------------------------------------------
+// Cam view: look through the operator's eyes (the streamed headset pose, or
+// the default operator position when no headset is connected).
+let camView = false;
+const _head = new THREE.Matrix4();
+const _target = new THREE.Vector3();
+function setCamView(on) {
+  camView = on;
+  controls.enabled = !on;
+  document.getElementById('camview').classList.toggle('on', on);
+  camera.fov = on ? 80 : 55;
+  camera.updateProjectionMatrix();
+  if (!on) {
+    // Keep looking where the headset looked, orbiting about the table.
+    controls.target.setFromMatrixPosition(anchor);
+    controls.update();
+  }
+}
+function updateCamView() {
+  const head = lastHeader && lastHeader.head;
+  if (head) {
+    _head.compose(new THREE.Vector3(head[0], head[1], head[2]),
+      new THREE.Quaternion(head[3], head[4], head[5], head[6]), new THREE.Vector3(1, 1, 1));
+  } else {
+    _head.lookAt(DEFAULT_HEAD, _target.set(0, 0, -0.05), new THREE.Vector3(0, 1, 0));
+    _head.setPosition(DEFAULT_HEAD);
+  }
+  _head.premultiply(anchor);  // physics -> room
+  _head.decompose(camera.position, camera.quaternion, camera.scale);
+}
+controls.addEventListener('start', () => { if (camView) setCamView(false); });
 
 document.getElementById('scene').onchange = (e) => command('load_scene', { scene: e.target.value });
 document.getElementById('reset').onclick = () => command('reset');
 document.getElementById('rec').onclick = () => command('record_toggle');
+document.getElementById('camview').onclick = () => setCamView(!camView);
 window.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'SELECT') return;
   if (e.code === 'Space') { command('record_toggle'); e.preventDefault(); }
   if (e.key === 'r') command('reset');
   if (e.key === 'c') showContacts = !showContacts;
+  if (e.key === 'v') setCamView(!camView);
   if (e.key === 'n') command('next_scene');
   if (e.key === 'p') command('prev_scene');
 });
@@ -271,46 +426,82 @@ window.addEventListener('resize', () => {
 // --------------------------------------------------------------------------
 
 let xrSession = null;
+let xrMode = null;
 let needsRecenter = false;
 let tableOffset = 0;
+let lastHandsSeen = 0;
 
-async function setupXRButtons() {
-  if (!navigator.xr) {
-    flash(window.isSecureContext ? 'WebXR not available in this browser'
-      : 'WebXR needs https:// or http://localhost (use adb reverse or --https)');
-    return;
+async function initXRButtons() {
+  const onQuest = /OculusBrowser|Quest/i.test(navigator.userAgent);
+  if (!window.isSecureContext) {
+    // Never silently disable the buttons: explain what to open instead.
+    if (onQuest || !isLocalHost()) banner(secureContextHelp(), 'info');
+  } else if (!navigator.xr && onQuest) {
+    banner('This page has no WebXR access. Use the built-in Meta Quest Browser.');
   }
   for (const [id, mode] of [['enter-vr', 'immersive-vr'], ['enter-ar', 'immersive-ar']]) {
     const button = document.getElementById(id);
-    if (await navigator.xr.isSessionSupported(mode).catch(() => false)) {
-      button.disabled = false;
-      button.onclick = () => startXR(mode);
+    button.onclick = () => startXR(mode);
+    if (navigator.xr) {
+      navigator.xr.isSessionSupported(mode).then((ok) => {
+        button.title = ok ? '' : `${mode} is not supported by this browser/device`;
+        if (!ok && mode === 'immersive-ar' && onQuest) button.style.display = 'none';
+      }).catch(() => {});
     }
   }
 }
-setupXRButtons();
+initXRButtons();
+
+async function requestSession(mode) {
+  const features = { optionalFeatures: ['hand-tracking', 'bounded-floor'] };
+  try {
+    return { session: await navigator.xr.requestSession(mode, { requiredFeatures: ['local-floor'], ...features }), space: 'local-floor' };
+  } catch (first) {
+    // Some runtimes lack local-floor: fall back to local (seated) space.
+    const session = await navigator.xr.requestSession(mode, { optionalFeatures: ['local-floor', 'hand-tracking'] });
+    return { session, space: 'local' };
+  }
+}
 
 async function startXR(mode) {
-  if (xrSession) { xrSession.end(); return; }
-  const session = await navigator.xr.requestSession(mode, {
-    requiredFeatures: ['local-floor'],
-    optionalFeatures: ['hand-tracking'],
-  });
-  xrSession = session;
+  if (xrSession) { await xrSession.end(); return; }
+  if (!window.isSecureContext) { banner(secureContextHelp()); return; }
+  if (!navigator.xr) {
+    banner('This browser has no WebXR support. On the headset use the Meta Quest Browser; on a PC, ' +
+      'use the desktop view (the VR buttons need a headset).');
+    return;
+  }
+  let result;
+  try {
+    result = await requestSession(mode);
+  } catch (err) {
+    banner(`Could not start ${mode === 'immersive-ar' ? 'passthrough' : 'VR'}: ${err.message || err}. ` +
+      (isLocalHost() || /Quest/i.test(navigator.userAgent) ? '' : 'Is a headset connected?'));
+    return;
+  }
+  hideBanner();
+  xrSession = result.session;
+  xrMode = mode;
+  renderer.xr.setReferenceSpaceType(result.space);
   scene.background = mode === 'immersive-ar' ? null : background;
-  await renderer.xr.setSession(session);
+  kitchen.group.visible = mode !== 'immersive-ar';  // passthrough shows the real room
+  renderer.xr.setFoveation(1.0);  // cheaper periphery on Quest
+  await renderer.xr.setSession(xrSession);
   needsRecenter = true;
+  lastHandsSeen = performance.now();
   send({ type: 'hello', role: 'headset' });
-  session.addEventListener('end', () => {
+  xrSession.addEventListener('end', () => {
     xrSession = null;
+    xrMode = null;
     scene.background = background;
+    kitchen.group.visible = true;
     ghost.count = 0;
     send({ type: 'hands', left: { tracked: false }, right: { tracked: false } });
   });
 }
 
-// Place the physics origin on a virtual table in front of the operator,
-// yaw-aligned with the head (physics -Z points away from the operator).
+// Place the physics origin on a table in front of the operator, yaw-aligned
+// with the head (physics -Z points away from the operator).
 function recenter(viewerPose) {
   const p = viewerPose.transform.position;
   const q = viewerPose.transform.orientation;
@@ -329,14 +520,16 @@ function recenter(viewerPose) {
 const panel = new THREE.Group();
 panel.visible = false;
 workspace.add(panel);
-panel.position.set(-0.38, 0.22, 0.05);
+panel.position.set(-0.4, 0.2, 0.05);
 panel.rotation.y = 0.45;
 const buttons = [];
 function makeButton(label, x, y, action, w = 0.085, h = 0.04) {
   const canvas = document.createElement('canvas');
   canvas.width = 256; canvas.height = 120;
   const tex = new THREE.CanvasTexture(canvas);
-  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ map: tex, transparent: true }));
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, toneMapped: false }));
   mesh.position.set(x, y, 0);
   panel.add(mesh);
   const b = { mesh, canvas, tex, label, action, w, h, cooldown: 0, lit: 0 };
@@ -359,15 +552,19 @@ const recButton = makeButton('● Rec', -0.047, 0.05, () => command('record_togg
 makeButton('Reset', 0.047, 0.05, () => command('reset'));
 makeButton('◀ Scene', -0.047, 0.0, () => command('prev_scene'));
 makeButton('Scene ▶', 0.047, 0.0, () => command('next_scene'));
-makeButton('Recenter', -0.047, -0.05, () => { tableOffset = 0; needsRecenter = true; });
+makeButton('Cam view', -0.047, -0.05, () => { tableOffset = 0; needsRecenter = true; });
 makeButton('Contacts', 0.047, -0.05, () => { showContacts = !showContacts; });
 makeButton('Table ▲', -0.047, -0.10, () => { tableOffset += 0.03; anchor.elements[13] += 0.03; setAnchor(anchor); });
 makeButton('Table ▼', 0.047, -0.10, () => { tableOffset -= 0.03; anchor.elements[13] -= 0.03; setAnchor(anchor); });
+makeButton('Ghost', -0.047, -0.15, () => { showGhost = !showGhost; });
+makeButton('Exit VR', 0.047, -0.15, () => { if (xrSession) xrSession.end(); });
 const infoCanvas = document.createElement('canvas');
-infoCanvas.width = 512; infoCanvas.height = 160;
+infoCanvas.width = 512; infoCanvas.height = 200;
 const infoTex = new THREE.CanvasTexture(infoCanvas);
-const info = new THREE.Mesh(new THREE.PlaneGeometry(0.18, 0.056), new THREE.MeshBasicMaterial({ map: infoTex, transparent: true }));
-info.position.set(0, 0.11, 0);
+infoTex.colorSpace = THREE.SRGBColorSpace;
+const info = new THREE.Mesh(new THREE.PlaneGeometry(0.18, 0.07),
+  new THREE.MeshBasicMaterial({ map: infoTex, transparent: true, toneMapped: false }));
+info.position.set(0, 0.118, 0);
 panel.add(info);
 let infoKey = '';
 function drawInfo(lines) {
@@ -375,16 +572,17 @@ function drawInfo(lines) {
   if (key === infoKey) return;
   infoKey = key;
   const ctx = infoCanvas.getContext('2d');
-  ctx.clearRect(0, 0, 512, 160);
+  ctx.clearRect(0, 0, 512, 200);
   ctx.fillStyle = 'rgba(20,22,28,0.85)';
-  ctx.beginPath(); ctx.roundRect(0, 0, 512, 160, 18); ctx.fill();
-  ctx.fillStyle = '#e8e8ea';
-  ctx.font = '30px system-ui, sans-serif';
-  lines.forEach((l, i) => ctx.fillText(l, 18, 44 + i * 46));
+  ctx.beginPath(); ctx.roundRect(0, 0, 512, 200, 18); ctx.fill();
+  lines.forEach((l, i) => {
+    ctx.fillStyle = l.startsWith('!') ? '#ffb4a8' : '#e8e8ea';
+    ctx.font = '28px system-ui, sans-serif';
+    ctx.fillText(l.replace(/^!/, ''), 18, 42 + i * 46);
+  });
   infoTex.needsUpdate = true;
 }
 
-const _tip = new THREE.Vector3();
 const _local = new THREE.Vector3();
 function pokeButtons(tips, dt) {
   for (const b of buttons) {
@@ -421,7 +619,6 @@ function readHand(frame, refSpace, source, ghostOffset, tips) {
   const joints = Array.from(hand.values());
   if (joints.length !== JOINTS || !frame.fillPoses(joints, refSpace, poseBuffer)) return { tracked: false };
   frame.fillJointRadii(joints, radiiBuffer);
-  _inv.copy(anchor).invert();
   const p = new Array(3 * JOINTS), q = new Array(4 * JOINTS);
   for (let j = 0; j < JOINTS; j++) {
     _mat.fromArray(poseBuffer, 16 * j);
@@ -437,52 +634,66 @@ function readHand(frame, refSpace, source, ghostOffset, tips) {
 }
 
 let lastTime = performance.now();
+let recDrawn = null;
+let fps = 0, fpsFrames = 0, fpsStart = performance.now();
 renderer.setAnimationLoop((time, frame) => {
   const now = performance.now();
   const dt = (now - lastTime) / 1000;
   lastTime = now;
+  fpsFrames++;
+  if (now - fpsStart > 1000) { fps = fpsFrames * 1000 / (now - fpsStart); fpsFrames = 0; fpsStart = now; }
+  let handHint = '';
   if (frame && xrSession) {
     const refSpace = renderer.xr.getReferenceSpace();
     const viewer = frame.getViewerPose(refSpace);
     if (viewer && needsRecenter) { recenter(viewer); needsRecenter = false; }
+    _inv.copy(anchor).invert();
     const message = { type: 'hands', left: { tracked: false }, right: { tracked: false } };
     const tips = [];
     let offset = 0;
+    let controllers = false;
     for (const source of xrSession.inputSources) {
-      if (!source.hand || (source.handedness !== 'left' && source.handedness !== 'right')) continue;
+      if (!source.hand) { if (source.gamepad) controllers = true; continue; }
+      if (source.handedness !== 'left' && source.handedness !== 'right') continue;
       message[source.handedness] = readHand(frame, refSpace, source, offset, tips);
       if (message[source.handedness].tracked) offset += JOINTS;
     }
-    ghost.count = offset;
+    if (offset > 0) lastHandsSeen = now;
+    else if (now - lastHandsSeen > 2000) {
+      handHint = controllers ? '!Put the controllers down: hands drive the sim'
+        : '!No hands: enable Settings > Hand tracking';
+    }
+    ghost.count = showGhost ? offset : 0;
     ghost.instanceMatrix.needsUpdate = true;
     if (viewer) {
-      _mat.fromArray(viewer.transform.matrix).premultiply(_inv.copy(anchor).invert());
+      _mat.fromArray(viewer.transform.matrix).premultiply(_inv);
       _mat.decompose(_pos, _quat, _scl);
       message.head = [_pos.x, _pos.y, _pos.z, _quat.x, _quat.y, _quat.z, _quat.w];
     }
     if (now - lastSend >= SEND_PERIOD_MS) { send(message); lastSend = now; }
     pokeButtons(tips, dt);
+  } else if (camView) {
+    updateCamView();
   } else {
     controls.update();
   }
   const h = lastHeader;
   const lines = [
     currentScene ? currentScene.name : '…',
-    h ? `t ${h.sim_time.toFixed(1)}s  RTF ${h.rtf.toFixed(2)}  contacts ${h.total_contacts}` : '',
-    statusInfo.recording ? `● REC ${h ? h.recorded_steps : 0} steps` : 'idle',
+    h ? `t ${h.sim_time.toFixed(1)}s  RTF ${h.rtf.toFixed(2)}  contacts ${h.total_contacts}  ${fps.toFixed(0)} fps` : '',
+    statusInfo.recording ? `● REC ${h ? h.recorded_steps : 0} steps` : (connected ? 'idle' : '!not connected to the PC'),
   ];
+  if (handHint) lines.push(handHint);
   drawInfo(lines);
-  if (recButton) drawButtonIfChanged();
+  if (recDrawn !== statusInfo.recording) {
+    recDrawn = statusInfo.recording;
+    drawButton(recButton, statusInfo.recording ? '■ Stop' : '● Rec', statusInfo.recording);
+  }
   const tracked = h ? Object.entries(h.tracked).map(([s, t]) => `${s}:${t ? 'tracked' : '—'}`).join(' ') : '';
   document.getElementById('status').textContent =
-    `${lines.join('   ')}   hands ${tracked}\n` +
-    (now < flashUntil ? flashText : 'Space: record  R: reset  N/P: next/prev scene  C: contacts');
+    `${lines.slice(0, 3).join('   ')}   hands ${tracked}${h && h.head ? '   headset connected' : ''}\n` +
+    (now < flashUntil ? flashText : 'Space: record  R: reset  V: cam view  N/P: next/prev scene  C: contacts');
   renderer.render(scene, camera);
 });
 
-let recDrawn = null;
-function drawButtonIfChanged() {
-  if (recDrawn === statusInfo.recording) return;
-  recDrawn = statusInfo.recording;
-  drawButton(recButton, statusInfo.recording ? '■ Stop' : '● Rec', statusInfo.recording);
-}
+window.superdexAppReady = true;

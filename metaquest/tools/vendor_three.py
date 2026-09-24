@@ -14,11 +14,10 @@
 
 """Download three.js from the npm registry into the web client's vendor dir.
 
-By default the client loads three.js from cdn.jsdelivr.net, which needs the
-headset to reach the internet. Run this once to serve it from the PC instead
-(offline labs, locked-down networks):
+The vendored copy is checked in, so the headset never needs internet access
+(the PC serves everything). Run this only to change the three.js version:
 
-    python metaquest/tools/vendor_three.py
+    python metaquest/tools/vendor_three.py --version 0.160.0
 """
 
 from __future__ import annotations
@@ -30,7 +29,14 @@ import urllib.request
 from pathlib import Path
 
 VERSION = "0.160.0"
-FILES = ("build/three.module.js", "examples/jsm/controls/OrbitControls.js", "LICENSE")
+FILES = (
+    "build/three.module.js",
+    "examples/jsm/controls/OrbitControls.js",
+    "examples/jsm/loaders/GLTFLoader.js",
+    "examples/jsm/utils/BufferGeometryUtils.js",
+    "examples/jsm/environments/RoomEnvironment.js",
+    "LICENSE",
+)
 DEST = Path(__file__).resolve().parents[1] / "superdex_quest_teleop" / "web" / "vendor" / "three"
 
 
