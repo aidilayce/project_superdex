@@ -220,3 +220,45 @@ def test_replay_streams_recorded_frames(roots, tmp_path):
     finally:
         runner.session.close()
         episode.close()
+
+
+def test_mp4_export_commands(roots, tmp_path):
+    """The replay runner's export API encodes JPEG frames into an MP4."""
+    import subprocess
+
+    imageio_ffmpeg = pytest.importorskip("imageio_ffmpeg")
+    from superdex_quest_teleop.replay import Episode, ReplayRunner
+    from superdex_quest_teleop.server import ServerConfig
+    from superdex_quest_teleop.session import TeleopSession
+
+    session = TeleopSession(scene_registry(roots)["cube"], roots)
+    session.start_recording(tmp_path)
+    for _ in range(3):
+        session.step()
+    path, _ = session.stop_recording()
+    session.close()
+    # 12 JPEG frames of ffmpeg's test pattern (odd size: the writer pads it).
+    jpegs = subprocess.run(
+        [imageio_ffmpeg.get_ffmpeg_exe(), "-loglevel", "error", "-f", "lavfi", "-i",
+         "testsrc=size=161x91:rate=12", "-frames:v", "12", "-f", "image2pipe", "-c:v", "mjpeg", "-"],
+        capture_output=True, check=True).stdout
+    frames = [b"\xff\xd8" + part for part in jpegs.split(b"\xff\xd8") if part]
+    assert len(frames) == 12
+
+    episode = Episode(path)
+    runner = ReplayRunner(ServerConfig(environment_auto=False), roots, lambda *_: None, episode)
+    try:
+        started = runner.export_command({"action": "start", "fps": 12})
+        assert started["ok"] and started["path"].endswith(".mp4")
+        for jpeg in frames:
+            runner.export_frame(jpeg)
+        done = runner.export_command({"action": "finish"})
+        assert done["ok"] and done["frames"] == 12 and done["url"].startswith("/exports/")
+        n, seconds = imageio_ffmpeg.count_frames_and_secs(done["path"])
+        assert n == 12 and seconds == pytest.approx(1.0, abs=0.1)
+        assert not runner.export_command({"action": "finish"})["ok"]  # nothing in progress
+        runner.export_command({"action": "start", "fps": 12})
+        aborted = runner.export_command({"action": "abort"})
+        assert aborted["ok"]
+    finally:
+        episode.close()

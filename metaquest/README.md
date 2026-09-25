@@ -413,6 +413,40 @@ with a timeline: play/pause (`Space`), scrub, step (`←`/`→`, with `Shift` 10
 steps) and change the speed. Nothing is simulated: the scene is rebuilt only
 for its meshes, and everything that moves comes from the file.
 
+**Export an MP4.** Click **Export MP4** in the replay bar to render the
+episode as you see it (current view and playback speed, 30 fps). The file is
+written next to the episode and the page offers a download link. From the
+command line, without opening a viewer:
+
+```bash
+uv pip install playwright imageio-ffmpeg        # once (or: pip install -e "metaquest[video]")
+uv run --no-project python -m playwright install chromium   # once; or pass --browser /path/to/chrome
+uv run --no-project python -m superdex_quest_teleop.replay ../recordings/kitchen_sponge_20260925_101500.h5 --mp4
+```
+
+This renders the episode in a headless browser with the same kitchen, hands
+and contact forces, and writes `kitchen_sponge_20260925_101500.mp4` (H.264)
+next to it. Options:
+
+| Flag | Default | Meaning |
+| :-- | :-- | :-- |
+| `--mp4 [OUT.mp4]` | episode name | Render to this file and exit |
+| `--size WxH` | `1920x1080` | Video size |
+| `--fps N` | `30` | Frame rate |
+| `--speed S` | `1` | Playback speed (`0.25`: 4× slow motion) |
+| `--start S` / `--end S` | whole episode | Time range [s] |
+| `--view orbit\|cam` | `orbit` | A fixed camera over the counter, or through the operator's eyes (recorded headset pose) |
+| `--camera PX,PY,PZ,TX,TY,TZ` | `0,1.55,0.75,0.05,0.9,-0.1` | Orbit camera position and target, room coordinates (counter top at y = 0.9 m) |
+| `--no-contacts` | off | Hide contact points and force vectors |
+| `--no-overlay` | off | No scene name / time caption |
+| `--browser PATH` | Playwright's Chromium, then Google Chrome | Browser used for rendering |
+| `-v` | off | Print the page's console |
+
+Every video frame is rendered at its exact recorded step, so the video is
+smooth however slow the rendering is. It is fast with a GPU; on a machine
+without one (e.g. a headless Linux server), WebGL falls back to software
+rendering at about one 1080p frame per second.
+
 **In Python.** Episodes are plain HDF5:
 
 ```python

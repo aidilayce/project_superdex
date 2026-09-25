@@ -84,13 +84,51 @@ class Episode:
 class ReplayRunner(PhysicsRunner):
     """Stands in for the physics thread: streams recorded frames."""
 
-    def __init__(self, config: ServerConfig, roots: AssetRoots, publish, episode: Episode) -> None:
+    def __init__(self, config: ServerConfig, roots: AssetRoots, publish, episode: Episode,
+                 export_path: Path | None = None) -> None:
         super().__init__(config, roots, publish)
         self.episode = episode
         self.cursor = 0
         self.playing = True
         self.speed = 1.0
         self.loop = True
+        # MP4 export: the viewer renders frames, this encodes them.
+        self.export_path = export_path
+        self.export_dir = (export_path or episode.path).resolve().parent
+        self._writer = None
+
+    # MP4 export (called from the web server's event loop, in order) ----------
+
+    def export_command(self, message: dict) -> dict:
+        from .video import Mp4Writer
+
+        action = message.get("action")
+        try:
+            if action == "start":
+                if self._writer is not None:
+                    self._writer.abort()
+                path = self.export_path or _free_name(self.episode.path.with_suffix(".mp4"))
+                self._writer = Mp4Writer(path, float(message.get("fps", 30)))
+                log.info("exporting %s (%s frames at %s fps)", path, message.get("frames"), message.get("fps"))
+                return {"ok": True, "action": "started", "path": str(path)}
+            if self._writer is None:
+                return {"ok": False, "action": action, "error": "no export in progress"}
+            writer, self._writer = self._writer, None
+            if action == "abort":
+                writer.abort()
+                return {"ok": True, "action": "aborted"}
+            path = writer.close()
+            log.info("exported %s (%d frames, %.1f s)", path, writer.frames, writer.frames / writer.fps)
+            return {"ok": True, "action": "finished", "path": str(path), "frames": writer.frames,
+                    "url": f"/exports/{path.name}" if path.parent == self.export_dir else None}
+        except Exception as exc:  # noqa: BLE001 - reported to the viewer
+            log.exception("export %s failed", action)
+            self._writer = None
+            return {"ok": False, "action": action, "error": str(exc)}
+
+    def export_frame(self, jpeg: bytes) -> None:
+        if self._writer is not None:
+            self._writer.write(jpeg)
 
     # Thread-safe entry points ------------------------------------------------
 
@@ -283,6 +321,109 @@ class ReplayRunner(PhysicsRunner):
             self.publish("status", self.status())
 
 
+def export_mp4(episode: Episode, roots: AssetRoots, out: Path, args, size: tuple[int, int]) -> Path:
+    """Render ``episode`` to ``out`` with a headless browser running the viewer."""
+    import asyncio
+    import socket
+    import sys
+    import threading
+    import urllib.parse
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise SystemExit("--mp4 renders with a headless browser: pip install playwright imageio-ffmpeg, "
+                         "then `python -m playwright install chromium` (or pass --browser /path/to/chrome)")
+    from .video import find_ffmpeg
+
+    find_ffmpeg()  # fail early with the install hint
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    config = ServerConfig(host="127.0.0.1", http_port=port, https=False, environment_auto=False,
+                          scene=episode.scene_id)
+    server = TeleopServer(
+        config, roots,
+        runner_factory=lambda cfg, r, publish: ReplayRunner(cfg, r, publish, episode, export_path=out),
+    )
+    server.runner.playing = False
+    stop_holder: dict = {}
+
+    def serve() -> None:
+        async def main() -> None:
+            stop_holder["stop"] = asyncio.Event()
+            stop_holder["loop"] = asyncio.get_running_loop()
+            await server.serve(stop_holder["stop"])
+
+        asyncio.run(main())
+
+    thread = threading.Thread(target=serve, name="replay-server", daemon=True)
+    thread.start()
+    if not server.runner.ready.wait(120):
+        raise SystemExit("the replay server did not start")
+
+    query = {
+        "export": "1", "fps": f"{args.fps:g}", "speed": f"{args.speed:g}", "start": f"{args.start:g}",
+        "view": args.view, "cam": args.camera, "contacts": "0" if args.no_contacts else "1",
+        "overlay": "0" if args.no_overlay else "1",
+    }
+    if args.end is not None:
+        query["end"] = f"{args.end:g}"
+    url = f"http://127.0.0.1:{port}/?{urllib.parse.urlencode(query)}"
+    duration = ((args.end if args.end is not None else episode.num_steps * episode.time_step) - args.start)
+    print(f"rendering {out} ({size[0]}x{size[1]}, {args.fps:g} fps, {max(duration, 0) / args.speed:.1f} s of video)")
+    gl_args = ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"] \
+        if sys.platform.startswith("linux") else []
+    try:
+        with sync_playwright() as pw:
+            launch = dict(headless=True, args=gl_args + ["--no-proxy-server"])
+            if args.browser:
+                browser = pw.chromium.launch(executable_path=args.browser, **launch)
+            else:
+                try:
+                    browser = pw.chromium.launch(**launch)
+                except Exception:  # noqa: BLE001 - no Playwright Chromium: try Google Chrome
+                    browser = pw.chromium.launch(channel="chrome", **launch)
+            page = browser.new_page(viewport={"width": size[0], "height": size[1]}, device_scale_factor=1)
+            def console(message) -> None:
+                if message.text.startswith("export "):
+                    _progress(message.text)
+                elif getattr(args, "verbose", False):
+                    print(f"[page {message.type}] {message.text}")
+
+            page.on("console", console)
+            page.on("pageerror", lambda e: log.warning("page error: %s", e))
+            page.goto(url)
+            result = None
+            while result is None:
+                page.wait_for_timeout(500)
+                result = page.evaluate("window.__exportResult || null")
+            browser.close()
+    finally:
+        print()
+        loop = stop_holder.get("loop")
+        if loop is not None:
+            loop.call_soon_threadsafe(stop_holder["stop"].set)
+        thread.join(60)
+    if not result.get("ok"):
+        raise SystemExit(f"export failed: {result.get('error')}")
+    return Path(result["path"])
+
+
+def _progress(text: str) -> None:
+    done, total = (int(v) for v in text.split()[1].split("/"))
+    bar = "#" * int(30 * done / total)
+    print(f"\r  [{bar:<30}] {done}/{total} frames", end="", flush=True)
+
+
+def _free_name(path: Path) -> Path:
+    candidate, n = path, 1
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem}_{n}{path.suffix}")
+        n += 1
+    return candidate
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="python -m superdex_quest_teleop.replay",
@@ -293,8 +434,26 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--https-port", type=int, default=8443,
                         help="HTTPS port (to watch the replay in the Quest over Wi-Fi)")
     parser.add_argument("--no-https", action="store_true")
-    parser.add_argument("--speed", type=float, default=1.0)
+    parser.add_argument("--speed", type=float, default=1.0,
+                        help="playback speed (with --mp4: video speed, e.g. 0.25 for slow motion)")
     parser.add_argument("--repo", type=Path, default=None, help="SuperDex checkout (default: auto)")
+    video = parser.add_argument_group("MP4 export (renders headless, no viewer needed)")
+    video.add_argument("--mp4", nargs="?", const="", default=None, metavar="OUT.mp4",
+                       help="render the episode to an MP4 and exit (default name: the episode's, .mp4)")
+    video.add_argument("--fps", type=float, default=30.0)
+    video.add_argument("--size", default="1920x1080", help="video size WxH")
+    video.add_argument("--view", choices=("orbit", "cam"), default="orbit",
+                       help="orbit: a fixed camera over the counter (see --camera); "
+                       "cam: through the operator's eyes (recorded headset pose)")
+    video.add_argument("--camera", default="0.0,1.55,0.75,0.05,0.9,-0.1", metavar="PX,PY,PZ,TX,TY,TZ",
+                       help="orbit camera position and target in room coordinates (counter top at y=0.9)")
+    video.add_argument("--start", type=float, default=0.0, help="start time [s]")
+    video.add_argument("--end", type=float, default=None, help="end time [s] (default: the end)")
+    video.add_argument("--no-contacts", action="store_true", help="hide contact points and force vectors")
+    video.add_argument("--no-overlay", action="store_true", help="no scene name / time caption")
+    video.add_argument("-v", "--verbose", action="store_true", help="print the page's console")
+    video.add_argument("--browser", default=None,
+                       help="Chromium/Chrome executable (default: Playwright's Chromium, then Google Chrome)")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if not args.episode.is_file():
@@ -304,6 +463,18 @@ def main(argv: list[str] | None = None) -> None:
     roots = AssetRoots(args.repo.resolve() if args.repo else default_repo_root())
     if episode.scene_id not in scene_registry(roots):
         parser.error(f"scene {episode.scene_id!r} of this episode is not in {roots.repo}")
+    if args.mp4 is not None:
+        out = Path(args.mp4) if args.mp4 else _free_name(args.episode.with_suffix(".mp4"))
+        try:
+            width, height = (int(v) for v in args.size.lower().split("x"))
+        except ValueError:
+            parser.error("--size must look like 1920x1080")
+        try:
+            path = export_mp4(episode, roots, out, args, (width, height))
+        finally:
+            episode.close()
+        print(f"saved {path}")
+        return
     config = ServerConfig(
         http_port=args.port, https_port=args.https_port, https=not args.no_https,
         environment_auto=False, scene=episode.scene_id,

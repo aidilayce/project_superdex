@@ -601,6 +601,10 @@ class TeleopServer:
         role = "viewer"
         try:
             async for msg in ws:
+                if msg.type == WSMsgType.BINARY and hasattr(self.runner, "export_frame"):
+                    # A rendered video frame (replay MP4 export), written in order.
+                    await asyncio.get_running_loop().run_in_executor(None, self.runner.export_frame, msg.data)
+                    continue
                 if msg.type != WSMsgType.TEXT:
                     continue
                 try:
@@ -613,6 +617,10 @@ class TeleopServer:
                     self.runner.set_hands(hands, head)
                 elif kind == "cmd":
                     self.runner.submit(message)
+                elif kind == "export" and hasattr(self.runner, "export_command"):
+                    reply = await asyncio.get_running_loop().run_in_executor(
+                        None, self.runner.export_command, message)
+                    await ws.send_json({"type": "export", **reply})
                 elif kind == "hello":
                     role = message.get("role", "viewer")
                     log.info("client connected as %s from %s", role, request.remote)
@@ -654,6 +662,16 @@ class TeleopServer:
         app.router.add_static("/pack/", self.config.pack_dir)
         if self.config.hand_models is not None:
             app.router.add_static("/hand_models/", self.config.hand_models)
+        export_dir = getattr(self.runner, "export_dir", None)
+        if export_dir is not None and Path(export_dir).is_dir():
+            async def exported(request: web.Request) -> web.StreamResponse:
+                name = request.match_info["name"]
+                path = Path(export_dir) / name
+                if "/" in name or not name.endswith(".mp4") or not path.is_file():
+                    raise web.HTTPNotFound()
+                return web.FileResponse(path, headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+            app.router.add_get("/exports/{name}", exported)
 
         async def on_startup(app: web.Application) -> None:
             self.loop = asyncio.get_running_loop()

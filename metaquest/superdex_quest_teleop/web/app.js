@@ -473,6 +473,7 @@ function applyFrame(buffer) {
   const f = new Float32Array(buffer, offset);
   lastHeader = header;
   if (replay) updateReplayTime(header.step);
+  queueMicrotask(() => resolveStepWaiters(header.step));
   let k = 0;
   for (let i = 0; i < header.num_actors; i++, k += 7) {
     const a = actors[i];
@@ -487,7 +488,7 @@ function applyFrame(buffer) {
       if (attr.count === count) {
         attr.array.set(f.subarray(k, k + 3 * count));
         attr.needsUpdate = true;
-        if ((header.step & 3) === 0) a.object.geometry.computeVertexNormals();
+        if ((header.step & 3) === 0 || exportJob) a.object.geometry.computeVertexNormals();
       }
     }
     k += 3 * count;
@@ -559,6 +560,8 @@ function connect() {
       applyEnvironment(msg.environment);
       if (msg.pack && !pack) setPack(msg.pack);
       if (msg.replay) setupReplay(msg.replay);
+    } else if (msg.type === 'export') {
+      if (exportReply) { exportReply(msg); exportReply = null; }
     } else if (msg.type === 'environment') {
       applyEnvironment(msg.environment);
     } else if (msg.type === 'assets') {
@@ -611,9 +614,131 @@ function setupReplay(info) {
   speed.value = 1;
   speed.onchange = () => command('replay_speed', { speed: Number(speed.value) });
   document.getElementById('replayplay').onclick = () => command('replay_toggle');
+  document.getElementById('replayexport').onclick = () => {
+    if (exportJob) exportJob.cancel = true;
+    else exportVideo({ speed: Number(document.getElementById('replayspeed').value) || 1 });
+  };
   document.getElementById('replayback').onclick = () => command('replay_step', { delta: -1 });
   document.getElementById('replayfwd').onclick = () => command('replay_step', { delta: 1 });
 }
+// --------------------------------------------------------------------------
+// MP4 export of a replay: this page renders each video frame at its exact
+// step and sends it as a JPEG; the PC encodes them (ffmpeg). Used by the
+// Export MP4 button and by `replay --mp4` (headless, ?export=1).
+// --------------------------------------------------------------------------
+
+let exportJob = null;
+let exportReply = null;
+const stepWaiters = [];
+function resolveStepWaiters(step) {
+  for (let i = stepWaiters.length - 1; i >= 0; i--) {
+    if (stepWaiters[i].step === step) { stepWaiters[i].resolve(); stepWaiters.splice(i, 1); }
+  }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function seekAndWait(step) {
+  if (lastHeader && lastHeader.step === step) return;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const arrived = new Promise((resolve) => stepWaiters.push({ step, resolve }));
+    command('replay_seek', { step });
+    if (await Promise.race([arrived.then(() => true), sleep(4000).then(() => false)])) return;
+  }
+  throw new Error(`step ${step} never arrived`);
+}
+function exportRequest(body) {
+  return new Promise((resolve) => {
+    exportReply = resolve;
+    send({ type: 'export', ...body });
+  });
+}
+function drawCaption(ctx, w, h, t) {
+  const size = Math.max(14, Math.round(h / 40));
+  const text = `${currentScene ? currentScene.name.replace(/^Replay: /, '') : ''}   t = ${t.toFixed(2)} s`;
+  ctx.font = `600 ${size}px system-ui, -apple-system, "Segoe UI", sans-serif`;
+  const pad = Math.round(size * 0.6), tw = ctx.measureText(text).width;
+  ctx.fillStyle = 'rgba(15,17,22,0.55)';
+  ctx.beginPath(); ctx.roundRect(pad, h - size - 3 * pad, tw + 2 * pad, size + 2 * pad, pad); ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.fillText(text, 2 * pad, h - 2 * pad - size * 0.18);
+}
+async function exportVideo(opts = {}) {
+  if (!replay || exportJob) return null;
+  const dt = replay.time_step, n = replay.num_steps;
+  const clampStep = (s) => Math.min(Math.max(s, 0), n - 1);
+  const fps = opts.fps || 30, speed = opts.speed || 1;
+  const first = clampStep(Math.round((opts.start || 0) / dt));
+  const last = opts.end != null ? clampStep(Math.round(opts.end / dt)) : n - 1;
+  const frames = Math.max(1, Math.floor(((last - first) * dt / speed) * fps) + 1);
+  command('replay_pause');
+  const started = await exportRequest({ action: 'start', fps, frames });
+  if (!started.ok) { banner(`MP4 export failed: ${started.error}`); return started; }
+  exportJob = { cancel: false };
+  const button = document.getElementById('replayexport');
+  const out = document.createElement('canvas');
+  out.width = renderer.domElement.width; out.height = renderer.domElement.height;
+  const ctx = out.getContext('2d');
+  let result;
+  try {
+    for (let k = 0; k < frames && !exportJob.cancel; k++) {
+      const step = Math.min(last, first + Math.round((k / fps) * speed / dt));
+      await seekAndWait(step);
+      if (camView) updateCamView();
+      renderer.render(scene, camera);
+      ctx.drawImage(renderer.domElement, 0, 0, out.width, out.height);
+      if (opts.overlay !== false) drawCaption(ctx, out.width, out.height, step * dt);
+      const blob = await new Promise((r) => out.toBlob(r, 'image/jpeg', 0.93));
+      ws.send(await blob.arrayBuffer());
+      while (ws.bufferedAmount > 8e6) await sleep(5);
+      const pct = Math.round((100 * (k + 1)) / frames);
+      if (button) button.textContent = `Cancel ${pct}%`;
+      if (k % 10 === 0 || k === frames - 1) console.log(`export ${k + 1}/${frames}`);
+    }
+    result = await exportRequest({ action: exportJob.cancel ? 'abort' : 'finish' });
+  } catch (err) {
+    await exportRequest({ action: 'abort' });
+    result = { ok: false, error: err.message || String(err) };
+  }
+  exportJob = null;
+  if (button) button.textContent = 'Export MP4';
+  if (result.ok && result.action === 'finished') {
+    const link = result.url ? ` <a href="${result.url}" download>Download</a>` : '';
+    banner(`Saved ${result.frames} frames to <code>${result.path}</code>.${link}`, 'info');
+  } else if (!result.ok) {
+    banner(`MP4 export failed: ${result.error}`);
+  }
+  return result;
+}
+
+// Headless export (replay --mp4): wait until every model and texture has
+// loaded, then export with the URL's settings and publish the result.
+let loadingPending = 0, loadingIdleSince = performance.now();
+THREE.DefaultLoadingManager.onStart = (url, loaded, total) => { loadingPending = total - loaded; };
+THREE.DefaultLoadingManager.onProgress = (url, loaded, total) => {
+  loadingPending = total - loaded;
+  if (loadingPending <= 0) loadingIdleSince = performance.now();
+};
+THREE.DefaultLoadingManager.onLoad = () => { loadingPending = 0; loadingIdleSince = performance.now(); };
+async function autoExport(params) {
+  const t0 = performance.now();
+  while (!(replay && currentScene && lastHeader && loadingPending <= 0 &&
+           performance.now() - loadingIdleSince > 1500 && performance.now() - t0 > 3000)) {
+    if (performance.now() - t0 > 120000) break;
+    await sleep(100);
+  }
+  const num = (k) => (params.has(k) ? Number(params.get(k)) : undefined);
+  if (params.get('view') === 'cam') setCamView(true);
+  if (params.get('contacts') === '0') showContacts = false;
+  if (params.get('contacts') === '1') showContacts = true;
+  window.__exportResult = await exportVideo({
+    fps: num('fps'), speed: num('speed'), start: num('start'), end: num('end'),
+    overlay: params.get('overlay') !== '0',
+  }) || { ok: false, error: 'not in replay mode' };
+}
+{
+  const params = new URLSearchParams(location.search);
+  if (params.get('export') === '1') autoExport(params);
+}
+
 function updateReplayStatus(r) {
   if (!replay) setupReplay(r);
   document.getElementById('replayplay').textContent = r.playing ? '❚❚' : '▶';
