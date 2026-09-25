@@ -8,7 +8,8 @@
 //
 // Models without their own textures get a procedural skin: UV-mapped albedo
 // with pores, creases and blotches, a matching normal map, a subtle sheen and
-// fingernails painted from the skinning weights. A textured model (e.g. a
+// fingernails painted from the skinning weights. Like the SuperDex Teleop
+// renders, the hand ends at the wrist (no forearm). A textured model (e.g. a
 // hand exported from a BEDLAM / SMPL-X avatar) keeps its own materials.
 
 import * as THREE from 'three';
@@ -70,7 +71,7 @@ function skinTextures() {
     const x = r() * size, y = r() * size, rad = 18 + r() * 60;
     for (const [ox, oy] of [[0, 0], [size, 0], [-size, 0], [0, size], [0, -size]]) {
       const g = actx.createRadialGradient(x + ox, y + oy, 0, x + ox, y + oy, rad);
-      g.addColorStop(0, r() > 0.45 ? 'rgba(200,100,90,0.045)' : 'rgba(255,225,190,0.05)');
+      g.addColorStop(0, r() > 0.45 ? 'rgba(220,120,110,0.03)' : 'rgba(255,230,200,0.03)');
       g.addColorStop(1, 'rgba(0,0,0,0)');
       actx.fillStyle = g;
       actx.fillRect(x + ox - rad, y + oy - rad, 2 * rad, 2 * rad);
@@ -78,7 +79,7 @@ function skinTextures() {
   }
   const img = actx.getImageData(0, 0, size, size);
   for (let i = 0; i < size * size; i++) {  // pores darken the albedo slightly
-    const shade = 0.93 + 0.07 * Math.min(1, height[i] * 2);
+    const shade = 0.975 + 0.025 * Math.min(1, height[i] * 2);
     img.data[4 * i] *= shade;
     img.data[4 * i + 1] *= shade * 0.985;
     img.data[4 * i + 2] *= shade * 0.97;
@@ -121,12 +122,15 @@ function proceduralSkin(tone) {
     color: tone,
     map: textures.map,
     normalMap: textures.normalMap,
-    normalScale: new THREE.Vector2(0.25, 0.25),
-    roughness: 0.5,
+    normalScale: new THREE.Vector2(0.12, 0.12),
+    roughness: 0.52,
     metalness: 0.0,
-    sheen: 0.12,
-    sheenRoughness: 0.6,
-    sheenColor: new THREE.Color(0xc07060),
+    // Soft reddish rim approximating light scattered through skin.
+    sheen: 0.3,
+    sheenRoughness: 0.55,
+    sheenColor: new THREE.Color(0xd98a78),
+    clearcoat: 0.05,
+    clearcoatRoughness: 0.5,
     vertexColors: true,
   });
 }
@@ -178,8 +182,54 @@ function paintNails(mesh, tone) {
   geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
 }
 
+// Round off the cut at the wrist (as in the SuperDex Teleop renders): in
+// the wrist bone frame (+Z toward the elbow), vertices behind the wrist are
+// projected onto an ellipsoidal dome fitted to the wrist cross-section.
+function roundWrist(mesh) {
+  const geometry = mesh.geometry;
+  const skeleton = mesh.skeleton;
+  const wristIndex = skeleton.bones.findIndex((b) => b.name === 'wrist');
+  if (wristIndex < 0) return;
+  const toLocal = skeleton.boneInverses[wristIndex];
+  const toMesh = toLocal.clone().invert();
+  const position = geometry.getAttribute('position');
+  const normal = geometry.getAttribute('normal');
+  const v = new THREE.Vector3();
+  const local = [];
+  const ring = new THREE.Box3();
+  for (let i = 0; i < position.count; i++) {
+    v.fromBufferAttribute(position, i).applyMatrix4(toLocal);
+    local.push(v.clone());
+    if (v.z > -0.002 && v.z < 0.006) ring.expandByPoint(v);
+  }
+  if (ring.isEmpty()) return;
+  const cx = (ring.min.x + ring.max.x) / 2, cy = (ring.min.y + ring.max.y) / 2;
+  const rx = (ring.max.x - ring.min.x) / 2, ry = (ring.max.y - ring.min.y) / 2;
+  const z0 = 0.002, rz = 0.75 * Math.min(rx, ry);
+  const normalMatrix = new THREE.Matrix3().setFromMatrix4(toMesh);
+  const n = new THREE.Vector3();
+  for (let i = 0; i < position.count; i++) {
+    const p = local[i];
+    const dx = p.x - cx, dy = p.y - cy, dz = p.z - z0;
+    if (dz <= 0) continue;
+    const k = Math.hypot(dx / rx, dy / ry, dz / rz);
+    if (k < 1e-6) continue;
+    const q = new THREE.Vector3(cx + dx / k, cy + dy / k, z0 + dz / k);
+    // Blend in over the first millimeters so the side wall stays smooth.
+    const w = Math.min(1, dz / 0.006);
+    p.lerp(q, w);
+    position.setXYZ(i, ...p.clone().applyMatrix4(toMesh).toArray());
+    n.set((p.x - cx) / (rx * rx), (p.y - cy) / (ry * ry), (p.z - z0) / (rz * rz)).normalize();
+    const old = new THREE.Vector3().fromBufferAttribute(normal, i).applyMatrix3(new THREE.Matrix3().setFromMatrix4(toLocal));
+    n.lerp(old, 1 - w).normalize().applyMatrix3(normalMatrix).normalize();
+    normal.setXYZ(i, n.x, n.y, n.z);
+  }
+  position.needsUpdate = true;
+  normal.needsUpdate = true;
+}
+
 export class SkinnedHand {
-  constructor(url, { tone = 0xc98f6e } = {}) {
+  constructor(url, { tone = 0xe2ab8f } = {}) {
     this.group = new THREE.Group();
     this.group.visible = false;
     this.bones = null;
@@ -191,39 +241,15 @@ export class SkinnedHand {
         if (!mesh) { reject(new Error(`${url}: no skinned mesh`)); return; }
         const textured = [].concat(mesh.material).some((m) => m && m.map);
         if (!textured) {
+          roundWrist(mesh);
           paintNails(mesh, tone);
           mesh.material = proceduralSkin(tone);
         }
         mesh.frustumCulled = false;
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
         this.bones = JOINT_NAMES.map((name) => root.getObjectByName(name) || null);
         this.group.add(root);
-        // Forearm behind the wrist (WebXR wrist frame: -Z toward the fingers,
-        // +Y dorsal, X across the wrist); display only. It fades out toward
-        // the elbow instead of ending in a visible cut.
-        const length = 0.26;
-        const geometry = new THREE.CylinderGeometry(1, 1.25, length, 40, 8, true);
-        geometry.rotateX(Math.PI / 2);                // axis along Z
-        geometry.translate(0, 0, length / 2 - 0.012); // extend toward +Z (elbow)
-        const fade = document.createElement('canvas');
-        fade.width = 4; fade.height = 128;
-        const fctx = fade.getContext('2d');
-        const grad = fctx.createLinearGradient(0, 0, 0, 128);
-        grad.addColorStop(0.0, '#000');  // elbow end (v = 1 at the top row)
-        grad.addColorStop(0.55, '#fff');
-        grad.addColorStop(1.0, '#fff');
-        fctx.fillStyle = grad;
-        fctx.fillRect(0, 0, 4, 128);
-        const forearmMaterial = [].concat(mesh.material)[0].clone();
-        forearmMaterial.vertexColors = false;
-        forearmMaterial.alphaMap = new THREE.CanvasTexture(fade);
-        forearmMaterial.transparent = true;
-        forearmMaterial.side = THREE.DoubleSide;
-        this.forearm = new THREE.Mesh(geometry, forearmMaterial);
-        this.forearm.scale.set(0.029, 0.02, 1);
-        this.forearm.frustumCulled = false;
-        this.forearmHolder = new THREE.Group();
-        this.forearmHolder.add(this.forearm);
-        this.group.add(this.forearmHolder);
         resolve(this);
       }, undefined, reject);
     });
@@ -238,10 +264,6 @@ export class SkinnedHand {
       const k = 7 * j;
       bone.position.set(joints[k], joints[k + 1], joints[k + 2]);
       bone.quaternion.set(joints[k + 3], joints[k + 4], joints[k + 5], joints[k + 6]);
-    }
-    if (this.forearmHolder) {
-      this.forearmHolder.position.set(joints[0], joints[1], joints[2]);
-      this.forearmHolder.quaternion.set(joints[3], joints[4], joints[5], joints[6]);
     }
     this.group.visible = true;
   }

@@ -37,7 +37,7 @@ def _decode(frame: bytes):
 
 def test_headset_protocol_and_recording(roots, tmp_path):
     async def scenario():
-        server = TeleopServer(ServerConfig(scene="cube", out_dir=tmp_path, environment_auto=False), roots)
+        server = TeleopServer(ServerConfig(scene="cube", out_dir=tmp_path, environment_auto=False, pack_dir=tmp_path / "pack"), roots)
         async with TestClient(TestServer(server.make_app())) as client:
             index = await client.get("/")
             html = await index.text()

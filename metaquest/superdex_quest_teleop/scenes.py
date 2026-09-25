@@ -244,6 +244,38 @@ def add_soft_mesh(
     )
 
 
+def add_soft_box(
+    scene: physics.Scene,
+    name: str,
+    shape_path: Path,
+    size: tuple[float, float, float],
+    position: tuple[float, float, float],
+    youngs: float,
+    poisson: float = 0.25,
+    density: float = 80.0,
+    friction: float = 0.9,
+) -> physics.Actor:
+    """A soft box: a unit tet cube baked to ``size`` [m], resting on the
+    table at ``position`` (x, z centered, lowest point at position's y)."""
+    probe = physics.load_shape_from_file(file_path=str(shape_path))
+    box = physics.get_shape_aabb(probe)
+    lo, hi = np.asarray(list(box.min)), np.asarray(list(box.max))
+    scale = np.asarray(size) / (hi - lo)
+    shape = physics.load_shape_from_file(
+        file_path=str(shape_path), bake_scale=[float(v) for v in scale]
+    )
+    center = 0.5 * (lo + hi) * scale
+    return scene.create_soft_actor(
+        name=name,
+        shape=shape,
+        material=_soft_material(youngs, poisson, density),
+        contact=physics.ContactParams(coulomb_friction_coefficient=friction),
+        world_from_local=physics.TransformRT(
+            translation=[position[0] - center[0], position[1] - lo[1] * scale[1], position[2] - center[2]]
+        ),
+    )
+
+
 def add_rigid_mesh(
     scene: physics.Scene,
     name: str,
@@ -439,6 +471,18 @@ def _build_cloth(scene: physics.Scene, roots: AssetRoots) -> None:
     add_cloth(scene, roots)
 
 
+def _build_kitchen_sponge(scene: physics.Scene, roots: AssetRoots) -> None:
+    """A kitchen sponge (soft foam block) and a paper cup on the countertop,
+    in front of the sink of the kitchen_sink environment."""
+    add_table(scene)
+    add_soft_box(
+        scene, "sponge", roots.physics_assets / "cube" / "cube_fine_mesh.mochi.json",
+        size=(0.095, 0.032, 0.065), position=(0.05, 0.0, 0.0), youngs=1.2e4, density=80.0,
+    )
+    add_prefab(scene, roots.assets / "prefabs" / "paper_cups" / "paper_cup.mochi_prefab",
+               "cup", (-0.17, 0.0, -0.08))
+
+
 def _build_medley(scene: physics.Scene, roots: AssetRoots) -> None:
     """A tabletop mix of rigid and deformable objects."""
     add_table(scene)
@@ -458,6 +502,9 @@ def _build_medley(scene: physics.Scene, roots: AssetRoots) -> None:
 
 
 _BUILTIN: tuple[SceneSpec, ...] = (
+    SceneSpec("kitchen_sponge", "Kitchen Sponge", "deformable",
+              "Squeeze and wipe with a soft kitchen sponge next to the sink.",
+              _build_kitchen_sponge, robust_solver=True),
     SceneSpec("cube", "Cube (rigid)", "rigid",
               "A 5.7 cm puzzle-cube sized rigid block.", _build_rigid_cube),
     SceneSpec("soft_cube", "Soft Cube", "deformable",

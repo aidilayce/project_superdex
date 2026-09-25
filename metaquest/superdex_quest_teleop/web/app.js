@@ -14,6 +14,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
 import { SkinnedHand } from './hands.js';
 import { buildKitchen, makeIsland } from './kitchen.js';
+import { ENVIRONMENTS, MaterialLibrary, buildEnvironment, spongeMaterial } from './environments.js';
 import { makeSkinMaterial } from './skin.js';
 
 const CONFIG = window.SUPERDEX || {};
@@ -69,26 +70,14 @@ renderer.xr.setReferenceSpaceType('local-floor');
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-const background = new THREE.Color(0xb9c6d2);
+const background = new THREE.Color(0xd9dde2);
 scene.background = background;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 const pmrem = new THREE.PMREMGenerator(renderer);
 scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.04).texture;
-let photoEnvironment = false;
-// Image-based lighting from SuperDex Studio's own HDR (Poly Haven, CC0),
-// replaced by the kitchen HDRI's light once that loads.
-if (CONFIG.ibl) {
-  new RGBELoader().load(CONFIG.ibl, (hdr) => {
-    if (photoEnvironment) return;
-    hdr.mapping = THREE.EquirectangularReflectionMapping;
-    scene.environment = pmrem.fromEquirectangular(hdr).texture;
-    hdr.dispose();
-  });
-}
-const hemi = new THREE.HemisphereLight(0xfff6ea, 0x8a7a68, 0.35);
+const hemi = new THREE.HemisphereLight(0xfff6ea, 0x8a7a68, 0.25);
 scene.add(hemi);
-const sun = new THREE.DirectionalLight(0xfff1dc, 0.9);
-sun.position.set(-1.0, 2.6, -1.2);
-scene.add(sun);
 
 const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.01, 60);
 camera.position.set(0, 1.55, 0.85);
@@ -111,38 +100,132 @@ const workspace = new THREE.Group();
 workspace.matrixAutoUpdate = false;
 scene.add(workspace);
 
+// Key light with soft shadows of the hands and objects on the counter.
+const sun = new THREE.DirectionalLight(0xfff4e6, 1.2);
+sun.position.set(-0.55, 1.7, 0.45);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.bias = -0.0004;
+sun.shadow.normalBias = 0.01;
+sun.shadow.radius = 4;
+Object.assign(sun.shadow.camera, { left: -0.8, right: 0.8, top: 0.8, bottom: -0.8, near: 0.2, far: 4 });
+const sunTarget = new THREE.Object3D();
+workspace.add(sun, sunTarget);
+sun.target = sunTarget;
+
+// Environments: 'kitchen_sink' and 'studio' are built in the physics frame
+// (environments.js); 'kitchen_island' is the room of kitchen.js around an
+// island. Materials, lighting HDRIs and props come from the CC0 Poly Haven
+// pack when the PC has it.
 const kitchen = buildKitchen();
 kitchen.group.matrixAutoUpdate = false;
 scene.add(kitchen.group);
 const island = makeIsland();
 workspace.add(island.group);
+let pack = CONFIG.pack || null;
+let materials = new MaterialLibrary(pack);
+let envName = ENVIRONMENTS.includes(CONFIG.sceneEnvironment) ? CONFIG.sceneEnvironment : 'kitchen_sink';
+let envObject = null;
+let tableHeight = DESKTOP_TABLE_HEIGHT;
+let studioHdr = null;
+let kitchenHdr = null;
+let environmentDome = null;
+let inPassthrough = false;
+const rgbe = new RGBELoader();
+
+function loadHdr(url, done) {
+  rgbe.load(url, (hdr) => { hdr.mapping = THREE.EquirectangularReflectionMapping; done(hdr); });
+}
+if (CONFIG.ibl) loadHdr(CONFIG.ibl, (hdr) => { studioHdr = hdr; applyLighting(); });
+
+function packHdrUrl() {
+  const h = pack && pack.hdris;
+  if (!h) return null;
+  const entry = h.kitchen_morning || h.kitchen_warm || h.apartment || Object.values(h)[0];
+  return entry ? entry.url : null;
+}
+let kitchenHdrUrl = null;
+function applyLighting() {
+  // Kitchens are lit by a real kitchen HDRI when available; the studio by
+  // SuperDex Studio's HDR (also its blurred backdrop).
+  const wanted = envName === 'studio' ? null : packHdrUrl();
+  if (wanted && wanted !== kitchenHdrUrl) {
+    kitchenHdrUrl = wanted;
+    loadHdr(wanted, (hdr) => { kitchenHdr = hdr; applyLighting(); });
+  }
+  const hdr = envName !== 'studio' && kitchenHdr ? kitchenHdr : studioHdr;
+  if (hdr) scene.environment = pmrem.fromEquirectangular(hdr).texture;
+  if (inPassthrough) {
+    scene.background = null;
+  } else if (environmentDome) {
+    scene.background = background;
+  } else if (envName === 'studio' && studioHdr) {
+    scene.background = studioHdr;
+    scene.backgroundBlurriness = 0.35;
+    scene.backgroundIntensity = 0.8;
+  } else {
+    scene.background = background;
+  }
+}
+
+function rebuildEnvironment() {
+  if (envObject) { workspace.remove(envObject.group); envObject = null; }
+  const islandRoom = envName === 'kitchen_island' || !!environmentDome;
+  kitchen.group.visible = islandRoom && !inPassthrough;
+  kitchen.room.visible = !environmentDome;
+  island.group.visible = islandRoom;
+  if (!islandRoom) {
+    envObject = buildEnvironment(envName, materials, pack);
+    envObject.group.visible = !inPassthrough;
+    workspace.add(envObject.group);
+    envObject.setHeight(tableHeight);
+  }
+  const button = document.getElementById('envbutton');
+  if (button) button.textContent = `Env: ${envName.replace('_', ' ')}`;
+  applyLighting();
+}
+function setEnvironment(name) {
+  envName = name;
+  rebuildEnvironment();
+}
+function nextEnvironment() {
+  setEnvironment(ENVIRONMENTS[(ENVIRONMENTS.indexOf(envName) + 1) % ENVIRONMENTS.length]);
+}
+function setPack(newPack) {
+  if (!newPack) return;
+  pack = newPack;
+  materials = new MaterialLibrary(pack);
+  flash('Poly Haven asset pack loaded');
+  rebuildEnvironment();
+}
 
 let anchor = new THREE.Matrix4();
 function setAnchor(m) {
   anchor = m.clone();
   workspace.matrix.copy(anchor);
   workspace.matrixWorldNeedsUpdate = true;
-  // The kitchen stands on the floor under the table, turned with it.
+  // The island kitchen stands on the floor under the table, turned with it.
   const p = new THREE.Vector3().setFromMatrixPosition(anchor);
   const yaw = Math.atan2(anchor.elements[8], anchor.elements[10]);
   kitchen.group.matrix.makeRotationY(yaw).setPosition(p.x, 0, p.z);
   kitchen.group.matrixWorldNeedsUpdate = true;
+  tableHeight = p.y;
   island.setHeight(p.y);
+  if (envObject) envObject.setHeight(p.y);
 }
 setAnchor(new THREE.Matrix4().makeTranslation(0, DESKTOP_TABLE_HEIGHT, 0));
+rebuildEnvironment();
 
-// Backdrop: a photographed kitchen (HDRI, auto-fetched from Poly Haven by
-// the PC), a 360 photo or a model of the user's own kitchen. The HDRI also
-// lights the scene, so objects and hands match the room they appear in.
-let environmentDome = null;
+// Optional backdrop file (--environment FILE): an HDRI, a 360 photo or a
+// model of the user's own kitchen, around the island.
 function applyEnvironment(env) {
   if (!env || (environmentDome && environmentDome.userData.url === env.url)) return;
   const place = (object) => {
     if (environmentDome) kitchen.group.remove(environmentDome);
     environmentDome = object;
     environmentDome.userData.url = env.url;
-    kitchen.room.visible = false;
     kitchen.group.add(object);
+    rebuildEnvironment();
     flash(`environment: ${env.name || env.url}`);
   };
   const dome = (texture) => {
@@ -154,14 +237,7 @@ function applyEnvironment(env) {
   };
   const fail = () => banner(`Could not load the environment ${env.url}.`);
   if (env.kind === 'hdr') {
-    new RGBELoader().load(env.url, (hdr) => {
-      hdr.mapping = THREE.EquirectangularReflectionMapping;
-      scene.environment = pmrem.fromEquirectangular(hdr).texture;
-      photoEnvironment = true;
-      hemi.intensity = 0.1;
-      sun.intensity = 0.35;
-      place(dome(hdr));
-    }, undefined, fail);
+    loadHdr(env.url, (hdr) => { kitchenHdr = hdr; kitchenHdrUrl = env.url; place(dome(hdr)); });
   } else if (env.kind === 'panorama') {
     new THREE.TextureLoader().load(env.url, (texture) => {
       texture.colorSpace = THREE.SRGBColorSpace;
@@ -310,8 +386,10 @@ function buildGeometry(msg) {
         side: a.deformable ? THREE.DoubleSide : THREE.FrontSide,
         flatShading: !a.deformable,
       });
-      const mesh = new THREE.Mesh(g, material);
+      const mesh = new THREE.Mesh(g, a.deformable && /sponge/i.test(a.name) ? spongeMaterial(g) : material);
       mesh.frustumCulled = false;
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
       if (a.deformable) {
         mesh.matrixAutoUpdate = false;  // vertices stream in world coordinates
         actorRoot.add(mesh);
@@ -326,7 +404,7 @@ function buildGeometry(msg) {
           // Upstream textured PBR model of this prefab actor.
           loadRenderScene(a.render.url).then((model) => {
             model.quaternion.fromArray(a.render.rotation);
-            model.traverse((o) => { if (o.isMesh) o.frustumCulled = false; });
+            model.traverse((o) => { if (o.isMesh) { o.frustumCulled = false; o.castShadow = true; o.receiveShadow = true; } });
             holder.remove(mesh);
             holder.add(model);
           }).catch(() => {});
@@ -437,8 +515,11 @@ function connect() {
       }
       if (currentScene) sel.value = currentScene.id;
       applyEnvironment(msg.environment);
+      if (msg.pack && !pack) setPack(msg.pack);
     } else if (msg.type === 'environment') {
       applyEnvironment(msg.environment);
+    } else if (msg.type === 'assets') {
+      setPack(msg.pack);
     } else if (msg.type === 'geometry') {
       buildGeometry(msg);
     } else if (msg.type === 'status') {
@@ -499,6 +580,7 @@ document.getElementById('scene').onchange = (e) => command('load_scene', { scene
 document.getElementById('reset').onclick = () => command('reset');
 document.getElementById('rec').onclick = () => command('record_toggle');
 document.getElementById('camview').onclick = () => setCamView(!camView);
+document.getElementById('envbutton').onclick = () => nextEnvironment();
 document.getElementById('handview').onclick = () => setHandView(handView === 'skin' ? 'robot' : 'skin');
 window.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'SELECT') return;
@@ -507,6 +589,7 @@ window.addEventListener('keydown', (e) => {
   if (e.key === 'c') showContacts = !showContacts;
   if (e.key === 'v') setCamView(!camView);
   if (e.key === 'h') setHandView(handView === 'skin' ? 'robot' : 'skin');
+  if (e.key === 'e') nextEnvironment();
   if (e.key === 'n') command('next_scene');
   if (e.key === 'p') command('prev_scene');
 });
@@ -578,8 +661,8 @@ async function startXR(mode) {
   xrSession = result.session;
   xrMode = mode;
   renderer.xr.setReferenceSpaceType(result.space);
-  scene.background = mode === 'immersive-ar' ? null : background;
-  kitchen.group.visible = mode !== 'immersive-ar';  // passthrough shows the real room
+  inPassthrough = mode === 'immersive-ar';  // passthrough shows the real room
+  rebuildEnvironment();
   renderer.xr.setFoveation(1.0);  // cheaper periphery on Quest
   await renderer.xr.setSession(xrSession);
   needsRecenter = true;
@@ -588,8 +671,8 @@ async function startXR(mode) {
   xrSession.addEventListener('end', () => {
     xrSession = null;
     xrMode = null;
-    scene.background = background;
-    kitchen.group.visible = true;
+    inPassthrough = false;
+    rebuildEnvironment();
     ghost.count = 0;
     send({ type: 'hands', left: { tracked: false }, right: { tracked: false } });
   });
@@ -653,6 +736,7 @@ makeButton('Table ▲', -0.047, -0.10, () => { tableOffset += 0.03; anchor.eleme
 makeButton('Table ▼', 0.047, -0.10, () => { tableOffset -= 0.03; anchor.elements[13] -= 0.03; setAnchor(anchor); });
 makeButton('Ghost', -0.047, -0.15, () => { showGhost = !showGhost; });
 makeButton('Hands', -0.047, -0.20, () => setHandView(handView === 'skin' ? 'robot' : 'skin'));
+makeButton('Env ▶', 0.047, -0.20, () => nextEnvironment());
 makeButton('Exit VR', 0.047, -0.15, () => { if (xrSession) xrSession.end(); });
 const infoCanvas = document.createElement('canvas');
 infoCanvas.width = 512; infoCanvas.height = 200;
@@ -788,7 +872,7 @@ renderer.setAnimationLoop((time, frame) => {
   const tracked = h ? Object.entries(h.tracked).map(([s, t]) => `${s}:${t ? 'tracked' : '—'}`).join(' ') : '';
   document.getElementById('status').textContent =
     `${lines.slice(0, 3).join('   ')}   hands ${tracked}${h && h.head ? '   headset connected' : ''}\n` +
-    (now < flashUntil ? flashText : 'Space: record  R: reset  V: cam view  H: hand view  N/P: next/prev scene  C: contacts');
+    (now < flashUntil ? flashText : 'Space: record  R: reset  V: cam view  H: hands  E: environment  N/P: scene  C: contacts');
   renderer.render(scene, camera);
 });
 

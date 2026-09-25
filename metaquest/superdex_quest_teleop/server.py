@@ -81,15 +81,22 @@ class ServerConfig:
     https: bool = True
     cert_dir: Path = Path.home() / ".superdex_quest_teleop"
     # Backdrop: an HDRI (.hdr), a 360 photo (.jpg/.png) or a model (.glb).
-    # None with environment_auto fetches a CC0 kitchen HDRI from Poly Haven
-    # in the background (cached); otherwise the procedural kitchen is used.
+    # A file overrides the 3D environment's backdrop (see scene_environment).
     environment: Path | None = None
+    # 3D environment the client builds around the table: "kitchen_sink",
+    # "kitchen_island" or "studio" (switchable in the client).
+    scene_environment: str = "kitchen_sink"
+    # Fetch the CC0 Poly Haven asset pack (HDRIs, PBR materials, props) in
+    # the background if it isn't cached yet; without it the environments use
+    # procedural materials.
     environment_auto: bool = True
+    pack_dir: Path = Path.home() / ".superdex_quest_teleop" / "assets"
+    asset_resolution: str = "1k"
     # Rigged display hands: a directory with left.glb / right.glb whose bones
     # carry the 25 WebXR joint names (default: WebXR generic-hand).
     hand_models: Path | None = None
     out_dir: Path = Path("recordings")
-    scene: str = "box_and_blocks"
+    scene: str = "kitchen_sponge"
     contact_mode: str = "hand"
     min_contact_force: float = 0.0
     keep_self_contacts: bool = False
@@ -426,6 +433,8 @@ class TeleopServer:
             "httpPort": self.config.http_port,
             "httpsPort": self.config.https_port if self.config.https else None,
             "environment": self._environment_info(),
+            "sceneEnvironment": self.config.scene_environment,
+            "pack": self._pack_info(),
             "handModels": self._hand_model_urls(),
             "ibl": "/ibl/studio_small_08_1k.hdr" if self._ibl_dir().exists() else None,
         }
@@ -450,19 +459,39 @@ class TeleopServer:
                     if (self.config.hand_models / f"{side}.glb").exists()}
         return {side: f"/vendor/webxr-input-profiles/generic-hand/{side}.glb" for side in hs.SIDES}
 
-    def _fetch_environment(self) -> None:
-        """Background: download a CC0 kitchen HDRI, then tell the clients."""
-        from .environment import fetch_kitchen_hdri
+    def _pack_info(self) -> dict | None:
+        """The asset pack manifest with URLs under /pack/."""
+        from .environment import load_manifest
+
+        manifest = load_manifest(self.config.pack_dir)
+        if not manifest:
+            return None
+
+        def url(rel: str) -> str:
+            return f"/pack/{rel}"
+
+        return {
+            "hdris": {k: {"id": v["id"], "url": url(v["path"])} for k, v in manifest.get("hdris", {}).items()},
+            "materials": {
+                slot: {"id": m["id"], **{k: url(v) for k, v in m.items() if k != "id"}}
+                for slot, m in manifest.get("materials", {}).items()
+            },
+            "props": [{"id": p["id"], "name": p.get("name", p["id"]), "url": url(p["path"])}
+                      for p in manifest.get("props", [])],
+        }
+
+    def _fetch_pack(self) -> None:
+        """Background: download the CC0 asset pack, then tell the clients."""
+        from .environment import fetch_pack
 
         try:
-            path = fetch_kitchen_hdri()
+            fetch_pack(self.config.pack_dir, self.config.asset_resolution)
         except Exception as exc:  # noqa: BLE001 - offline is fine
-            log.warning("no kitchen HDRI (%s); using the procedural kitchen. Fetch one later with "
-                        "`python -m superdex_quest_teleop.environment` or pass --environment", exc)
+            log.warning("asset pack unavailable (%s); environments use procedural materials. "
+                        "Fetch it later with `python -m superdex_quest_teleop.environment`", exc)
             return
-        self.config.environment = path
-        log.info("environment: %s", path)
-        self._publish_threadsafe("status", {"type": "environment", "environment": self._environment_info()})
+        log.info("asset pack ready in %s", self.config.pack_dir)
+        self._publish_threadsafe("status", {"type": "assets", "pack": self._pack_info()})
 
     async def _environment(self, request: web.Request) -> web.StreamResponse:
         env = self.config.environment
@@ -483,7 +512,8 @@ class TeleopServer:
             {"type": "hello", "scenes": self.runner.scene_list(),
              "out_dir": str(Path(self.config.out_dir).resolve()),
              "synthetic": self.config.synthetic,
-             "environment": self._environment_info()}
+             "environment": self._environment_info(),
+             "pack": self._pack_info()}
         )
         geometry = self.runner.geometry_message()
         if geometry is not None:
@@ -541,14 +571,16 @@ class TeleopServer:
             app.router.add_static("/prefab_assets/", self.roots.assets / "prefabs")
         if self._ibl_dir().exists():
             app.router.add_static("/ibl/", self._ibl_dir())
+        self.config.pack_dir.mkdir(parents=True, exist_ok=True)
+        app.router.add_static("/pack/", self.config.pack_dir)
         if self.config.hand_models is not None:
             app.router.add_static("/hand_models/", self.config.hand_models)
 
         async def on_startup(app: web.Application) -> None:
             self.loop = asyncio.get_running_loop()
             self.runner.start()
-            if self.config.environment is None and self.config.environment_auto:
-                threading.Thread(target=self._fetch_environment, daemon=True).start()
+            if self.config.environment_auto and self._pack_info() is None:
+                threading.Thread(target=self._fetch_pack, daemon=True).start()
 
         async def on_cleanup(app: web.Application) -> None:
             self.runner.submit({"cmd": "stop"})

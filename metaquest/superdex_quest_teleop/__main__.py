@@ -24,6 +24,8 @@ from .scenes import AssetRoots, default_repo_root, scene_registry
 from .server import ServerConfig, TeleopServer, lan_addresses
 from .session import CONTACT_MODES
 
+ENVIRONMENTS = ("kitchen_sink", "kitchen_island", "studio")
+
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
@@ -31,7 +33,7 @@ def main(argv: list[str] | None = None) -> None:
         description="Meta Quest hand-tracking teleoperation for SuperDex with "
         "per-point contact and force recording.",
     )
-    parser.add_argument("--scene", default="box_and_blocks", help="initial scene id (see --list-scenes)")
+    parser.add_argument("--scene", default="kitchen_sponge", help="initial scene id (see --list-scenes)")
     parser.add_argument("--list-scenes", action="store_true", help="print the available scenes and exit")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--http-port", "--port", type=int, default=8080,
@@ -39,10 +41,17 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--https-port", type=int, default=8443,
                         help="HTTPS port with a self-signed certificate (Quest over Wi-Fi)")
     parser.add_argument("--no-https", action="store_true", help="serve plain HTTP only")
-    parser.add_argument("--environment", default="auto",
-                        help="auto (default): a CC0 kitchen HDRI from Poly Haven, downloaded once; "
-                        "procedural: the built-in kitchen; or a file: an .hdr, an equirectangular "
-                        "360 photo (.jpg/.png, e.g. of your own kitchen) or a .glb/.gltf model")
+    parser.add_argument("--environment", default="kitchen_sink",
+                        help="3D environment around the table: kitchen_sink (default), "
+                        "kitchen_island or studio (switchable with the Env button); or a file "
+                        "shown as backdrop: an .hdr, an equirectangular 360 photo (.jpg/.png, e.g. "
+                        "of your own kitchen) or a .glb/.gltf model")
+    parser.add_argument("--no-download", action="store_true",
+                        help="don't fetch the CC0 Poly Haven asset pack (textures, HDRIs, props)")
+    parser.add_argument("--asset-dir", type=Path, default=None,
+                        help="asset pack location (default: ~/.superdex_quest_teleop/assets)")
+    parser.add_argument("--asset-resolution", default="1k", choices=("1k", "2k", "4k"),
+                        help="texture resolution of the asset pack (1k suits Quest)")
     parser.add_argument("--hand-models", type=Path, default=None,
                         help="directory with left.glb/right.glb: rigged, textured hands whose bones "
                         "use the 25 WebXR joint names (default: WebXR generic-hand with skin shading)")
@@ -78,10 +87,13 @@ def main(argv: list[str] | None = None) -> None:
         parser.error(f"unknown scene {args.scene!r}; use --list-scenes")
 
     environment = None
-    if args.environment not in ("auto", "procedural"):
+    scene_environment = args.environment
+    if args.environment not in ENVIRONMENTS:
         environment = Path(args.environment).expanduser().resolve()
         if not environment.is_file():
-            parser.error(f"environment file not found: {args.environment}")
+            parser.error(f"unknown environment {args.environment!r}: use one of "
+                         f"{', '.join(ENVIRONMENTS)} or an existing file")
+        scene_environment = "kitchen_island"
     if args.hand_models is not None and not (args.hand_models / "right.glb").exists():
         parser.error(f"{args.hand_models} must contain left.glb and right.glb")
     config = ServerConfig(
@@ -90,7 +102,10 @@ def main(argv: list[str] | None = None) -> None:
         https_port=args.https_port,
         https=not args.no_https,
         environment=environment,
-        environment_auto=args.environment == "auto",
+        scene_environment=scene_environment,
+        environment_auto=not args.no_download,
+        asset_resolution=args.asset_resolution,
+        **({"pack_dir": args.asset_dir.expanduser().resolve()} if args.asset_dir else {}),
         hand_models=args.hand_models.resolve() if args.hand_models else None,
         out_dir=args.out,
         scene=args.scene,

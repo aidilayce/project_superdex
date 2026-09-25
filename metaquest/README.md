@@ -92,9 +92,9 @@ releases the object, which exercises the whole pipeline.
 ### In the headset
 
 When the session starts, the virtual table (the physics origin) is placed
-0.42 m in front of your eyes and 0.5 m below them, facing where you look. It
-is drawn as a butcher-block kitchen island. Your real hands appear as small
-blue joint spheres ("ghost"). The simulated Meta XR hands follow them
+0.42 m in front of your eyes and 0.5 m below them, facing where you look. By
+default it is the stone countertop of a kitchen, next to the sink. Your real
+hands appear as small blue joint spheres ("ghost"). The simulated Meta XR hands follow them
 physically: they stop at objects instead of passing through, so what you see
 matches the forces being recorded.
 
@@ -111,68 +111,119 @@ fingertip:
 | Contacts | Show or hide contact points and force vectors |
 | Ghost | Show or hide your tracked joints |
 | Hands | Switch between skinned hands and the Meta XR robot-hand meshes |
+| Env ▶ | Next 3D environment |
 | Exit VR | Leave the immersive session |
 
 The panel also shows the scene, the simulation's real-time factor, the
 headset frame rate and the recording state. It warns when no hands are
 tracked, for example while you still hold the controllers.
 
-**Desktop view:** a scene menu, **Reset**, **Record** and **Cam view**. Cam
+**Desktop view:** a scene menu, **Reset**, **Record**, **Cam view**, **Env**
+and **Hands**. Cam
 view looks through the operator's eyes: it follows the headset live while one
 is connected; otherwise it shows the default operator viewpoint. Dragging the
 view returns to orbiting.
 
-Keys: `Space` records, `R` resets, `V` toggles Cam view, `H` switches the
-hand view, `N`/`P` changes scene, `C` toggles contacts.
+Keys: `Space` records, `R` resets, `V` toggles Cam view, `E` switches the
+environment, `H` switches the hand view, `N`/`P` changes scene, `C` toggles
+contacts.
 
-### Look: scenes, lighting and hands
+### Look: environments, materials and hands
 
-**Where realism comes from.** The realistic videos in the SuperDex README were
-rendered in Unreal Engine 5 with *SuperDex Teleop*, which is not released yet
-(announced for Q4 2026); the public repository ships no Unreal scenes. This
-client uses everything the repository does ship, plus CC0/MIT assets:
+The SuperDex README videos were rendered in Unreal Engine 5 with the
+unreleased *SuperDex Teleop*. The public repository has no Unreal scenes, so
+this client builds its look from the assets SuperDex does ship plus CC0 assets
+from [Poly Haven](https://polyhaven.com), the library SuperDex Studio already
+uses for its lighting.
 
-* **Objects:** every prefab is drawn with its upstream textured PBR render
-  model (`assets/prefabs/*/render/*.glb`: the wooden box and blocks,
-  pegboards, printed paper cups, shape sorter, chain, sphere). The physics
-  still uses the collision meshes.
-* **Lighting:** image-based lighting from SuperDex Studio's HDR
-  (`superdex_studio/assets/ibl/studio_small_08_1k.hdr`, Poly Haven, CC0).
-* **Kitchen:** with the default `--environment auto`, the PC downloads a CC0
-  kitchen HDRI from [Poly Haven](https://polyhaven.com/hdris/indoor) once
-  (cached in `~/.superdex_quest_teleop/environments`). It becomes both the
-  photographic 360° backdrop and the light that falls on the objects and
-  hands. Until it's available (or offline), a procedural kitchen is shown.
-  Pick a different HDRI with
-  `python -m superdex_quest_teleop.environment --list` and `--id <asset>`
-  (add `--resolution 4k` for a sharper backdrop).
-* **Your own kitchen:** pass `--environment` a 360° photo of your kitchen
-  (`.jpg`/`.png`, taken from where you stand), an `.hdr`, or a `.glb`/`.gltf`
-  model (origin on the floor under the table center, -Z facing away from you).
-  On Quest 3, **Enter passthrough** shows your real room.
-* **Hands:** each hand is one continuous skinned mesh (the WebXR
-  `generic-hand` model, MIT). Every frame the PC turns the *simulated* Meta
-  XR hand's link poses into the 25 WebXR joint poses the mesh is rigged to,
-  so the skin shows exactly where physics put the fingers. The skin has a
-  UV-mapped albedo, a normal map with pores and creases, a subtle sheen and
-  fingernails. The forearm fades out toward the elbow. Press **H** (or poke
-  *Hands*) to see the Meta XR robot-hand meshes that actually collide.
+**3D environments** (display only; physics sees the table plane). Switch with
+**Env** or `E`, or choose one with `--environment`:
 
-**BEDLAM-style hands.** BEDLAM renders SMPL-X bodies with scanned skin
-textures in Unreal. Those textures are licensed for registered,
-non-commercial research use, so they are not bundled here. You can use them
-(or any textured hand) with `--hand-models DIR`, where `DIR` holds `left.glb`
-and `right.glb`:
+| Environment | What it is |
+| :-- | :-- |
+| `kitchen_sink` (default) | Stone countertop (the physics table) with an undermount stainless sink, gooseneck faucet, soap bottle, tiled backsplash, window, wood cabinets with handles, floor and walls, plus kitchen props. It matches the SuperDex "sponge by the sink" shot |
+| `kitchen_island` | A kitchen with the table as a butcher-block island |
+| `studio` | A table in SuperDex Studio's HDR, as a blurred backdrop |
 
-1. Rig the hand mesh with 25 bones named like the WebXR joints (`wrist`,
-   `thumb-metacarpal`, …, `pinky-finger-tip`). Orient each bone -Z along the
-   bone toward the fingertip, +Y on the back of the hand. In Blender you can
-   start from `web/vendor/webxr-input-profiles/generic-hand/*.glb` and
-   transfer weights to your mesh.
-2. Bake or assign the albedo, normal and roughness textures (for example a
-   BEDLAM/SMPL-X skin texture) to its UVs, and export as glTF binary.
+**Poly Haven asset pack.** On first start, the server downloads a CC0 pack
+into `~/.superdex_quest_teleop/assets` in the background, and connected
+headsets switch to it as soon as it's ready. You can also fetch it yourself:
 
-Models that bring their own textures are shown with their own materials.
+```bash
+python -m superdex_quest_teleop.environment              # 1k textures (Quest)
+python -m superdex_quest_teleop.environment --resolution 2k
+```
+
+It contains:
+
+* **Kitchen HDRIs** for image-based lighting and reflections: `blinds` (a
+  morning kitchen), `kiara_interior` (a kitchen lounge) and `lebombo`.
+* **PBR material sets** (albedo, OpenGL normal and roughness maps), tiled at
+  real-world scale:
+
+  | Slot | Assets |
+  | :-- | :-- |
+  | Countertop | `marble_01`, `granite_tile` |
+  | Cabinets | `kitchen_wood` |
+  | Backsplash | `long_white_tiles`, `interior_tiles` |
+  | Floor | `laminate_floor` |
+  | Walls | `white_plaster_02` |
+  | Table top | `oak_wood_planks` |
+  | Brushed steel | `metal_plate_02` |
+* **glTF props** (for example `food_lime_01`, `wooden_spoon`, and matching
+  food and kitchen models) placed on the counters.
+
+Curated asset IDs are tried first, then a keyword search over Poly Haven's
+live catalog. Without the pack (offline, or `--no-download`), procedural
+materials stand in.
+
+**Objects.** Every prefab is drawn with its upstream textured PBR model
+(`assets/prefabs/*/render/*.glb`: the wooden box and blocks, pegboards,
+printed paper cups, shape sorter, chain, sphere). The kitchen sponge is a
+yellow foam block with a green scouring layer whose pores stay attached as it
+deforms. All objects and hands cast soft shadows on the counter.
+
+**Hands.** As in the SuperDex Teleop renders, each hand is a single smooth
+skinned hand that ends in a rounded wrist, with no forearm. It uses the WebXR
+`generic-hand` model (MIT) with light skin, subtle normal detail and a soft
+sheen. Every frame, the PC turns the *simulated* Meta XR hand's link poses
+into the 25 joint poses the mesh is rigged to, so the skin shows exactly where
+physics put the fingers. Press **H** to see the Meta XR robot-hand meshes that
+actually collide.
+
+**BEDLAM hands.** `superdex_quest_teleop.bedlam_hands` builds photoreal hands
+from a SMPL-X model and a BEDLAM (or BEDLAM 2.0) scanned skin texture. It:
+
+* cuts both hands out of the SMPL-X body (optionally with shape `--betas`);
+* closes the wrist with a dome;
+* re-skins the hands to the 25 WebXR joints;
+* crops the skin texture to the hands' UV region;
+* writes `left.glb` and `right.glb`.
+
+Run it where BEDLAM lives (e.g. your cluster):
+
+```bash
+python -m superdex_quest_teleop.bedlam_hands --smplx /path/to/smplx/SMPLX_NEUTRAL.npz \
+    --bedlam-root /CT/datasets10/static00/BEDLAM --list            # list skin textures
+python -m superdex_quest_teleop.bedlam_hands --smplx /path/to/smplx/SMPLX_NEUTRAL.npz \
+    --bedlam-root /CT/datasets26/static00/BEDLAM_2 --texture-match <name> --out ~/bedlam_hands
+python -m superdex_quest_teleop --hand-models ~/bedlam_hands
+```
+
+Notes:
+
+* The SMPL-X `.npz` must contain UVs (`vt`/`ft`), or pass `--uv-obj`
+  pointing at the SMPL-X UV template.
+* Use `--texture` to choose an exact albedo file.
+* SMPL-X and BEDLAM are licensed for non-commercial research, and so are the
+  generated files: keep them out of public repositories.
+* Any other rigged hand whose bones use the 25 WebXR joint names works with
+  `--hand-models` too.
+
+**Your own kitchen.** Pass `--environment` a 360° photo (`.jpg`/`.png`, taken
+from where you stand), an `.hdr`, or a `.glb`/`.gltf` model. The model's
+origin goes on the floor under the table center, with -Z facing away from
+you. On Quest 3, **Enter passthrough** shows your real kitchen.
 
 ### Troubleshooting
 
@@ -188,7 +239,7 @@ Models that bring their own textures are shown with their own materials.
 
 | Flag | Default | Meaning |
 | :-- | :-- | :-- |
-| `--scene ID` | `box_and_blocks` | Initial scene (`--list-scenes`) |
+| `--scene ID` | `kitchen_sponge` | Initial scene (`--list-scenes`) |
 | `--out DIR` | `recordings` | Where episodes are written |
 | `--contacts hand\|all` | `hand` | `hand`: every contact involving a hand link. `all`: also object/object and object/table contacts |
 | `--min-contact-force N` | `0` | Drop contact points with smaller force. `0` also keeps zero-force near-contact samples |
@@ -198,8 +249,10 @@ Models that bring their own textures are shown with their own materials.
 | `--synthetic` | off | Scripted right hand instead of the headset |
 | `--http-port N` / `--https-port N` | `8080` / `8443` | Listening ports |
 | `--no-https` | off | Serve plain HTTP only |
-| `--environment auto\|procedural\|FILE` | `auto` | `auto`: CC0 kitchen HDRI from Poly Haven. `procedural`: the built-in kitchen. `FILE`: your `.hdr`, 360° photo or `.glb` |
-| `--hand-models DIR` | WebXR generic hand | Rigged, textured `left.glb`/`right.glb` (e.g. BEDLAM-style hands) |
+| `--environment NAME\|FILE` | `kitchen_sink` | `kitchen_sink`, `kitchen_island`, `studio`, or a backdrop file (`.hdr`, 360° photo, `.glb`) |
+| `--no-download` | off | Don't fetch the Poly Haven asset pack |
+| `--asset-dir DIR` / `--asset-resolution` | `~/.superdex_quest_teleop/assets` / `1k` | Asset pack location and texture resolution |
+| `--hand-models DIR` | WebXR generic hand | Rigged, textured `left.glb`/`right.glb` (e.g. from `bedlam_hands`) |
 | `--threads N` | `-1` | SuperDex worker threads |
 
 ## Scenes
@@ -210,6 +263,7 @@ table using their measured bounds.
 
 | id | Kind | Content |
 | :-- | :-- | :-- |
+| `kitchen_sponge` | soft + rigid | A soft kitchen sponge and a paper cup by the sink (default) |
 | `box_and_blocks` | rigid | Box and Blocks test (32 blocks) |
 | `duck_lamp` | soft | Neo-Hookean duck lamp |
 | `sphere` | rigid | 3 cm sphere |
