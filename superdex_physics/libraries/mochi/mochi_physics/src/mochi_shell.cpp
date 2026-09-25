@@ -371,10 +371,80 @@ void mochi::shell::EntitySetSolution(
   currSol.value = solution; // copy values
 }
 
+template <TimeStep kTimeStep>
+void mochi::shell::UpdateContactSkinSamples(
+    ecs::Included<TagShellActor>,
+    ecs::RequiredTag<TagUseDeformableContactSkin>,
+    CFemSurfaceDiscretization const& surfaceDisc,
+    CDeformedContactSkinNodes const& deformedNodes,
+    CContactSamples<kTimeStep>& outSamples) {
+  MOCHI_PROFILE_SCOPE();
+  UpdateCollisionSamplePositionsFromNodePositions(
+      Unflatten<Real3 const>(MakeConstSpan(deformedNodes.positions)), surfaceDisc, outSamples);
+}
+
+template void mochi::shell::UpdateContactSkinSamples<TimeStep::Current>(
+    ecs::Included<TagShellActor>,
+    ecs::RequiredTag<TagUseDeformableContactSkin>,
+    CFemSurfaceDiscretization const& surfaceDisc,
+    CDeformedContactSkinNodes const& deformedNodes,
+    CContactSamples<TimeStep::Current>& outSamples);
+
+template void mochi::shell::UpdateContactSkinSamples<TimeStep::StageStart>(
+    ecs::Included<TagShellActor>,
+    ecs::RequiredTag<TagUseDeformableContactSkin>,
+    CFemSurfaceDiscretization const& surfaceDisc,
+    CDeformedContactSkinNodes const& deformedNodes,
+    CContactSamples<TimeStep::StageStart>& outSamples);
+
+template <TimeStep kTimeStep>
+void mochi::shell::UpdateContactSkinPositions(
+    ecs::Included<TagShellActor>,
+    ecs::RequiredTag<TagUseDeformableContactSkin>,
+    CTriangularMesh const&,
+    CSurfaceMesh const& contactSkin,
+    CFinalDisplacementRef<kTimeStep> const& displacements,
+    CFemSurfaceDiscretization const& surfaceDisc,
+    CDeformedContactSkinNodes& deformedNodes,
+    CContactSamples<kTimeStep>& outSamples) {
+  MOCHI_PROFILE_SCOPE();
+  MOCHI_ASSERT_VERBOSE(contactSkin.embedding != nullptr, "Contact skin requires an embedding.");
+
+  UpdateLinearEmbeddedNodePositionsFromDisplacements(
+      *contactSkin.embedding,
+      Unflatten<Real3 const>(MakeConstSpan(deformedNodes.referencePositions)),
+      Unflatten<Real3 const>(displacements.value.GetConstSpan()),
+      contactSkin.mesh->GetActiveNodes(),
+      Unflatten<Real3>(MakeSpan(deformedNodes.positions)));
+  UpdateCollisionSamplePositionsFromNodePositions(
+      Unflatten<Real3 const>(MakeConstSpan(deformedNodes.positions)), surfaceDisc, outSamples);
+}
+
+template void mochi::shell::UpdateContactSkinPositions<TimeStep::Current>(
+    ecs::Included<TagShellActor>,
+    ecs::RequiredTag<TagUseDeformableContactSkin>,
+    CTriangularMesh const& physicsMesh,
+    CSurfaceMesh const& contactSkin,
+    CFinalDisplacementRef<TimeStep::Current> const& displacements,
+    CFemSurfaceDiscretization const& surfaceDisc,
+    CDeformedContactSkinNodes& deformedNodes,
+    CContactSamples<TimeStep::Current>& outSamples);
+
+template void mochi::shell::UpdateContactSkinPositions<TimeStep::StageStart>(
+    ecs::Included<TagShellActor>,
+    ecs::RequiredTag<TagUseDeformableContactSkin>,
+    CTriangularMesh const& physicsMesh,
+    CSurfaceMesh const& contactSkin,
+    CFinalDisplacementRef<TimeStep::StageStart> const& displacements,
+    CFemSurfaceDiscretization const& surfaceDisc,
+    CDeformedContactSkinNodes& deformedNodes,
+    CContactSamples<TimeStep::StageStart>& outSamples);
+
 void mochi::shell::AssembleAsyncContact(
     AssemblyParams const& params,
     entt::entity e,
     ecs::Included<TagShellActor, TagUseContact>,
+    ecs::Excluded<TagUseDeformableContactSkin>,
     ecs::OptionalTag<TagQueryActiveContacts> queryActiveContacts,
     ecs::CtxGlobal<CSimulationParams const> simParams,
     CTimeIntegratorState const& intState,

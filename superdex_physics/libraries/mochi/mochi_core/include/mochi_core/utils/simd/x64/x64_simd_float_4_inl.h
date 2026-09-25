@@ -36,29 +36,15 @@ class Simd<float, 4> {
   template <int i>
   [[nodiscard]] static MOCHI_FORCE_INLINE float Get(Simd v) {
     static_assert(i >= 0 && i < 4, "Index out of range");
-    if constexpr (i == 0) {
-      return _mm_cvtss_f32(v.raw); // SSE
-    } else if constexpr (i == 1) {
-      return _mm_cvtss_f32(_mm_shuffle_ps(v.raw, v.raw, _MM_SHUFFLE(1, 1, 1, 1))); // SSE, SSE
-    } else if constexpr (i == 2) {
-      return _mm_cvtss_f32(_mm_shuffle_ps(v.raw, v.raw, _MM_SHUFFLE(2, 2, 2, 2))); // SSE, SSE
-    } else if constexpr (i == 3) {
-      return _mm_cvtss_f32(_mm_shuffle_ps(v.raw, v.raw, _MM_SHUFFLE(3, 3, 3, 3))); // SSE, SSE
-    }
+    return v[i];
   }
 
-  [[nodiscard]] static MOCHI_FORCE_INLINE float Get(Simd v, int i) {
+  [[nodiscard]] MOCHI_FORCE_INLINE Scalar operator[](int i) const {
     MOCHI_ASSERT_VERBOSE(i >= 0 && i < kSize, "Index out of range");
 #if MOCHI_COMPILER_MSVC
-    return v.raw.m128_f32[i];
+    return raw.m128_f32[i];
 #else
-    switch (i) { // clang-format off
-      case 0: return Get<0>(v);
-      case 1: return Get<1>(v);
-      case 2: return Get<2>(v);
-      case 3: return Get<3>(v);
-      MOCHI_UNLIKELY default: return 0.0f;
-    } // clang-format on
+    return raw[i];
 #endif
   }
 
@@ -168,7 +154,11 @@ class Simd<float, 4> {
 
   [[nodiscard]] static MOCHI_FORCE_INLINE Simd Load(Scalar const* ptr, int n) {
     MOCHI_ASSERT_VERBOSE(n >= 0 && n <= kSize, "Invalid size parameter");
+#if MOCHI_ARCH_X64_AVX512
+    return _mm_maskz_loadu_ps(x64_simd::kLaneMasksS8[n], ptr); // AVX512VL
+#else
     return _mm_maskload_ps(ptr, x64_simd::kLoadMasksS4[n]); // AVX
+#endif
   }
 
   [[nodiscard]] static Simd LoadIndexed(Scalar const* ptr, Simd<int, 4> const& indices) {
@@ -234,7 +224,7 @@ class Simd<float, 4> {
     static_assert(N >= 0 && N <= kSize);
     if constexpr (N == 0) {
     } else if constexpr (N < kSize) {
-      // About 3X faster than a masked store on AMD. About the same on Intel.
+      // About 3X faster than a masked store on older AMD CPUs. About the same on others.
       memcpy(ptr, &v, sizeof(Scalar) * N);
     } else {
       _mm_storeu_ps(ptr, v.raw); // SSE
@@ -243,7 +233,11 @@ class Simd<float, 4> {
 
   static MOCHI_FORCE_INLINE void Store(Scalar* ptr, Simd v, int n) {
     MOCHI_ASSERT_VERBOSE(n >= 0 && n <= kSize, "Invalid size parameter");
-    // Faster than masked store on AMD.
+#if MOCHI_ARCH_X64_AVX512
+    _mm_mask_storeu_ps(ptr, x64_simd::kLaneMasksS8[n], v.raw); // AVX512VL
+#else
+    // With AVX2, this is faster than masked store for a predictable value of n.
+    // It is much slower for a random value of n.
     switch (n) { // clang-format off
       case 1: Store<1>(ptr, v); break;
       case 2: Store<2>(ptr, v); break;
@@ -251,6 +245,7 @@ class Simd<float, 4> {
       case 4: Store<4>(ptr, v); break;
       MOCHI_UNLIKELY default: break;
     } // clang-format on
+#endif
   }
 
   MOCHI_FORCE_INLINE static int StoreSelected(Scalar* ptr, Simd condition, Simd values) {

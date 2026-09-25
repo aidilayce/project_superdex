@@ -142,7 +142,7 @@ class Error final {
 #define MOCHI_ERROR_SET(error, descriptionStringLiteral) \
   static_cast<mochi::Error&>(error).SetFirstError("" descriptionStringLiteral, __FILE__, __LINE__);
 
-// Sets an error and returns if the condition is true
+// Sets an error if the condition is true.
 #define MOCHI_ERROR_IF(condition, error, descriptionStringLiteral) \
   if (condition)                                                   \
     MOCHI_UNLIKELY {                                               \
@@ -151,7 +151,7 @@ class Error final {
   else {                                                           \
   }
 
-// Sets and error and returns if the condition is false
+// Sets an error if the condition is false.
 #define MOCHI_ERROR_IF_NOT(condition, error, descriptionStringLiteral) \
   MOCHI_ERROR_IF(!(condition), error, descriptionStringLiteral)
 

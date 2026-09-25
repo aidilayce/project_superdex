@@ -104,6 +104,7 @@ class ContextImpl final : public Context {
   ShapeHandle CreatePlaneShape(Real3 const& normal, real distance, Error& error) override;
   MeshDataView GetShapeMesh(ShapeHandle shape, Error& error) const override;
   MeshDataView GetShapeSurfaceMesh(ShapeHandle shape, Error& error) const override;
+  MeshDataView GetShapeContactSkinMesh(ShapeHandle shape, Error& error) const override;
   MeshDataView GetShapeVisualMesh(ShapeHandle shape, Error& error) const override;
   Aabb GetShapeAabb(ShapeHandle shape, Error& error) const override;
   [[nodiscard]] ArticulatedShapeInfo GetArticulatedShapeInfo(ShapeHandle shape, Error& error)
@@ -153,7 +154,7 @@ class ContextImpl final : public Context {
   static ShapePtr
   CreateShapeFromModelData(ModelData&& model, ExperimentalModelData&& experimental, Error& error);
   ShapeHandle RegisterShape(ConstShapePtr shape, Error& error);
-  MOCHI_API ConstShapePtr GetShapeSharedPtr(ShapeHandle shape) const;
+  ConstShapePtr GetShapeSharedPtr(ShapeHandle shape) const;
 
   // The C API needs a way to disable auto-cleanup of shape handles. Currently there is no public
   // option for this in languages that support auto-cleanup.
@@ -241,6 +242,34 @@ class ContextImpl final : public Context {
 
   // See GetFileCacheKey() for the format of the key.
   std::unordered_map<std::string, FileCacheEntryPtr> _fileCache;
+};
+
+// Bind public API calls that use scheduler-aware helpers to their TaskScheduler. These
+// helpers fall back to serial execution when no scheduler is bound, so the guard is intentionally
+// a no-op when this thread already has a scheduler.
+class ScopedSchedulerBinding {
+  MOCHI_DECLARE_NO_COPY_NO_MOVE(ScopedSchedulerBinding);
+
+ public:
+  explicit ScopedSchedulerBinding(SceneImpl* scene)
+      : ScopedSchedulerBinding(assert_cast<ContextImpl*>(scene->GetContext())->GetTaskScheduler()) {
+  }
+
+  explicit ScopedSchedulerBinding(TaskScheduler& scheduler)
+      : _scheduler(TaskScheduler::TryGet() == nullptr ? &scheduler : nullptr) {
+    if (_scheduler != nullptr) {
+      _scheduler->BindThisThread();
+    }
+  }
+
+  ~ScopedSchedulerBinding() {
+    if (_scheduler != nullptr) {
+      _scheduler->UnbindThisThread();
+    }
+  }
+
+ private:
+  TaskScheduler* _scheduler;
 };
 
 inline Handle::ValueType ContextImpl::GenerateNewHandle() {

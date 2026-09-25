@@ -1773,10 +1773,26 @@ void AssetBrowser::TryApplyPendingAssetAction() {
       break;
     case PendingAssetAction::Reload:
       for (auto const& path : paths) {
-        if (_assetManager->FindAssetByPath(path)) {
-          _assetManager->UnloadAssetByPath(path);
-          _assetManager->LoadAsset(path);
+        Asset* const existing = _assetManager->FindAssetByPath(path);
+        if (existing == nullptr) {
+          continue;
         }
+        // Referenced elsewhere: UnloadAssetByPath would refuse to unload (ref count > 0) and the
+        // subsequent LoadAsset would hand back the stale cached asset. Re-read into the existing
+        // object in place instead, which refreshes every consumer at once. Matches
+        // ModelEditor::PollSlotFileChanges.
+        if (_assetManager->GetPathReferenceCount(path) != 0) {
+          if (!existing->ReloadFromDisk()) {
+            MOCHI_LOG_WARNING(
+                "Reload: '%s' is still referenced and could not be reloaded in place; keeping the "
+                "cached copy.",
+                path.ToString().c_str());
+          }
+          continue;
+        }
+        _assetManager->UnloadAssetByPath(path);
+        _assetManager->LoadAsset(path);
+        _assetManager->InvalidateShapeCachesForPath(path);
       }
       break;
     case PendingAssetAction::Delete:

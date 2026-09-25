@@ -25,6 +25,7 @@
 */
 
 #include "x64_simd_half_16_inl.h"
+#include "x64_simd_half_32_inl.h"
 #include "x64_simd_half_8_inl.h"
 
 /***********************************************************************************************
@@ -37,8 +38,13 @@ namespace mochi {
 template <> [[nodiscard]] MOCHI_FORCE_INLINE Simd<float, 8> StaticCast<Simd<float, 8>, Simd<Half, 8>>(Simd<Half, 8> const& a) { return _mm256_cvtph_ps(a.raw); } // F16C
 template <> [[nodiscard]] MOCHI_FORCE_INLINE Simd<Half, 8> StaticCast<Simd<Half, 8>, Simd<float, 8>>(Simd<float, 8> const& a) { return _mm256_cvtps_ph(a.raw, _MM_FROUND_TO_NEAREST_INT); } // F16C
 
+#if MOCHI_ARCH_X64_AVX512
+template <> [[nodiscard]] MOCHI_FORCE_INLINE Simd<float, 16> StaticCast<Simd<float, 16>, Simd<Half, 16>>(Simd<Half, 16> const& a) { return _mm512_cvtph_ps(a.raw); }
+template <> [[nodiscard]] MOCHI_FORCE_INLINE Simd<Half, 16> StaticCast<Simd<Half, 16>, Simd<float, 16>>(Simd<float, 16> const& a) { return _mm512_cvtps_ph(a.raw, _MM_FROUND_TO_NEAREST_INT); }
+#else
 template <> [[nodiscard]] MOCHI_FORCE_INLINE Simd<float, 16> StaticCast<Simd<float, 16>, Simd<Half, 16>>(Simd<Half, 16> const& a) { return {StaticCast<Simd<float, 8>>(Simd<Half, 16>::GetHalf<0>(a)), StaticCast<Simd<float, 8>>(Simd<Half, 16>::GetHalf<1>(a))}; }
 template <> [[nodiscard]] MOCHI_FORCE_INLINE Simd<Half, 16> StaticCast<Simd<Half, 16>, Simd<float, 16>>(Simd<float, 16> const& a) { return {StaticCast<Simd<Half, 8>>(a.first), StaticCast<Simd<Half, 8>>(a.second)}; }
+#endif
 
 template <> [[nodiscard]] MOCHI_FORCE_INLINE Simd<Half, 8> ReinterpretCast<Simd<Half, 8>, Simd<float, 4>>(Simd<float, 4> const& a) { return _mm_castps_si128(a.raw); }
 template <> [[nodiscard]] MOCHI_FORCE_INLINE Simd<float, 4> ReinterpretCast<Simd<float, 4>, Simd<Half, 8>>(Simd<Half, 8> const& a) { return _mm_castsi128_ps(a.raw); }
@@ -57,6 +63,16 @@ template <> [[nodiscard]] MOCHI_FORCE_INLINE Simd<Half, 16> ReinterpretCast<Simd
 template <> [[nodiscard]] MOCHI_FORCE_INLINE Simd<double, 4> ReinterpretCast<Simd<double, 4>, Simd<Half, 16>>(Simd<Half, 16> const& a) { return _mm256_castsi256_pd(a.raw); }
 template <> [[nodiscard]] MOCHI_FORCE_INLINE Simd<Half, 16> ReinterpretCast<Simd<Half, 16>, Simd<int64_t, 4>>(Simd<int64_t, 4> const& a) { return a.raw; }
 template <> [[nodiscard]] MOCHI_FORCE_INLINE Simd<int64_t, 4> ReinterpretCast<Simd<int64_t, 4>, Simd<Half, 16>>(Simd<Half, 16> const& a) { return a.raw; }
+#if MOCHI_ARCH_X64_AVX512
+template <> [[nodiscard]] MOCHI_FORCE_INLINE Simd<Half, 32> ReinterpretCast<Simd<Half, 32>, Simd<float, 16>>(Simd<float, 16> const& a) { return _mm512_castps_si512(a.raw); }
+template <> [[nodiscard]] MOCHI_FORCE_INLINE Simd<float, 16> ReinterpretCast<Simd<float, 16>, Simd<Half, 32>>(Simd<Half, 32> const& a) { return _mm512_castsi512_ps(a.raw); }
+template <> [[nodiscard]] MOCHI_FORCE_INLINE Simd<Half, 32> ReinterpretCast<Simd<Half, 32>, Simd<int, 16>>(Simd<int, 16> const& a) { return a.raw; }
+template <> [[nodiscard]] MOCHI_FORCE_INLINE Simd<int, 16> ReinterpretCast<Simd<int, 16>, Simd<Half, 32>>(Simd<Half, 32> const& a) { return a.raw; }
+template <> [[nodiscard]] MOCHI_FORCE_INLINE Simd<Half, 32> ReinterpretCast<Simd<Half, 32>, Simd<double, 8>>(Simd<double, 8> const& a) { return _mm512_castpd_si512(a.raw); }
+template <> [[nodiscard]] MOCHI_FORCE_INLINE Simd<double, 8> ReinterpretCast<Simd<double, 8>, Simd<Half, 32>>(Simd<Half, 32> const& a) { return _mm512_castsi512_pd(a.raw); }
+template <> [[nodiscard]] MOCHI_FORCE_INLINE Simd<Half, 32> ReinterpretCast<Simd<Half, 32>, Simd<int64_t, 8>>(Simd<int64_t, 8> const& a) { return a.raw; }
+template <> [[nodiscard]] MOCHI_FORCE_INLINE Simd<int64_t, 8> ReinterpretCast<Simd<int64_t, 8>, Simd<Half, 32>>(Simd<Half, 32> const& a) { return a.raw; }
+#endif
 // clang-format on
 
 namespace details {

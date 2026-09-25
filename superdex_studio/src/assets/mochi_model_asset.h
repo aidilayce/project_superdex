@@ -60,6 +60,10 @@ class MochiModelAsset : public Asset {
 
   // Soft Dynamic Mesh Utils
   int GetSoftSurfaceVertexCount();
+  // Surface node count of the shape's render surface (tetrahedral boundary or triangle surface),
+  // regardless of element type. Used to stage an articulated skin (a triangle surface) through the
+  // same deforming dynamic-mesh path as soft actors.
+  int GetSurfaceVertexCount();
   bool CreateSoftDynamicMeshes(
       mochi::Real3 const& bakeScale,
       mochi::TransformRT const& shapeTransform,
@@ -70,6 +74,18 @@ class MochiModelAsset : public Asset {
       mochi_renderer::WireframeMesh* wireframe,
       mochi::Real3 const& bakeScale,
       mochi::TransformRT const& shapeTransform);
+
+  // Build a GPU-skinned wireframe of the shape's collision surface, for previewing an articulated
+  // skin's deformation at editor time (and driving it at sim time) without per-vertex CPU updates.
+  // The surface must carry skinning (Shape::GetSurfaceMeshData exposes it for skinned mesh shapes);
+  // returns false otherwise. `boneCount` is the number of bones the caller will drive (articulation
+  // link count); the renderable allocates at least enough bones to cover the referenced indices.
+  // Deform it via WireframeMesh::SetBoneMatrices.
+  bool CreateSkinnedCollisionWireframe(
+      mochi::Real3 const& bakeScale,
+      mochi::TransformRT const& shapeTransform,
+      int boneCount,
+      std::unique_ptr<mochi_renderer::WireframeMesh>& outWireframe);
 
   // Asset overrides
   char const* GetTypeLabel() const override;
@@ -90,17 +106,31 @@ class MochiModelAsset : public Asset {
       AssetManager* manager,
       mochi_renderer::ResourceManager& resourceManager);
 
+  // Load the shape's render surface (native, unbaked): the tetrahedral boundary for a tet mesh, or
+  // the triangle surface itself for a surface mesh. Vertex ordering matches the physics engine's
+  // SurfaceNodePositions query, so the same buffer can be updated in place during simulation.
+  mochi::MeshDataView GetNativeSurfaceMesh(mochi::Error& error);
   // Load the model's tetrahedral boundary surface (native, unbaked); empty view + one warning if
   // the model is not a tetrahedral mesh.
   mochi::MeshDataView GetNativeSoftSurface(mochi::Error& error);
   // Bake the native surface for `bakeScale` + `shapeTransform` into flat renderer-space buffers
-  // (area-weighted normals). Returns false if the model is not a tetrahedral mesh.
+  // (area-weighted normals). Works for both tetrahedral boundaries and triangle surfaces (soft
+  // callers are already gated to tet meshes upstream). Returns false if the shape has no surface.
   bool BakeSoftSurface(
       mochi::Real3 const& bakeScale,
       mochi::TransformRT const& shapeTransform,
       std::vector<float>& positions,
       std::vector<float>& normals,
       std::vector<int>& indices);
+  // Read the (surface-aligned) skinning from the native surface mesh into per-node bone indices and
+  // weights (numNodes * weightsPerNode each, in the same node order as BakeSoftSurface). Returns
+  // false if the shape carries no surface skinning. `outMaxBoneIndex` is the largest bone index
+  // referenced (-1 if none).
+  bool BakeSoftSurfaceSkinning(
+      std::vector<int>& boneIndices,
+      std::vector<float>& boneWeights,
+      int& weightsPerNode,
+      int& outMaxBoneIndex);
 
  private:
   std::unique_ptr<mochi_renderer::WireframeMesh> _renderModel;

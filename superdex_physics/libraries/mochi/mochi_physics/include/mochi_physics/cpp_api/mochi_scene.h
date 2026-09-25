@@ -104,7 +104,7 @@ class Scene {
 
   virtual void DestroyActor(ActorHandle actor) = 0;
 
-  void DestroyActor(Actor* actor);
+  virtual void DestroyActor(Actor* actor) = 0;
 
   [[nodiscard]] virtual Actor* GetActor(ActorHandle actor) = 0;
 
@@ -249,6 +249,21 @@ class Scene {
       IncludeNestedActors includeNestedActors,
       Error& error) = 0;
 
+  virtual void SetContactPairParamsOverride(
+      ActorHandle actorA,
+      ActorHandle actorB,
+      ContactPairParamsOverride const& paramsOverride,
+      Error& error) = 0;
+
+  virtual void
+  ClearContactPairParamsOverride(ActorHandle actorA, ActorHandle actorB, Error& error) = 0;
+
+  [[nodiscard]] virtual bool
+  HasContactPairParamsOverride(ActorHandle actorA, ActorHandle actorB, Error& error) const = 0;
+
+  [[nodiscard]] virtual ContactPairParamsOverride
+  GetContactPairParamsOverride(ActorHandle actorA, ActorHandle actorB, Error& error) const = 0;
+
   // Callbacks **********************************************************************************
 
   static constexpr int kDefaultCallbackPriority = 100;
@@ -271,5 +286,3 @@ class Scene {
 };
 
 } // namespace mochi
-
-#include "mochi_scene_inl.h"

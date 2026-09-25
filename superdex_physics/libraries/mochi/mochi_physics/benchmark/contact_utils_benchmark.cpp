@@ -19,6 +19,7 @@
 #include <mochi_core/contact/contact_utils.h>
 #include <mochi_core/geometry/geometry_utils.h>
 #include <mochi_core/geometry/sdf_bv.h>
+#include <mochi_core/geometry/sphere_tree.h>
 #include <mochi_core/utils/debug.h>
 #include <mochi_core/utils/defer.h>
 #include <mochi_core/utils/dynamic_array.h>
@@ -29,6 +30,12 @@
 #include <mochi_physics/src/mochi_contact.h>
 #include <mochi_physics/src/mochi_ecs_utils.h>
 #include <mochi_physics/src/mochi_scene.h>
+
+#include <algorithm>
+#include <functional>
+#include <memory>
+#include <string>
+#include <string_view>
 
 using namespace mochi;
 using namespace mochi_benchmark;
@@ -490,21 +497,11 @@ struct DummyPlaneBv {
   real y = 0_r;
 };
 
-// Single overlap test for BvTree
-MOCHI_FORCE_INLINE bool HasOverlap(DummyPlaneBv const& planeBv, Sphere const& sphere) {
-  return sphere.GetCenter()[1] + sphere.GetRadius() >= planeBv.y;
-}
-
-// Batch overlap test for BvhTree
-template <int kMaxBatchSize>
-void HasOverlapBatch(
-    int batchSize,
+template <int kBatchSize>
+static MOCHI_FORCE_INLINE Simd<real, kBatchSize> HasOverlap(
     DummyPlaneBv const& planeBv,
-    Span<Sphere const> spheres,
-    Span<bool> outHasOverlap) {
-  for (int i = 0; i < batchSize; ++i) {
-    outHasOverlap[i] = spheres[i].GetCenter()[1] + spheres[i].GetRadius() >= planeBv.y;
-  }
+    BatchSphere<kBatchSize> const& sphere) {
+  return (sphere.center[1] + sphere.radius) >= planeBv.y;
 }
 
 } // namespace
@@ -512,23 +509,28 @@ void HasOverlapBatch(
 // This benchmark case focuses on BSH culling. It uses DummyPlaneBv which does a minimal amount
 // of work to give us results that still reflect the requested percentVolumeOverlap. Thus, this
 // benchmark focuses on the BSH culling performance in (relative) isolation.
+template <class Bsh>
 static void BenchmarkFindIntersectingSamples_Bsh(
     benchmark::State& state,
+    Bsh const& bsh,
     Span<Real3 const> positions,
     real percentVolumeOverlap) {
-  ContactSamplesBvh<Sphere> bsh(positions);
-
   // Compute Y threshold based on percentVolumeOverlap.
   Aabb bounds = CalcAabb(positions);
   real yThreshold = Lerp(bounds.GetMax()[1], bounds.GetMin()[1], percentVolumeOverlap);
+  if (percentVolumeOverlap == 0_r) {
+    yThreshold += 1_r; // Make sure there are zero hits for this case
+  }
   DummyPlaneBv dummyBv{.y = yThreshold};
 
   DynamicArray<int> culledIndices;
   culledIndices.reserve(positions.size());
 
+  std::function<void()> const benchmarkIteration = [&]() {
+    bsh.FindIntersectingSamples(dummyBv, culledIndices);
+  };
   for (auto _ : state) {
-    culledIndices.clear();
-    CallNoInline([&]() { bsh.FindIntersectingSamples(dummyBv, culledIndices); });
+    CallNoInline(benchmarkIteration);
   }
 
   // Stats
@@ -545,7 +547,9 @@ static void FindIntersectingSamples_Mesh_vs_Bsh(
   auto* context = mochi::CreateContext(0);
   MOCHI_DEFER(mochi::DestroyContext(context));
   auto positions = GetSamplesPositionsFromMesh(context, meshPath);
-  BenchmarkFindIntersectingSamples_Bsh(state, positions, percentVolumeOverlap);
+  int constexpr kMaxPerLeaf = 8;
+  auto bsh = SphereTree<8>::FromPoints(positions, kMaxPerLeaf);
+  BenchmarkFindIntersectingSamples_Bsh(state, bsh, positions, percentVolumeOverlap);
 }
 
 // clang-format off
@@ -577,13 +581,14 @@ static void BenchmarkFindPointContact_SdfWithBsh(
   }
 
   // Build BSH from adjusted points
-  ContactSamplesBvh<Sphere> bsh(adjustedPoints);
+  int constexpr kMaxPerLeaf = 16;
+  auto bsh = SphereTree<8>::FromPoints(adjustedPoints, kMaxPerLeaf);
 
-  // Create SdfBv for BSH culling.
+  ContactDetectionParams cdParams;
+  // Match the fine-contact tolerance so culling cannot reject valid contacts.
   VMatrix4x4r gridFromPointsT = sdf->GetGridFromActorTranspose();
-  real distanceThreshold = 0_r; // This makes percentVolumeOverlap more accurate.
   SdfBv sdfBv{
-      .gridSdf = sdf, .distanceThreshold = distanceThreshold, .gridFromPointsT = gridFromPointsT};
+      .gridSdf = sdf, .distanceThreshold = cdParams.tolerance, .gridFromPointsT = gridFromPointsT};
 
   // Non-identity transform for FindPointContactsT
   TransformRT pointsFromCollider =
@@ -593,7 +598,6 @@ static void BenchmarkFindPointContact_SdfWithBsh(
   ArrayTransformPoints(
       MakeSpan(positionsTransformed), MakeConstSpan(adjustedPoints), pointsFromCollider);
 
-  ContactDetectionParams cdParams;
   DynamicArray<int> culledIndices;
   DynamicArray<Real3> culledPositions;
   DynamicArray<int> resultIndices;
@@ -607,34 +611,59 @@ static void BenchmarkFindPointContact_SdfWithBsh(
   resultContacts.reserve(positions.size());
   resultSdf.reserve(positions.size());
 
-  for (auto _ : state) {
-    CallNoInline([&]() {
-      // Step 1: BSH culling
-      culledIndices.clear();
-      bsh.FindIntersectingSamples(sdfBv, culledIndices);
+  DynamicArray<int> expectedResultIndices;
+  DynamicArray<Real3> expectedContacts;
+  SdfInfo expectedSdf;
+  FindPointContactsT(
+      positionsTransformed,
+      sdf,
+      cdParams,
+      pointsFromCollider,
+      expectedResultIndices,
+      expectedContacts,
+      expectedSdf,
+      isSdfGradUnitary);
 
-      // Step 2: Gather culled positions
-      culledPositions.resize_noinit(culledIndices.size());
-      for (int i = 0; i < isize(culledIndices); ++i) {
-        culledPositions[i] = positionsTransformed[culledIndices[i]];
-      }
+  std::function<void()> const benchmarkIteration = [&]() {
+    // Step 1: BSH culling
+    bsh.FindIntersectingSamples(sdfBv, culledIndices);
 
-      // Step 3: SDF query on culled points only
-      resultIndices.clear();
-      resultContacts.clear();
-      resultSdf.clear();
-      FindPointContactsT(
-          culledPositions,
-          sdf,
-          cdParams,
-          pointsFromCollider,
-          resultIndices,
-          resultContacts,
-          resultSdf,
-          isSdfGradUnitary);
-    });
+    // Step 2: Gather culled positions
+    culledPositions.resize_noinit(culledIndices.size());
+    for (int i = 0; i < isize(culledIndices); ++i) {
+      culledPositions[i] = positionsTransformed[culledIndices[i]];
+    }
+
+    // Step 3: SDF query on culled points only
+    resultIndices.clear();
+    resultContacts.clear();
+    resultSdf.clear();
+    FindPointContactsT(
+        culledPositions,
+        sdf,
+        cdParams,
+        pointsFromCollider,
+        resultIndices,
+        resultContacts,
+        resultSdf,
+        isSdfGradUnitary);
+  };
+  benchmarkIteration();
+  DynamicArray<int> actualResultIndices;
+  actualResultIndices.resize_noinit(resultIndices.size());
+  for (int i = 0; i < isize(resultIndices); ++i) {
+    actualResultIndices[i] = culledIndices[resultIndices[i]];
+  }
+  std::sort(expectedResultIndices.begin(), expectedResultIndices.end());
+  std::sort(actualResultIndices.begin(), actualResultIndices.end());
+  if (actualResultIndices != expectedResultIndices) {
+    state.SkipWithError("BSH culling changed the contact result");
+    return;
   }
 
+  for (auto _ : state) {
+    CallNoInline(benchmarkIteration);
+  }
   // Stats
   state.counters["points/second"] =
       benchmark::Counter(state.iterations() * positions.size(), benchmark::Counter::kIsRate);
@@ -664,14 +693,14 @@ static void FindPointContacts_Mesh_vs_SdfWithBsh(
 }
 
 // clang-format off
-BENCHMARK_CAPTURE(FindPointContacts_Mesh_vs_SdfWithBsh, FindPointContacts_Mesh_vs_SdfWithBsh_OverlapPct00, kMeshPath, 0.00_r)->Name("FindPointContacts/MeshVsSdfWithBsh/OverlapPct00");
-BENCHMARK_CAPTURE(FindPointContacts_Mesh_vs_SdfWithBsh, FindPointContacts_Mesh_vs_SdfWithBsh_OverlapPct01, kMeshPath, 0.01_r)->Name("FindPointContacts/MeshVsSdfWithBsh/OverlapPct01");
-BENCHMARK_CAPTURE(FindPointContacts_Mesh_vs_SdfWithBsh, FindPointContacts_Mesh_vs_SdfWithBsh_OverlapPct05, kMeshPath, 0.05_r)->Name("FindPointContacts/MeshVsSdfWithBsh/OverlapPct05");
-BENCHMARK_CAPTURE(FindPointContacts_Mesh_vs_SdfWithBsh, FindPointContacts_Mesh_vs_SdfWithBsh_OverlapPct10, kMeshPath, 0.1_r)->Name("FindPointContacts/MeshVsSdfWithBsh/OverlapPct10");
-BENCHMARK_CAPTURE(FindPointContacts_Mesh_vs_SdfWithBsh, FindPointContacts_Mesh_vs_SdfWithBsh_OverlapPct25, kMeshPath, 0.25_r)->Name("FindPointContacts/MeshVsSdfWithBsh/OverlapPct25");
-BENCHMARK_CAPTURE(FindPointContacts_Mesh_vs_SdfWithBsh, FindPointContacts_Mesh_vs_SdfWithBsh_OverlapPct50, kMeshPath, 0.5_r)->Name("FindPointContacts/MeshVsSdfWithBsh/OverlapPct50");
-BENCHMARK_CAPTURE(FindPointContacts_Mesh_vs_SdfWithBsh, FindPointContacts_Mesh_vs_SdfWithBsh_OverlapPct75, kMeshPath, 0.75_r)->Name("FindPointContacts/MeshVsSdfWithBsh/OverlapPct75");
-BENCHMARK_CAPTURE(FindPointContacts_Mesh_vs_SdfWithBsh, FindPointContacts_Mesh_vs_SdfWithBsh_OverlapPct100, kMeshPath, 1.0_r)->Name("FindPointContacts/MeshVsSdfWithBsh/OverlapPct100");
+BENCHMARK_CAPTURE(FindPointContacts_Mesh_vs_SdfWithBsh, FindPointContacts_MeshVsSdfWithBsh_OverlapPct00, kMeshPath, 0.00_r)->Name("FindPointContacts/MeshVsSdfWithBsh/OverlapPct00");
+BENCHMARK_CAPTURE(FindPointContacts_Mesh_vs_SdfWithBsh, FindPointContacts_MeshVsSdfWithBsh_OverlapPct01, kMeshPath, 0.01_r)->Name("FindPointContacts/MeshVsSdfWithBsh/OverlapPct01");
+BENCHMARK_CAPTURE(FindPointContacts_Mesh_vs_SdfWithBsh, FindPointContacts_MeshVsSdfWithBsh_OverlapPct05, kMeshPath, 0.05_r)->Name("FindPointContacts/MeshVsSdfWithBsh/OverlapPct05");
+BENCHMARK_CAPTURE(FindPointContacts_Mesh_vs_SdfWithBsh, FindPointContacts_MeshVsSdfWithBsh_OverlapPct10, kMeshPath, 0.1_r)->Name("FindPointContacts/MeshVsSdfWithBsh/OverlapPct10");
+BENCHMARK_CAPTURE(FindPointContacts_Mesh_vs_SdfWithBsh, FindPointContacts_MeshVsSdfWithBsh_OverlapPct25, kMeshPath, 0.25_r)->Name("FindPointContacts/MeshVsSdfWithBsh/OverlapPct25");
+BENCHMARK_CAPTURE(FindPointContacts_Mesh_vs_SdfWithBsh, FindPointContacts_MeshVsSdfWithBsh_OverlapPct50, kMeshPath, 0.5_r)->Name("FindPointContacts/MeshVsSdfWithBsh/OverlapPct50");
+BENCHMARK_CAPTURE(FindPointContacts_Mesh_vs_SdfWithBsh, FindPointContacts_MeshVsSdfWithBsh_OverlapPct75, kMeshPath, 0.75_r)->Name("FindPointContacts/MeshVsSdfWithBsh/OverlapPct75");
+BENCHMARK_CAPTURE(FindPointContacts_Mesh_vs_SdfWithBsh, FindPointContacts_MeshVsSdfWithBsh_OverlapPct100, kMeshPath, 1.0_r)->Name("FindPointContacts/MeshVsSdfWithBsh/OverlapPct100");
 // clang-format on
 
 #endif // MOCHI_INTERNAL

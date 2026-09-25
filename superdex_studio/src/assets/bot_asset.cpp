@@ -97,6 +97,13 @@ BotAsset::Create(std::string const& name, mochi::Path const& path, AssetManager*
               if (!m.link.shapeFile.empty()) {
                 manager->LoadMochiModelAsset(m.link.shapeFile);
               }
+            } else if constexpr (std::is_same_v<T, superdex::robotics::AttachSkin>) {
+              if (!m.skin.renderModelFile.empty()) {
+                manager->LoadRenderModelAsset(m.skin.renderModelFile);
+              }
+              if (!m.skin.shapeFile.empty()) {
+                manager->LoadMochiModelAsset(m.skin.shapeFile);
+              }
             }
           },
           mod);
@@ -297,6 +304,14 @@ void ForEachPathInBotPrefab(superdex::robotics::BotPrefab const& prefab, Fn cons
       fn(mochi::Path{link.renderModelFile.c_str()});
     }
   }
+  if (prefab.skin.has_value()) {
+    if (!prefab.skin->shapeFile.empty()) {
+      fn(mochi::Path{prefab.skin->shapeFile.c_str()});
+    }
+    if (!prefab.skin->renderModelFile.empty()) {
+      fn(mochi::Path{prefab.skin->renderModelFile.c_str()});
+    }
+  }
 }
 
 // Visit every referenced path in a ModBotPrefab.
@@ -323,6 +338,13 @@ void ForEachPathInModBotPrefab(superdex::robotics::ModBotPrefab const& params, F
             }
             if (!m.link.renderModelFile.empty()) {
               fn(mochi::Path{m.link.renderModelFile.c_str()});
+            }
+          } else if constexpr (std::is_same_v<T, superdex::robotics::AttachSkin>) {
+            if (!m.skin.shapeFile.empty()) {
+              fn(mochi::Path{m.skin.shapeFile.c_str()});
+            }
+            if (!m.skin.renderModelFile.empty()) {
+              fn(mochi::Path{m.skin.renderModelFile.c_str()});
             }
           }
         },
@@ -361,6 +383,10 @@ bool BotAsset::RewriteReferencedPath(mochi::Path const& oldPath, mochi::Path con
     changed |= MaybeRewrite(link.shapeFile, oldPath, newPath);
     changed |= MaybeRewrite(link.renderModelFile, oldPath, newPath);
   }
+  if (_botPrefab.skin.has_value()) {
+    changed |= MaybeRewrite(_botPrefab.skin->shapeFile, oldPath, newPath);
+    changed |= MaybeRewrite(_botPrefab.skin->renderModelFile, oldPath, newPath);
+  }
   if (_botType == superdex::robotics::BotFileType::ModBotPrefab) {
     changed |= MaybeRewrite(_modBotPrefab.base, oldPath, newPath);
     for (auto& mod : _modBotPrefab.modifications) {
@@ -376,6 +402,9 @@ bool BotAsset::RewriteReferencedPath(mochi::Path const& oldPath, mochi::Path con
                 std::is_same_v<T, superdex::robotics::ReplaceLink>) {
               changed |= MaybeRewrite(m.link.shapeFile, oldPath, newPath);
               changed |= MaybeRewrite(m.link.renderModelFile, oldPath, newPath);
+            } else if constexpr (std::is_same_v<T, superdex::robotics::AttachSkin>) {
+              changed |= MaybeRewrite(m.skin.shapeFile, oldPath, newPath);
+              changed |= MaybeRewrite(m.skin.renderModelFile, oldPath, newPath);
             }
           },
           mod);

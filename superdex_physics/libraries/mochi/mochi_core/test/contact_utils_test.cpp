@@ -539,6 +539,66 @@ static void TestPointContacts(
   ExpectEqualResults(outResult, result2, allowRotationAgnosticGsd);
 }
 
+// Match the batch size used by production code.
+// TODO[T289584846] - Adjust after AVX-512 turning.
+constexpr int kPointContactBatchSize =
+    Max(4, MOCHI_ARCH_ARM_NEON ? (2 * Simd<real>::kSize) : Simd<real>::kSize);
+
+template <class ShapeT, class MakePoint, class Verify>
+void TestEveryPointContactTail(ShapeT const& shape, MakePoint makePoint, Verify verify) {
+  for (int count = 1; count <= kPointContactBatchSize; ++count) {
+    DynamicArray<Real3> points;
+    points.resize_noinit(count);
+    for (int i = 0; i < count; ++i) {
+      points[i] = makePoint(i);
+    }
+
+    ContactDetectionResult result;
+    TestPointContactsImpl(points, shape, {}, TransformRT{}, result);
+    ASSERT_EQ(static_cast<size_t>(count), result.sampleIndices.size());
+    ASSERT_EQ(static_cast<size_t>(count), result.posColliding.size());
+    ASSERT_EQ(static_cast<size_t>(count), result.sdfInfo.size());
+    for (int i = 0; i < count; ++i) {
+      EXPECT_EQ(i, result.sampleIndices[i]);
+      EXPECT_NEAR_EQ(points[i], result.posColliding[i]);
+      verify(points[i], result.sdfInfo.val[i], result.sdfInfo.grad[i]);
+    }
+  }
+}
+
+TEST(MochiContact, FindPointContacts_PlaneEveryTailSize) {
+  Plane const plane{Real3{0_r, 1_r, 0_r}, 0_r};
+  TestEveryPointContactTail(
+      plane,
+      [](int i) { return Real3{static_cast<real>(i) * 0.01_r, -0.5_r, 0.25_r}; },
+      [](Real3 const&, real sdf, Real3 const& gradient) {
+        EXPECT_NEAR_EQ(-0.5_r, sdf);
+        EXPECT_NEAR_EQ((Real3{0_r, 1_r, 0_r}), gradient);
+      });
+}
+
+TEST(MochiContact, FindPointContacts_SphereEveryTailSize) {
+  Sphere const sphere{Real3{}, 2_r};
+  TestEveryPointContactTail(
+      sphere,
+      [](int i) { return Real3{1_r + static_cast<real>(i) * 0.01_r, 0_r, 0_r}; },
+      [](Real3 const& point, real sdf, Real3 const& gradient) {
+        EXPECT_NEAR_EQ(point[0] - 2_r, sdf);
+        EXPECT_NEAR_EQ((Real3{1_r, 0_r, 0_r}), gradient);
+      });
+}
+
+TEST(MochiContact, FindPointContacts_ObbEveryTailSize) {
+  Obb const box{TransformRT{}, Real3{2_r, 2_r, 2_r}};
+  TestEveryPointContactTail(
+      box,
+      [](int i) { return Real3{1_r + static_cast<real>(i) * 0.01_r, 0.2_r, 0.3_r}; },
+      [](Real3 const& point, real sdf, Real3 const& gradient) {
+        EXPECT_NEAR_EQ(point[0] - 2_r, sdf);
+        EXPECT_NEAR_EQ((Real3{1_r, 0_r, 0_r}), gradient);
+      });
+}
+
 // Used for Obb and for box-shaped meshes.
 template <typename ShapeT>
 static void TestPointContactsBox(
@@ -1085,7 +1145,7 @@ TEST(MochiContact, FindPointContactsParallel) {
   auto rng = RandomGenerator(42);
   std::uniform_real_distribution<real> range(-1_r, 1_r);
   constexpr size_t kNumPoints = 999;
-  std::vector<Real3> points;
+  DynamicArray<Real3> points;
   points.reserve(kNumPoints);
   for (size_t i = 0; i < kNumPoints; ++i) {
     points.push_back(kCenter + Real3{range(rng), range(rng), range(rng)});

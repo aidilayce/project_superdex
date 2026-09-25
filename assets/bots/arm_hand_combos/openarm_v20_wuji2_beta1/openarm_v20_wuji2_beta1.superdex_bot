@@ -1,0 +1,144 @@
+{
+  "base": "//torsos/openarm_v20/openarm_v20_torso.superdex_bot",
+  "modifications": [
+    {
+      "AttachBot": {
+        "enabled": true,
+        "joint": {
+          "name": "torso_to_left_arm",
+          "type": "Hard"
+        },
+        "name": "left_arm",
+        "parentLinkName": "openarm_left_base_link",
+        "path": "//arms/openarm_v20/left/openarm_v20_left_arm.superdex_bot",
+        "prefix": "arm_"
+      }
+    },
+    {
+      "AttachLink": {
+        "enabled": true,
+        "joint": {
+          "name": "openarm_wuji_mount_left_joint",
+          "type": "Hard"
+        },
+        "link": {
+          "centerOfMass": [
+            0.013538362458348274,
+            -0.00011932259076274931,
+            -0.031752582639455795
+          ],
+          "mass": 0.03690154105424881,
+          "momentOfInertia": [
+            1.76986213773489e-05,
+            -7.3366770436678053e-08,
+            -8.4325383795658126e-06,
+            2.8429511075955816e-05,
+            -5.0208967650178238e-08,
+            2.0805138774449006e-05
+          ],
+          "name": "openarm_wuji_mount_left_link",
+          "renderModel": "render/openarm_wuji_mount_render.glb",
+          "shape": "collision/openarm_wuji_mount_collision.mochi.h5"
+        },
+        "name": "openarm_wuji_mount_left",
+        "parentLinkName": "arm_openarm_left_ee_base_link"
+      }
+    },
+    {
+      "AttachBot": {
+        "enabled": true,
+        "joint": {
+          "name": "arm_to_left_hand",
+          "parentLinkFromJoint": {
+            "rotation": [
+              -0.70710676908493042,
+              0.70710676908493042,
+              -1.376787679419067e-07,
+              1.376787679419067e-07
+            ],
+            "translation": [
+              0,
+              0,
+              -0.046486400067806244
+            ]
+          },
+          "type": "Hard"
+        },
+        "name": "wuji_hand_left",
+        "parentLinkName": "openarm_wuji_mount_left_link",
+        "path": "//hands/wuji_hand2_beta1/left/wuji_hand2_beta1_left.superdex_bot",
+        "prefix": "left_"
+      }
+    },
+    {
+      "AttachBot": {
+        "enabled": true,
+        "joint": {
+          "name": "torso_to_right_arm",
+          "type": "Hard"
+        },
+        "name": "right_arm",
+        "parentLinkName": "openarm_right_base_link",
+        "path": "//arms/openarm_v20/right/openarm_v20_right_arm.superdex_bot",
+        "prefix": "arm_"
+      }
+    },
+    {
+      "AttachLink": {
+        "enabled": true,
+        "joint": {
+          "name": "openarm_wuji_mount_right_joint",
+          "type": "Hard"
+        },
+        "link": {
+          "centerOfMass": [
+            0.013538362458348274,
+            -0.00011932259076274931,
+            -0.031752582639455795
+          ],
+          "mass": 0.03690154105424881,
+          "momentOfInertia": [
+            1.76986213773489e-05,
+            -7.3366770436678053e-08,
+            -8.4325383795658126e-06,
+            2.8429511075955816e-05,
+            -5.0208967650178238e-08,
+            2.0805138774449006e-05
+          ],
+          "name": "openarm_wuji_mount_right_link",
+          "renderModel": "render/openarm_wuji_mount_render.glb",
+          "shape": "collision/openarm_wuji_mount_collision.mochi.h5"
+        },
+        "name": "openarm_wuji_mount_right",
+        "parentLinkName": "arm_openarm_right_ee_base_link"
+      }
+    },
+    {
+      "AttachBot": {
+        "enabled": true,
+        "joint": {
+          "name": "arm_to_right_hand",
+          "parentLinkFromJoint": {
+            "rotation": [
+              -0.70710676908493042,
+              -0.70710676908493042,
+              1.376787679419067e-07,
+              1.376787679419067e-07
+            ],
+            "translation": [
+              0,
+              0,
+              -0.046486400067806244
+            ]
+          },
+          "type": "Hard"
+        },
+        "name": "wuji_hand_right",
+        "parentLinkName": "openarm_wuji_mount_right_link",
+        "path": "//hands/wuji_hand2_beta1/right/wuji_hand2_beta1_right.superdex_bot",
+        "prefix": "right_"
+      }
+    }
+  ],
+  "name": "openarm_v20"
+}

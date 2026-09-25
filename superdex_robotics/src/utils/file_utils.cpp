@@ -562,6 +562,11 @@ void superdex::robotics::MakePathsRelative(
   for (auto& link : botPrefab.links) {
     MakeLinkPathsRelative(link, basePath, error);
   }
+  MOCHI_ERROR_RETURN(error);
+  if (botPrefab.skin.has_value()) {
+    MakePathRelative(botPrefab.skin->shapeFile, basePath, kBotPathMaxParentDepth, error);
+    MakePathRelative(botPrefab.skin->renderModelFile, basePath, kBotPathMaxParentDepth, error);
+  }
 }
 
 void superdex::robotics::MakePathsAbsolute(
@@ -571,6 +576,15 @@ void superdex::robotics::MakePathsAbsolute(
   MOCHI_ERROR_RETURN(error);
   for (auto& link : botPrefab.links) {
     MakeLinkPathsAbsolute(link, basePath, error);
+  }
+  MOCHI_ERROR_RETURN(error);
+  if (botPrefab.skin.has_value()) {
+    if (!botPrefab.skin->shapeFile.empty()) {
+      MakePathAbsolute(botPrefab.skin->shapeFile, basePath, kBotPathMaxParentDepth, error);
+    }
+    if (!botPrefab.skin->renderModelFile.empty()) {
+      MakePathAbsolute(botPrefab.skin->renderModelFile, basePath, kBotPathMaxParentDepth, error);
+    }
   }
 }
 
@@ -591,6 +605,10 @@ void superdex::robotics::MakePathsRelative(
             },
             [&](AttachLink& m) { MakeLinkPathsRelative(m.link, basePath, error); },
             [&](ReplaceLink& m) { MakeLinkPathsRelative(m.link, basePath, error); },
+            [&](AttachSkin& m) {
+              MakePathRelative(m.skin.shapeFile, basePath, kBotPathMaxParentDepth, error);
+              MakePathRelative(m.skin.renderModelFile, basePath, kBotPathMaxParentDepth, error);
+            },
         },
         mod);
   }
@@ -614,6 +632,14 @@ void superdex::robotics::MakePathsAbsolute(
             },
             [&](AttachLink& m) { MakeLinkPathsAbsolute(m.link, basePath, error); },
             [&](ReplaceLink& m) { MakeLinkPathsAbsolute(m.link, basePath, error); },
+            [&](AttachSkin& m) {
+              if (!m.skin.shapeFile.empty()) {
+                MakePathAbsolute(m.skin.shapeFile, basePath, kBotPathMaxParentDepth, error);
+              }
+              if (!m.skin.renderModelFile.empty()) {
+                MakePathAbsolute(m.skin.renderModelFile, basePath, kBotPathMaxParentDepth, error);
+              }
+            },
         },
         mod);
     MOCHI_ERROR_RETURN(error);
@@ -785,7 +811,7 @@ void superdex::robotics::SaveToFile(
   }
 }
 
-#if MOCHI_INTERNAL
+#if SUPERDEXROBOTICS_WITH_BOT_SCENE
 void superdex::robotics::SaveToFile(
     BotScenePrefab const& scenePrefab,
     std::string_view path,
@@ -820,7 +846,7 @@ void superdex::robotics::SaveToFile(
   // splicing needed.
   SaveParamsToFile(temp, path, error);
 }
-#endif // MOCHI_INTERNAL
+#endif // SUPERDEXROBOTICS_WITH_BOT_SCENE
 
 static void HashFileIntoState(XXH3_state_t* state, std::string_view path, Error& error) {
   MOCHI_ERROR_RETURN(error);

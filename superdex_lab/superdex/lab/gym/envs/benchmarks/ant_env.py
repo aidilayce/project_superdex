@@ -15,7 +15,7 @@
 from typing import Any
 
 import numpy as np
-import superdex.physics as physics
+import superdex.physics as sdp
 from superdex.lab.gym.envs import (
     ActionSpace,
     Info,
@@ -88,7 +88,80 @@ class AntEnvCfg(MochiEnvCfg):
 
 
 class AntEnv(MochiEnv):
-    """Ant environment."""
+    """
+    ## Description
+
+    Ant provides quadrupedal locomotion. The reward favors forward progress and
+    penalizes control effort and contact-wrench magnitude.
+
+    ## Action Space
+
+    The action is an `(8,)` `Box`. The element `control` is bounded `[-1.0, 1.0]` and
+    applied as external forces on DOFs 6-13 with a force scale of 150.
+
+    ## Observation Space
+
+    The observation is an `(81,)` `Box` with the default configuration, flattened in
+    alphabetical key order:
+
+    | Key | Shape | Meaning |
+    | --- | --- | --- |
+    | `contact_forces` | 54 | Six contact-wrench components for each of 9 bodies. Omitted when `include_contact_in_observation=False` |
+    | `pose` | 13 | `num_dofs (14) - 2` excluded positions, `+1` for the quaternion representation |
+    | `vel` | 14 | One per DOF |
+
+    Turning off `exclude_current_positions_from_observation` adds 2, turning off
+    `include_contact_in_observation` removes 54, and setting `use_rotation_vector=True`
+    removes 1.
+
+    ## Rewards
+
+    The scalar reward is the sum of four terms:
+
+    | Term | Value |
+    | --- | --- |
+    | `forward` | `x_velocity * forward_reward_weight` |
+    | `ctrl` | `-control_cost_weight * dot(control, control)` |
+    | `contact` | `-contact_cost_weight * squared norm of the clipped contact wrench` |
+    | `survive` | `healthy_reward` while healthy, else `0` |
+
+    ## Starting State
+
+    The scene is restored to its captured initial state, then uniform reset noise scaled
+    by `reset_noise_scale` (default `0.1`) is added to the pose and velocity.
+
+    ## Episode End
+
+    The episode terminates (`terminated_reason = "Unhealthy"`) when the torso height
+    leaves `healthy_y_range`, unless `terminate_when_unhealthy=False`. It truncates at
+    `steps_per_episode`.
+
+    ## Arguments
+
+    In addition to the shared `MochiEnvCfg` fields (see the Authoring guide's base
+    configuration section), `AntEnvCfg` accepts:
+
+    | Field | Default | Meaning |
+    | --- | --- | --- |
+    | `control_frequency` | `20` | Control frequency [Hz] |
+    | `simulation_frequency` | `100` | Simulation frequency [Hz]; 5 substeps per control step |
+    | `steps_per_episode` | `1000` | Truncation limit |
+    | `reset_noise_scale` | `0.1` | Scale of the uniform reset noise |
+    | `forward_reward_weight` | `1` | Weight of the forward-progress term |
+    | `control_cost_weight` | `0.5` | Weight of the control-cost penalty |
+    | `contact_cost_weight` | `5e-4` | Weight of the contact-cost penalty |
+    | `healthy_reward` | `1.0` | Per-step bonus while healthy |
+    | `terminate_when_unhealthy` | `True` | Terminate when the torso leaves the healthy range |
+    | `healthy_y_range` | `(0.2, 1.0)` | Torso height band [m] |
+    | `contact_force_range` | `(-1.0, 1.0)` | Per-component clip range for each body's contact wrench |
+    | `exclude_current_positions_from_observation` | `True` | Omit x and z, keeping policies translation-invariant |
+    | `include_contact_in_observation` | `True` | Include the contact-wrench observation |
+    | `use_rotation_vector` | `False` | Represent rotations with a rotation vector |
+
+    ## Scene identity
+
+    `uid_fields = (use_damping, use_gravity, use_low_friction, use_high_friction)`.
+    """
 
     ####################################################################################
     # Member variables
@@ -105,7 +178,7 @@ class AntEnv(MochiEnv):
     _exclude_current_positions_from_observation: bool
     _include_contact_in_observation: bool
     _use_rotation_vector: bool
-    _contact_actors: list[physics.Actor]
+    _contact_actors: list[sdp.Actor]
 
     ####################################################################################
     # Constructor
@@ -196,12 +269,12 @@ class AntEnv(MochiEnv):
             # Load the Ant prefab.
             assets_root = get_assets_root()
             prefab_path = assets_root / "benchmarks" / "ant" / "ant.mochi_prefab"
-            prefab = physics.prefab.shallow_load_from_file(str(prefab_path))
+            prefab = sdp.prefab.shallow_load_from_file(str(prefab_path))
 
             # Add scene-level settings to the prefab
-            prefab.scene = physics.prefab.SceneParams(
-                solver=physics.SolverParams(
-                    linear_solver=physics.LinearSolverParams(abs_tol=1e-10)
+            prefab.scene = sdp.prefab.SceneParams(
+                solver=sdp.SolverParams(
+                    linear_solver=sdp.LinearSolverParams(abs_tol=1e-10)
                 )
             )
 
@@ -213,14 +286,10 @@ class AntEnv(MochiEnv):
                 prefab.scene.gravity = [0, 0, 0]
             if cfg.use_low_friction:
                 for link in prefab.actors.articulated[0].links:
-                    link.contact = physics.ContactParams(
-                        coulomb_friction_coefficient=0.1
-                    )
+                    link.contact = sdp.ContactParams(coulomb_friction_coefficient=0.1)
             if cfg.use_high_friction:
                 for link in prefab.actors.articulated[0].links:
-                    link.contact = physics.ContactParams(
-                        coulomb_friction_coefficient=2.0
-                    )
+                    link.contact = sdp.ContactParams(coulomb_friction_coefficient=2.0)
 
             # Initialize scene from prefab.
             prefab_params = mochi_helpers.PrefabParams()
@@ -248,7 +317,7 @@ class AntEnv(MochiEnv):
         self._contact_actors = []
         for link_handle in self._agent.get_nested_link_actors():
             link_actor = self._scene.get_actor(link_handle)
-            link_actor.register_query(physics.QueryType.TOTAL_CONTACT_FORCE)
+            link_actor.register_query(sdp.QueryType.TOTAL_CONTACT_FORCE)
             self._contact_actors.append(link_actor)
 
     ####################################################################################

@@ -17,6 +17,7 @@
 #include "mochi_debug_draw.h"
 
 #include "mochi_common_components.h"
+#include "mochi_context.h"
 #include "mochi_ecs_utils.h"
 
 #include <mochi_core/geometry/geometry_utils.h>
@@ -367,8 +368,8 @@ class DebugDrawSystemImpl final : public DebugDrawSystem {
 */
 class DebugDrawImpl final : public DebugDrawInternal {
  public:
-  explicit DebugDrawImpl(entt::registry& registry)
-      : _myThreadId(std::this_thread::get_id()), _registry(registry) {}
+  DebugDrawImpl(entt::registry& registry, TaskScheduler& scheduler)
+      : _myThreadId(std::this_thread::get_id()), _registry(registry), _scheduler(scheduler) {}
 
   ~DebugDrawImpl() override {
     // Set thread affinity to prevent assertion failures in case this is not the same thread that
@@ -419,6 +420,7 @@ class DebugDrawImpl final : public DebugDrawInternal {
 
   std::thread::id _myThreadId;
   entt::registry& _registry;
+  TaskScheduler& _scheduler;
   bool _isEnabled = false;
   bool _hasFinalizedSystems = false;
   std::vector<std::unique_ptr<DebugDrawSystemImpl>> _systems;
@@ -436,6 +438,8 @@ bool DebugDrawImpl::IsEnabled() const {
 
 void DebugDrawImpl::Enable(bool enable) {
   MOCHI_ASSERT(std::this_thread::get_id() == _myThreadId);
+  ScopedSchedulerBinding schedulerBinding(_scheduler);
+
   if (enable != _isEnabled) {
     _isEnabled = enable;
 
@@ -476,6 +480,8 @@ int DebugDrawImpl::FindFeature(std::string_view name) const {
 
 void DebugDrawImpl::EnableFeature(int index, bool enable) {
   MOCHI_ASSERT(std::this_thread::get_id() == _myThreadId);
+  ScopedSchedulerBinding schedulerBinding(_scheduler);
+
   MOCHI_ASSERT(index < isize(_systems));
 
   DebugDrawSystemImpl* system = _systems[index].get();
@@ -568,6 +574,8 @@ bool DebugDrawImpl::IsFeatureEnabled(int index) const {
 
 DebugDrawData DebugDrawImpl::GatherData() {
   MOCHI_ASSERT(std::this_thread::get_id() == _myThreadId);
+  ScopedSchedulerBinding schedulerBinding(_scheduler);
+
   MOCHI_PROFILE_SCOPE();
   _collector.ClearData();
   if (!_isEnabled) {
@@ -635,6 +643,8 @@ DebugDrawData DebugDrawImpl::GatherData() {
 }
 
 void DebugDrawImpl::EnableActor(ActorHandle actor, bool enable, Error& error) {
+  ScopedSchedulerBinding schedulerBinding(_scheduler);
+
   MOCHI_ERROR_RETURN(error);
   auto e = GetEntity(_registry, actor, error);
   MOCHI_ERROR_RETURN(error);
@@ -709,8 +719,33 @@ void DebugDrawImpl::RegisterSystemImpl(
 }
 
 // Static Method
-std::unique_ptr<DebugDrawInternal> DebugDrawInternal::Create(entt::registry& registry) {
-  return std::make_unique<DebugDrawImpl>(registry);
+std::unique_ptr<DebugDrawInternal> DebugDrawInternal::Create(
+    entt::registry& registry,
+    TaskScheduler& scheduler) {
+  return std::make_unique<DebugDrawImpl>(registry, scheduler);
+}
+
+DynamicArray<DebugDrawFeatureInfo> GetDebugDrawFeatureCatalog() {
+  // Build a throwaway DebugDraw on a scratch registry just to enumerate the features.
+  entt::registry registry;
+  auto* scheduler = TaskScheduler::TryGet();
+  std::unique_ptr<TaskScheduler> ownedScheduler;
+  if (scheduler == nullptr) {
+    ownedScheduler = std::make_unique<TaskScheduler>(0);
+    scheduler = ownedScheduler.get();
+  }
+  auto const debugDraw = DebugDrawInternal::Create(registry, *scheduler);
+  RegisterDebugDrawSystems(*debugDraw);
+
+  DynamicArray<DebugDrawFeatureInfo> features;
+  features.reserve(debugDraw->GetNumFeatures());
+  for (int i = 0; i < debugDraw->GetNumFeatures(); ++i) {
+    features.push_back(
+        DebugDrawFeatureInfo{
+            std::string{debugDraw->GetFeatureName(i)},
+            std::string{debugDraw->GetFeatureDescription(i)}});
+  }
+  return features;
 }
 
 } // namespace mochi

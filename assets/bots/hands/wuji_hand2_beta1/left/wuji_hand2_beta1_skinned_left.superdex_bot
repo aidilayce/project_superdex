@@ -1,0 +1,221 @@
+{
+  "base": "wuji_hand2_beta1_left.superdex_bot",
+  "contactOverrides": [
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_36_pinky_tip"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_35_pinky_pad"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_34_pinky_nail"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_33_pinky_distal"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_32_pinky_middle"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_31_pinky_proximal_abd"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_30_pinky_proximal"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_29_ring_finger_tip"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_28_ring_finger_pad"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_27_ring_finger_nail"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_26_ring_finger_distal"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_25_ring_finger_middle"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_23_ring_finger_proximal"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_24_ring_finger_proximal_abd"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_22_middle_finger_tip"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_21_middle_finger_pad"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_20_middle_finger_nail"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_19_middle_finger_distal"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_18_middle_finger_middle"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_17_middle_finger_proximal_abd"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_16_middle_finger_proximal"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_15_index_finger_tip"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_14_index_finger_pad"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_13_index_finger_nail"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_12_index_finger_distal"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_11_index_finger_middle"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_10_index_finger_proximal_abd"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_09_index_finger_proximal"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_08_thumb_tip"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_07_thumb_pad"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_06_thumb_nail"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_05_thumb_distal"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_04_thumb_middle"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_03_thumb_proximal_abd"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_02_thumb_proximal"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_01_wrist"
+    },
+    {
+      "linkA": "wuji_hand2_beta1_skinned_left",
+      "linkB": "link_00_mount"
+    }
+  ],
+  "modifications": [
+    {
+      "AttachSkin": {
+        "enabled": true,
+        "name": "AttachSkin1",
+        "skin": {
+          "boundaryElementType": "P1Q3",
+          "contact": {
+            "collidingPenaltyLengthScale": 1,
+            "coulombFrictionCoefficient": 1,
+            "distanceErrorBound": 0,
+            "frictionFalloffVel": 0.0099999997764825821,
+            "frictionWithColliderNormal": true,
+            "maxAlignmentNormals": 0,
+            "normalViscousDampingCoefficient": 0,
+            "objScale": 1,
+            "penaltyCoefficient": 1000000000,
+            "penaltySmoothingHalfDistance": 0.004999999888241291,
+            "penaltyThresholdDefault": 0.0010000000474974513,
+            "penaltyThresholdExtraPadding": 0,
+            "viscousFrictionCoefficient": 0
+          },
+          "layer": "",
+          "nonCollidingLinks": [
+            "link_02_thumb_proximal",
+            "link_03_thumb_proximal_abd",
+            "link_04_thumb_middle",
+            "link_08_thumb_tip",
+            "link_09_index_finger_proximal",
+            "link_10_index_finger_proximal_abd",
+            "link_11_index_finger_middle",
+            "link_15_index_finger_tip",
+            "link_16_middle_finger_proximal",
+            "link_17_middle_finger_proximal_abd",
+            "link_18_middle_finger_middle",
+            "link_22_middle_finger_tip",
+            "link_23_ring_finger_proximal",
+            "link_24_ring_finger_proximal_abd",
+            "link_25_ring_finger_middle",
+            "link_29_ring_finger_tip",
+            "link_30_pinky_proximal",
+            "link_31_pinky_proximal_abd",
+            "link_32_pinky_middle",
+            "link_36_pinky_tip"
+          ],
+          "renderModel": "render/skin_render.glb",
+          "renderModelRotation": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "renderModelScale": [
+            1,
+            1,
+            1
+          ],
+          "renderModelTranslation": [
+            0,
+            0,
+            0
+          ],
+          "shape": "collision/skin_low_poly_cut_tips_collision.mochi.h5"
+        }
+      }
+    }
+  ],
+  "name": "wuji_hand2_beta1_skinned_left"
+}

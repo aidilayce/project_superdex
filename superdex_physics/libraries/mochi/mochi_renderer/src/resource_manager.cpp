@@ -27,6 +27,7 @@
 #include <filament/RenderableManager.h>
 #include <filament/Texture.h>
 #include <filament/TextureSampler.h>
+#include <gltfio/FilamentInstance.h>
 #include <gltfio/TextureProvider.h>
 #include <materials/uberarchive.h>
 #include <mochi_core/utils/coordinate_space_converter.h>
@@ -425,12 +426,22 @@ RenderModel* ResourceManager::LoadGltf(mochi::Path const& path, bool async) {
       MOCHI_LOG("[gltf] CheckGltfAsset passed, loading asset...");
       _gltfResourceLoader->asyncCancelLoad();
       _gltfResourceLoader->evictResourceData();
-      auto renderModel = std::unique_ptr<RenderModel>(new RenderModel(
-          _engine, filename.getNameWithoutExtension(), path, RenderModelFormat::Gltf));
-      if (auto* fila_asset = LoadFilamentGltfAsset(filename, renderModel->_instances)) {
+      FilamentInstanceVector instances;
+      if (auto* fila_asset = LoadFilamentGltfAsset(filename, instances)) {
         MOCHI_LOG("[gltf] LoadFilamentGltfAsset succeeded, loading resources...");
         if (LoadFilamentGltfResources(filename, fila_asset, async)) {
           MOCHI_LOG("[gltf] LoadFilamentGltfResources succeeded for: %s", path.ToString().c_str());
+          // Route GLBs that carry a skin to SkinnedModel so they can be GPU-skinned by driving
+          // their joint transforms; plain GLBs stay rigid RenderModels. Detected from the loaded
+          // asset's initial instance (gltfio has already built the skeleton/skin).
+          bool const skinned =
+              !instances.empty() && instances[0] != nullptr && instances[0]->getSkinCount() > 0;
+          std::string const name = filename.getNameWithoutExtension();
+          auto renderModel = skinned ? std::unique_ptr<RenderModel>(new SkinnedModel(
+                                           _engine, name, path, RenderModelFormat::Gltf))
+                                     : std::unique_ptr<RenderModel>(new RenderModel(
+                                           _engine, name, path, RenderModelFormat::Gltf));
+          renderModel->_instances = std::move(instances);
           renderModel->_primaryAsset = fila_asset;
           renderModel->_assetLoader = _gltfAssetLoader;
           renderModel->InitializeInitialInstance();

@@ -17,7 +17,10 @@
 #include <superdex_robotics/utils/bot_utils.h>
 
 #include <mochi_core/articulated_body/articulated_body.h>
+#include <mochi_core/geometry/model_data.h>
 #include <mochi_core/utils/defer.h>
+#include <mochi_physics/cpp_api/mochi_context.h>
+#include <mochi_physics/utils/mochi_model_utils.h>
 
 #include <algorithm>
 #include <set>
@@ -378,6 +381,13 @@ void superdex::robotics::ApplyMod(
     MOCHI_ERROR_SET(error, "Child bot has no links");
     MOCHI_ERROR_RETURN(error);
   }
+  // A bot supports at most one skin, so a skinned child cannot be attached onto a bot that already
+  // has one.
+  MOCHI_ERROR_IF(
+      child.skin.has_value() && botPrefab.skin.has_value(),
+      error,
+      "Cannot attach a skinned bot onto a bot that already has a skin (a bot supports at most one skin).");
+  MOCHI_ERROR_RETURN(error);
   // Record current link count for index offset
   int const linkOffset = isize(botPrefab.links);
   // Append child joints, replacing child's world joint (index 0) with connecting joint
@@ -416,11 +426,24 @@ void superdex::robotics::ApplyMod(
   for (real pos : child.defaultPose) {
     botPrefab.defaultPose.push_back(pos);
   }
-  // Append child contact overrides with prefixed link names
+  // Append child contact overrides with prefixed link names. A party that names the child's skin
+  // (the child's own top-level actor name) is re-pointed to this bot's top-level actor name,
+  // because the child skin is adopted below and referenced by the composed bot's name (see
+  // GetBotSkinName).
+  std::string_view const childSkinName =
+      child.skin.has_value() ? GetBotSkinName(child) : std::string_view{};
   for (auto const& over : child.contactOverrides) {
     BotContactOverride prefixed = over;
-    prefixed.linkA = mod.prefix + over.linkA;
-    prefixed.linkB = mod.prefix + over.linkB;
+    if (!childSkinName.empty() && std::string_view(over.linkA) == childSkinName) {
+      prefixed.linkA = botPrefab.name;
+    } else {
+      prefixed.linkA = mod.prefix + over.linkA;
+    }
+    if (!childSkinName.empty() && std::string_view(over.linkB) == childSkinName) {
+      prefixed.linkB = botPrefab.name;
+    } else {
+      prefixed.linkB = mod.prefix + over.linkB;
+    }
     botPrefab.contactOverrides.push_back(std::move(prefixed));
   }
   // Append child cycle joints, offsetting valid child-local link indices into
@@ -435,6 +458,32 @@ void superdex::robotics::ApplyMod(
       offsetCycle.childLink += linkOffset;
     }
     botPrefab.cycles.push_back(offsetCycle);
+  }
+  // Adopt the child's skin (the base has none; verified above). Record the composed link name each
+  // skin bone binds to (_skinBoneLinks) so the skin's baked bone indices can be remapped onto the
+  // reordered composed skeleton in BuildArticulatedActorParams. Link names are stable across the
+  // RebuildBotData re-sort, so this mapping survives composition.
+  if (child.skin.has_value()) {
+    botPrefab.skin = child.skin;
+    botPrefab._skinBoneLinks.clear();
+    if (!child._skinBoneLinks.empty()) {
+      // Nested combo: the child already carries a bone->link mapping; extend the prefix.
+      for (auto const& name : child._skinBoneLinks) {
+        botPrefab._skinBoneLinks.push_back(mod.prefix + name);
+      }
+    } else {
+      // Leaf child: skin bone b is identity with the child's link order (child.links is in bone
+      // order), so bone b binds to child link b.
+      for (int iLink = 0; iLink < childNumLinks; ++iLink) {
+        botPrefab._skinBoneLinks.push_back(mod.prefix + child.links[iLink].name);
+      }
+    }
+    // Forward the names of the links the skin covers, prefixed to match the merged link names.
+    if (botPrefab.skin->nonCollidingLinks.has_value()) {
+      for (auto& name : *botPrefab.skin->nonCollidingLinks) {
+        name = mod.prefix + name;
+      }
+    }
   }
 }
 
@@ -480,6 +529,32 @@ void superdex::robotics::ApplyMod(
   ApplyMod(botPrefab, attachMod, loader, validate, error);
 }
 
+void superdex::robotics::ApplyMod(
+    BotPrefab& botPrefab,
+    AttachSkin const& mod,
+    IBotLoader const& /*loader*/,
+    bool /*validate*/,
+    Error& error) {
+  MOCHI_ERROR_RETURN(error);
+  // A bot supports at most one skin.
+  MOCHI_ERROR_IF(
+      botPrefab.skin.has_value(),
+      error,
+      "Cannot attach a skin to a bot that already has one (a bot supports at most one skin).");
+  MOCHI_ERROR_RETURN(error);
+  botPrefab.skin = mod.skin;
+  // Record the link each skin bone binds to by NAME: identity, i.e. skin bone b -> the bot's link b
+  // in its current order. Names are stable across RebuildBotData's re-sort and nested composition,
+  // so the skin's baked bone indices remap correctly in BuildArticulatedActorParams. This mirrors
+  // the AttachBot "leaf child" branch and reduces to the base-bot identity skin path when the link
+  // order is unchanged.
+  botPrefab._skinBoneLinks.clear();
+  botPrefab._skinBoneLinks.reserve(isize(botPrefab.links));
+  for (auto const& link : botPrefab.links) {
+    botPrefab._skinBoneLinks.push_back(link.name);
+  }
+}
+
 BotPrefab superdex::robotics::BuildBot(
     ModBotPrefab const& buildParams,
     IBotLoader const& loader,
@@ -500,6 +575,17 @@ BotPrefab superdex::robotics::BuildBot(
   // Rebuild to populate _dofIndices before any mods
   RebuildBotData(botPrefab, error);
   MOCHI_ERROR_RETURN(error, {});
+  // A base authored with its own skin (a standalone skinned .superdex_bot) has no _skinBoneLinks:
+  // its baked bone indices match its own link order. Mods below add, remove and re-sort links, and
+  // nothing would record that the mapping used to be identity -- the skin would then silently bind
+  // each bone to whatever link ends up at that index. Capture the mapping now, while it still
+  // holds. ApplyMod(AttachSkin) does the same for a skin attached later.
+  if (botPrefab.skin.has_value() && botPrefab._skinBoneLinks.empty()) {
+    botPrefab._skinBoneLinks.reserve(isize(botPrefab.links));
+    for (auto const& link : botPrefab.links) {
+      botPrefab._skinBoneLinks.push_back(link.name);
+    }
+  }
   // Set the combo name
   botPrefab.name = buildParams.name;
   // Process each modification
@@ -526,6 +612,33 @@ BotPrefab superdex::robotics::BuildBot(
     if (!error.IsOK()) {
       MOCHI_LOG_ERROR("Failed to build bot after modification [%d]", iMod);
     }
+    MOCHI_ERROR_RETURN(error, {});
+  }
+  // Apply the recipe's own contact-filter overrides on top of the composed bot. These are matched
+  // by party name (link names, or the skin party == the composed bot name), so RebuildBotData's
+  // name-keyed prune keeps the ones whose parties exist and drops any dangling references.
+  if (!buildParams.contactOverrides.empty()) {
+    auto& composed = botPrefab.contactOverrides;
+    for (auto const& over : buildParams.contactOverrides) {
+      // AttachBot may already have contributed a prefixed child override for this same pair. Drop
+      // it so the recipe's entry is the only one: readers that stop at the first match would
+      // otherwise report the child's value, while spawning applies every entry in order and ends up
+      // with the recipe's -- the editor matrix and the spawned bot would disagree.
+      std::string_view const a(over.linkA);
+      std::string_view const b(over.linkB);
+      composed.erase(
+          std::remove_if(
+              composed.begin(),
+              composed.end(),
+              [&](BotContactOverride const& existing) {
+                std::string_view const ea(existing.linkA);
+                std::string_view const eb(existing.linkB);
+                return (ea == a && eb == b) || (ea == b && eb == a);
+              }),
+          composed.end());
+      composed.push_back(over);
+    }
+    RebuildBotData(botPrefab, error);
     MOCHI_ERROR_RETURN(error, {});
   }
   return botPrefab;
@@ -621,6 +734,24 @@ void superdex::robotics::Validate(
       REPORT_JOINT_ISSUE(
           results, i, "duplicate name '%s' (joint [%d])", botPrefab.joints[i].name.c_str(), i);
       MOCHI_ERROR_SET(error, "Invalid BotPrefab; see log warnings for details");
+    }
+  }
+  MOCHI_ERROR_RETURN(error);
+
+  // The skin is referenced in contact overrides by the bot's (top-level actor's) name, so no link
+  // may share that name -- otherwise a skin<->link override reference would be ambiguous.
+  if (botPrefab.skin.has_value()) {
+    std::string_view const skinName = GetBotSkinName(botPrefab);
+    for (int i = 0; i < numLinks; ++i) {
+      if (std::string_view(botPrefab.links[i].name) == skinName) {
+        REPORT_LINK_ISSUE(
+            results,
+            i,
+            "link [%d] name '%s' collides with the bot name (used to reference the skin)",
+            i,
+            botPrefab.links[i].name.c_str());
+        MOCHI_ERROR_SET(error, "Invalid BotPrefab; see log warnings for details");
+      }
     }
   }
   MOCHI_ERROR_RETURN(error);
@@ -1033,6 +1164,12 @@ void superdex::robotics::RebuildBotData(BotPrefab& botPrefab, Error& error) {
   for (auto const& link : botPrefab.links) {
     linkNames.insert(std::string_view(link.name));
   }
+  // The skin is a valid contact-override party, referenced by the bot's (top-level actor's) name,
+  // so keep skin overrides when a skin is present and prune them when it is absent (mirrors
+  // link-name pruning).
+  if (botPrefab.skin.has_value()) {
+    linkNames.insert(GetBotSkinName(botPrefab));
+  }
   auto& overrides = botPrefab.contactOverrides;
   overrides.erase(
       std::remove_if(
@@ -1235,6 +1372,100 @@ ArticulatedActorParams superdex::robotics::BuildArticulatedActorParams(
   articulatedParams.links = std::move(linkParams);
   articulatedParams.cycles = botPrefab.cycles;
 
+  // Skin (optional). The skin has no baked transform (see ArticulatedSkinPrefab), so the shape is
+  // loaded with identity scale/transform.
+  if (botPrefab.skin.has_value() && botPrefab.skin->shapeFile.empty()) {
+    // Every other failure in this block is reported; make the drop diagnosable too.
+    MOCHI_LOG_WARNING(
+        "BuiltBot: bot '%s' has a skin with no shape file; instantiating without a skin.",
+        botPrefab.name.c_str());
+  }
+  if (botPrefab.skin.has_value() && !botPrefab.skin->shapeFile.empty()) {
+    ShapeHandle skinShape;
+    if (botPrefab._skinBoneLinks.empty()) {
+      // Identity bone->link mapping: the skin's baked bone indices already match the link order, so
+      // the cached file shape can be used directly.
+      skinShape = loader.LoadShape(
+          botPrefab.skin->shapeFile, {1_r, 1_r, 1_r}, TransformRT{}, context, error);
+      MOCHI_ERROR_RETURN(error, {});
+    } else {
+      // A composed (mod) bot re-sorts links, so the skin's baked bone indices (which index link
+      // frames positionally) must be remapped onto the final link order. Resolve each skin bone's
+      // target link by name (names are stable across the sort), load the skin model, offset its
+      // skinning indices, and bake a fresh shape from the remapped model data.
+      std::unordered_map<std::string_view, int> linkIndexByName;
+      linkIndexByName.reserve(botPrefab.links.size());
+      for (int iLink = 0; iLink < isize(botPrefab.links); ++iLink) {
+        linkIndexByName.emplace(std::string_view(botPrefab.links[iLink].name), iLink);
+      }
+      // _skinBoneLinks carries one entry per link at the time the skin was attached, which is
+      // generally more than the skin has bones for. An entry that no longer resolves is only a
+      // problem if a bone actually references it, so record -1 here and fail below only for the
+      // bones the skin really uses -- otherwise removing an unrelated, unweighted link would fail
+      // the whole build.
+      DynamicArray<int> boneRemap;
+      boneRemap.reserve(isize(botPrefab._skinBoneLinks));
+      for (auto const& linkName : botPrefab._skinBoneLinks) {
+        auto it = linkIndexByName.find(std::string_view(linkName));
+        boneRemap.push_back(it == linkIndexByName.end() ? -1 : it->second);
+      }
+      ModelData skinModel = loader.LoadModelData(botPrefab.skin->shapeFile, error);
+      MOCHI_ERROR_RETURN(error, {});
+      if (!skinModel.mesh.has_value() || !skinModel.mesh->skinning.has_value()) {
+        MOCHI_LOG_WARNING(
+            "BuiltBot: skin model '%s' has no skinning data to remap.",
+            botPrefab.skin->shapeFile.c_str());
+        MOCHI_ERROR_SET(error, "Skin model has no skinning data to remap.");
+        MOCHI_ERROR_RETURN(error, {});
+      }
+      // The skin mesh's rest coordinates are authored in the standalone (sub-)bot's own root frame,
+      // where that root link is actor link 0. In the composed articulation the top-level actor root
+      // is a different link, and the skinning solver resolves rest coordinates in that top-level
+      // root frame. Re-express the rest coordinates by baking the transform of the skin's origin
+      // link (skin bone 0's link) relative to the composed root, evaluated at the zero pose -- the
+      // same reference pose at which the actor captures its reference bone frames. For a standalone
+      // bot this transform is identity, which is why the branch above needs no bake.
+      DynamicArray<TransformRT> rootFromLink;
+      DynamicArray<real> const zeroPose(botPrefab._numDofs, 0_r);
+      ComputeLinkTransformsFromPose(
+          botPrefab, zeroPose, rootFromLink, LinkTransformSpace::RootFromParent, error);
+      MOCHI_ERROR_RETURN(error, {});
+      if (boneRemap.empty() || boneRemap[0] < 0) {
+        MOCHI_LOG_WARNING(
+            "BuiltBot: skin origin link '%s' is not present in the built bot.",
+            boneRemap.empty() ? "<none>" : botPrefab._skinBoneLinks[0].c_str());
+        MOCHI_ERROR_SET(error, "Skin origin link is not present in the built bot.");
+        MOCHI_ERROR_RETURN(error, {});
+      }
+      TransformRT const rootFromSkinOrigin = rootFromLink[boneRemap[0]];
+      model_utils::BakeTransform(skinModel, {1_r, 1_r, 1_r}, rootFromSkinOrigin, error);
+      MOCHI_ERROR_RETURN(error, {});
+      for (int& boneIndex : skinModel.mesh->skinning->indices) {
+        if (boneIndex < 0 || boneIndex >= isize(boneRemap)) {
+          MOCHI_LOG_WARNING(
+              "BuiltBot: skin bone index %d out of range for bone->link mapping (size %d).",
+              boneIndex,
+              isize(boneRemap));
+          MOCHI_ERROR_SET(error, "Skin bone index out of range for the skin's bone->link mapping.");
+          MOCHI_ERROR_RETURN(error, {});
+        }
+        if (boneRemap[boneIndex] < 0) {
+          MOCHI_LOG_WARNING(
+              "BuiltBot: skin bone references link '%s' not present in the built bot.",
+              botPrefab._skinBoneLinks[boneIndex].c_str());
+          MOCHI_ERROR_SET(error, "Skin bone references a link not present in the built bot.");
+          MOCHI_ERROR_RETURN(error, {});
+        }
+        boneIndex = boneRemap[boneIndex];
+      }
+      skinShape = context->CreateModelShape(skinModel, error);
+      MOCHI_ERROR_RETURN(error, {});
+    }
+    ArticulatedSkinParams skinParams = *botPrefab.skin; // slice base ArticulatedSkinParams fields
+    skinParams.shape = skinShape;
+    articulatedParams.skin.emplace(std::move(skinParams));
+  }
+
   return articulatedParams;
 }
 
@@ -1275,6 +1506,16 @@ DynamicArray<real> superdex::robotics::BuildArticulatedPoseFromBotPose(
   return pose;
 }
 
+std::string_view superdex::robotics::GetBotSkinName(BotPrefab const& botPrefab) {
+  if (!botPrefab.skin.has_value()) {
+    return {};
+  }
+  // The skin shares the bot's top-level articulated actor, so it is referenced by that actor's
+  // name (BotPrefab::name, which BuildArticulatedActorParams assigns to
+  // ArticulatedActorParams::name).
+  return std::string_view(botPrefab.name);
+}
+
 static void ApplyBotContactOverrides(
     BotPrefab const& botPrefab,
     Span<BotContactOverride const> contactOverrides,
@@ -1302,22 +1543,37 @@ static void ApplyBotContactOverrides(
   for (int i = 0; i < isize(botPrefab.links); ++i) {
     nameToIndex.emplace(std::string_view(botPrefab.links[i].name), i);
   }
+  // A skin party resolves to the articulated actor's own compound entity handle (the skin shares
+  // the top-level actor). Skin<->link contact collides by default, so a disable override here opts
+  // a specific skin<->link pair out.
+  std::string_view const skinName =
+      botPrefab.skin.has_value() ? GetBotSkinName(botPrefab) : std::string_view{};
+  ActorHandle const skinHandle = actor->GetHandle();
+  auto resolveParty = [&](DynamicString const& party, ActorHandle& outHandle) -> bool {
+    std::string_view const name(party);
+    if (!skinName.empty() && name == skinName) {
+      outHandle = skinHandle;
+      return true;
+    }
+    auto const it = nameToIndex.find(name);
+    if (it == nameToIndex.end()) {
+      return false;
+    }
+    outHandle = linkActors[it->second];
+    return true;
+  };
   for (auto const& over : contactOverrides) {
-    auto const itA = nameToIndex.find(std::string_view(over.linkA));
-    auto const itB = nameToIndex.find(std::string_view(over.linkB));
-    if (itA == nameToIndex.end() || itB == nameToIndex.end()) {
+    ActorHandle handleA;
+    ActorHandle handleB;
+    if (!resolveParty(over.linkA, handleA) || !resolveParty(over.linkB, handleB)) {
       MOCHI_LOG_WARNING(
-          "ApplyBotContactOverrides: contact over references unknown link '%s' or '%s'",
+          "ApplyBotContactOverrides: contact override references unknown link or skin '%s' or '%s'",
           over.linkA.c_str(),
           over.linkB.c_str());
       continue;
     }
     scene->EnableActorContactSymmetric(
-        linkActors[itA->second],
-        linkActors[itB->second],
-        /*enable*/ over.enable,
-        IncludeNestedActors::No,
-        error);
+        handleA, handleB, /*enable*/ over.enable, IncludeNestedActors::No, error);
     MOCHI_ERROR_RETURN(error);
   }
 }
@@ -1339,6 +1595,10 @@ static Actor* AddToSceneImpl(
   MOCHI_ERROR_RETURN(error, nullptr);
   actor->SetArticulatedPoseFromJoints(actorPose, error);
   MOCHI_ERROR_RETURN(error, nullptr);
+  // Skin<->link contact is enabled by default (Mochi's contact matrix collides by default). A
+  // BotContactOverride that names the skin opts a specific skin<->link pair out -- e.g. the skin's
+  // own links, which it wraps and would otherwise fight the joints (a skinned double pendulum
+  // seizing near 90 degrees).
   ApplyBotContactOverrides(botPrefab, contactOverrides, actor, scene, error);
   MOCHI_ERROR_RETURN(error, nullptr);
   return actor;

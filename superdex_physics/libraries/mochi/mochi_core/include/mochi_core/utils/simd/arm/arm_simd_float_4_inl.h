@@ -40,9 +40,9 @@ class Simd<float, 4> {
     return vgetq_lane_f32(v.raw, i);
   }
 
-  [[nodiscard]] MOCHI_FORCE_INLINE static Scalar Get(Simd v, int i) {
+  [[nodiscard]] MOCHI_FORCE_INLINE Scalar operator[](int i) const {
     MOCHI_ASSERT_VERBOSE(i >= 0 && i < kSize, "Index out of range");
-    return v.raw[i];
+    return raw[i];
   }
 
   [[nodiscard]] MOCHI_FORCE_INLINE static Simd Set(Simd v, int i, Scalar value) {

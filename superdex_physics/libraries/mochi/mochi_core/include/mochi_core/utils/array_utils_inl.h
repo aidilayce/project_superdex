@@ -526,6 +526,23 @@ inline T MaxAbs(Span<T const, SZ> a) {
   return max;
 }
 
+template <int kStride>
+inline real MaxPackedVector3Norm(Span<real const> values) {
+  static_assert(kStride >= 3, "Packed 3D vector stride must be at least three.");
+  MOCHI_ASSERT_VERBOSE(
+      isize(values) % kStride == 0, "Packed vector size must be divisible by its stride.");
+
+  real maxNormSqr = 0_r;
+  int i = 0;
+  for (; i + Vec4r::kSize <= isize(values); i += kStride) {
+    maxNormSqr = Max(maxNormSqr, NormSqr<3>(Load<Vec4r>(&values[i])));
+  }
+  if (i < isize(values)) {
+    maxNormSqr = Max(maxNormSqr, NormSqr(Load<3, Vec4r>(&values[i])));
+  }
+  return Sqrt(maxNormSqr);
+}
+
 template <typename T, typename SZ>
 inline T MaxAbsDifference(Span<T const, SZ> a, Span<T const, SZ> b) {
   MOCHI_ASSERT(a.size() == b.size());

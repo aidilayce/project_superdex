@@ -378,8 +378,7 @@ bool LineSearch<T>::ArmijoOrResidualNorm(Problem& problem, Status& status, LsPar
 
     // Check improvement of the residual norm or enough improvement of the merit
     double const merit = problem.GetObjective();
-    auto const resNorm = problem.GetResidual().Norm();
-    if ((merit <= status.merit + scale * factor0) || (resNorm < resNorm0)) {
+    if ((merit <= status.merit + scale * factor0) || (problem.GetResidual().Norm() < resNorm0)) {
       status.merit = merit;
       improved = true;
       break;

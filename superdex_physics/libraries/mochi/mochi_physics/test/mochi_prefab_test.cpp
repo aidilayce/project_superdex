@@ -24,6 +24,7 @@
 #include <mochi_physics/src/mochi_ecs_utils.h>
 #include <mochi_physics/src/mochi_hdf5.h>
 #include <mochi_physics/src/mochi_scene.h>
+#include <mochi_physics/src/mochi_soft_rom_components.h>
 #include <mochi_physics/utils/mochi_prefab.h>
 
 #include <limits>
@@ -136,7 +137,12 @@ TEST(Prefab, ArticulatedActor_Serialization) {
             "contact": {
               "penaltyCoefficient": 4e9
             },
-            "boundaryElementType": "P1Q6"
+            "boundaryElementType": "P1Q6",
+            "boundarySubsampling": {
+              "subsamplingDensity": 0.25,
+              "strategy": "AreaProportional"
+            },
+            "nonCollidingLinks": ["parentLink", "childLink"]
           }
         }
       ]
@@ -185,6 +191,14 @@ TEST(Prefab, ArticulatedActor_Serialization) {
     EXPECT_STREQ("mySkinLayer", art.skin->layer.c_str());
     EXPECT_NEAR_EQ(4e9_r, art.skin->contact.penaltyCoefficient);
     EXPECT_EQ(ActorBoundaryElementType::P1Q6, art.skin->boundaryElementType);
+    ASSERT_TRUE(art.skin->boundarySubsampling.has_value());
+    EXPECT_NEAR_EQ(0.25_r, art.skin->boundarySubsampling->subsamplingDensity);
+    EXPECT_EQ(
+        BoundarySubsamplingStrategy::AreaProportional, art.skin->boundarySubsampling->strategy);
+    ASSERT_TRUE(art.skin->nonCollidingLinks.has_value());
+    ASSERT_EQ(2, static_cast<int>(art.skin->nonCollidingLinks->size()));
+    EXPECT_STREQ("parentLink", (*art.skin->nonCollidingLinks)[0].c_str());
+    EXPECT_STREQ("childLink", (*art.skin->nonCollidingLinks)[1].c_str());
   };
 
   // Load one articulated actor from JSON.
@@ -1517,6 +1531,99 @@ TEST_IF(MOCHI_INTERNAL, Prefab, SoftActor_AddToScene) {
   EXPECT_EQ(actorHandle, result.actors[0]->GetHandle());
 }
 
+TEST_IF(MOCHI_ENABLE_ROM_ACTORS, Prefab, ExperimentalAddToScene_AppliesRomToAllSoftActors) {
+  auto* context = mochi::CreateContext(0);
+  MOCHI_DEFER(mochi::DestroyContext(context));
+  auto* scene = context->CreateScene("my scene");
+  MOCHI_DEFER(context->DestroyScene(scene));
+
+  auto tempDir = CreateTempDirectory("experimental_rom_prefab_test", ExpectOK{});
+  prefab::ScenePrefab childPrefab;
+  childPrefab.actors.soft.push_back().shapeFile = "cube/cube_mesh.mochi.json";
+  auto const childPath = tempDir.Path() / "child.mochi_scene";
+  prefab::SaveToJsonFile(childPrefab, childPath.string(), ExpectOK{});
+
+  prefab::ScenePrefab parentPrefab;
+  parentPrefab.actors.soft.push_back().shapeFile = "cube/cube_mesh.mochi.json";
+  parentPrefab.prefabs.push_back().path = childPath.string();
+  auto const parentPath = tempDir.Path() / "parent.mochi_scene";
+  prefab::SaveToJsonFile(parentPrefab, parentPath.string(), ExpectOK{});
+
+  experimental::RomParams const romParams{
+      .source = "polynomial_crom_order_1",
+      .romProjectionStrategy = experimental::RomProjectionStrategy::ElementLevelProjection};
+  auto const result = experimental::AddToScene(
+      parentPath.string(),
+      test::GetAssetsDir(),
+      scene,
+      prefab::PrefabParams{},
+      romParams,
+      test::ExpectOK{});
+
+  ASSERT_EQ(2, isize(result.actors));
+  auto const& reg = static_cast<SceneImpl*>(scene)->GetRegistry();
+  for (auto const* actor : result.actors) {
+    auto const entity = GetEntityUnchecked(actor->GetHandle());
+    ASSERT_TRUE(reg.all_of<TagRomActor>(entity));
+    ASSERT_TRUE(reg.all_of<CRomProjectionStrategy>(entity));
+    EXPECT_EQ(
+        experimental::RomProjectionStrategy::ElementLevelProjection,
+        reg.get<CRomProjectionStrategy>(entity).value);
+  }
+}
+
+TEST_IF(MOCHI_ENABLE_ROM_ACTORS, Prefab, ExperimentalAddToScene_AppliesRomToNestedSoftActors) {
+  auto* context = mochi::CreateContext(0);
+  MOCHI_DEFER(mochi::DestroyContext(context));
+  auto* scene = context->CreateScene("my scene");
+  MOCHI_DEFER(context->DestroyScene(scene));
+
+  prefab::ScenePrefab scenePrefab;
+  auto& actor = scenePrefab.actors.softSkinned.push_back();
+  actor.skeletonParams.name = "RomSkeleton";
+  actor.skeletonParams.joints.push_back().type = ArticulatedJointType::Free;
+
+  auto& link = actor.skeletonParams.links.push_back();
+  link.name = "Root";
+  link.parentLink = -1;
+  link.shapeFile = "cube/cube_mesh.mochi.json";
+  link.colliderType = ColliderType::None;
+
+  auto& soft = actor.softParams.push_back();
+  soft.name = "Soft";
+  soft.shapeFile = "cube/cube_mesh.mochi.json";
+  soft.colliderType = ColliderType::None;
+  soft.hasGravity = false;
+  soft.hasInertia = true;
+  actor.softAttachLinks.push_back("Root");
+
+  auto tempDir = CreateTempDirectory("experimental_nested_rom_prefab_test", ExpectOK{});
+  auto const prefabPath = tempDir.Path() / "nested_rom.mochi_scene";
+  prefab::SaveToJsonFile(scenePrefab, prefabPath.string(), ExpectOK{});
+
+  experimental::RomParams const romParams{
+      .source = "polynomial_crom_order_1",
+      .romProjectionStrategy = experimental::RomProjectionStrategy::ActorLevelProjection};
+  auto const result = experimental::AddToScene(
+      prefabPath.string(),
+      test::GetAssetsDir(),
+      scene,
+      prefab::PrefabParams{},
+      romParams,
+      test::ExpectOK{});
+
+  ASSERT_EQ(1, isize(result.actors));
+  auto const nestedSoftActors = result.actors[0]->GetNestedSoftActors(test::ExpectOK{});
+  ASSERT_EQ(1, isize(nestedSoftActors));
+  auto const& reg = static_cast<SceneImpl*>(scene)->GetRegistry();
+  auto const entity = GetEntityUnchecked(nestedSoftActors[0]);
+  ASSERT_TRUE(reg.all_of<TagRomActor>(entity));
+  ASSERT_TRUE(reg.all_of<CRomProjectionStrategy>(entity));
+  EXPECT_EQ(
+      experimental::RomProjectionStrategy::ActorLevelProjection,
+      reg.get<CRomProjectionStrategy>(entity).value);
+}
+
 TEST_IF(MOCHI_HDF5_AND_INTERNAL, Prefab, SoftSkinnedActor_AddToScene) {
   auto* context = mochi::CreateContext(0);
   MOCHI_DEFER(mochi::DestroyContext(context));
@@ -1972,8 +2079,76 @@ TEST(Prefab, LoadNestedPrefabs_ReloadsOnPathChange) {
   EXPECT_STREQ("ActorFromB", scenePrefab.prefabs[0].prefab->actors.rigid[0].name.c_str());
 }
 
-// Loads nested prefabs and asserts the load fails with the cyclic-reference error. Cycle detection
-// legitimately logs to LogChannel::Error, so it is suppressed for the duration.
+TEST(Prefab, LoadNestedPrefabs_PreservesPopulatedPathlessReference) {
+  auto tempDir = CreateTempDirectory("pathless_nested_test", ExpectOK{});
+  WriteFile(
+      tempDir.Path() / "grandchild.mochi_scene",
+      R"({"actors": {"rigid": [{"name": "Grandchild"}]}})",
+      ExpectOK{});
+
+  auto child = std::make_shared<prefab::ScenePrefab>();
+  child->prefabs.push_back().path = "grandchild.mochi_scene";
+  prefab::ScenePrefab root;
+  root.prefabs.push_back().prefab = child;
+
+  prefab::LoadNestedPrefabs(root, tempDir.Path().string(), ExpectOK{});
+
+  EXPECT_EQ(child, root.prefabs[0].prefab);
+  ASSERT_NE(nullptr, child->prefabs[0].prefab);
+  ASSERT_EQ(1, child->prefabs[0].prefab->actors.rigid.size());
+  EXPECT_STREQ("Grandchild", child->prefabs[0].prefab->actors.rigid[0].name.c_str());
+}
+
+TEST(Prefab, LoadNestedPrefabs_RejectsUnpopulatedPathlessReference) {
+  prefab::ScenePrefab root;
+  auto& reference = root.prefabs.push_back();
+
+  Error error;
+  {
+    auto suppressError = test::SuppressLogError();
+    prefab::LoadNestedPrefabs(root, test::GetAssetsDir(), error);
+  }
+
+  EXPECT_NOT_OK(error);
+  EXPECT_NE(error.ToString().find("nested prefab reference"), std::string::npos);
+  EXPECT_EQ(nullptr, reference.prefab);
+}
+
+TEST(Prefab, LoadNestedPrefabs_FailedReloadPreservesExistingReference) {
+  auto tempDir = CreateTempDirectory("failed_nested_reload_test", ExpectOK{});
+  auto existing = std::make_shared<prefab::ScenePrefab>();
+  existing->actors.rigid.push_back().name = "Existing";
+
+  prefab::ScenePrefab root;
+  auto& reference = root.prefabs.push_back();
+  reference.path = "missing.mochi_scene";
+  reference.prefab = existing;
+
+  Error missingReplacementError;
+  {
+    auto suppressError = test::SuppressLogError();
+    prefab::LoadNestedPrefabs(root, tempDir.Path().string(), missingReplacementError);
+  }
+  EXPECT_NOT_OK(missingReplacementError);
+  EXPECT_EQ(existing, reference.prefab);
+
+  // The replacement itself loads, but its missing child prevents publication of the replacement.
+  WriteFile(
+      tempDir.Path() / "replacement.mochi_scene",
+      R"({"prefabs": [{"path": "missing.mochi_scene"}]})",
+      ExpectOK{});
+  reference.path = "replacement.mochi_scene";
+  Error missingDescendantError;
+  {
+    auto suppressError = test::SuppressLogError();
+    prefab::LoadNestedPrefabs(root, tempDir.Path().string(), missingDescendantError);
+  }
+  EXPECT_NOT_OK(missingDescendantError);
+  EXPECT_EQ(existing, reference.prefab);
+  ASSERT_EQ(1, reference.prefab->actors.rigid.size());
+  EXPECT_STREQ("Existing", reference.prefab->actors.rigid[0].name.c_str());
+}
+
 static void ExpectPrefabCycleError(Error const& error) {
   EXPECT_NOT_OK(error);
   EXPECT_NE(
@@ -2065,20 +2240,28 @@ TEST(Prefab, LoadNestedPrefabs_DetectsMutualCycle) {
 TEST(Prefab, EnsureFullyLoaded_InMemoryNestedTreeIsNotACycle) {
   auto* context = mochi::CreateContext(0);
   MOCHI_DEFER(mochi::DestroyContext(context));
+  auto tempDir = CreateTempDirectory("in_memory_nested_tree_test", ExpectOK{});
+  WriteFile(tempDir.Path() / "loaded.mochi_scene", R"({})", ExpectOK{});
 
   // Depth-2 tree of in-memory (pathless) prefabs. Their resolved paths all collapse to rootPath, so
   // a cycle guard keyed on the resolved path would falsely reject the inner reference; gating on
   // the reference's own (empty) path treats these as non-file references and skips path-based cycle
   // tracking.
   // Runs through EnsureFullyLoaded (skipLoaded=true), the path where that false positive would
-  // surface.
+  // surface. It also verifies that both pathless handles are retained while their file-backed
+  // descendant is loaded.
   auto grandchild = std::make_shared<prefab::ScenePrefab>();
+  grandchild->prefabs.push_back().path = "loaded.mochi_scene";
   auto child = std::make_shared<prefab::ScenePrefab>();
   child->prefabs.push_back().prefab = grandchild;
   prefab::ScenePrefab root;
   root.prefabs.push_back().prefab = child;
 
-  prefab::EnsureFullyLoaded(root, test::GetAssetsDir(), context, test::ExpectOK{});
+  prefab::EnsureFullyLoaded(root, tempDir.Path().string(), context, test::ExpectOK{});
+
+  EXPECT_EQ(child, root.prefabs[0].prefab);
+  EXPECT_EQ(grandchild, child->prefabs[0].prefab);
+  EXPECT_NE(nullptr, grandchild->prefabs[0].prefab);
 }
 
 TEST(Prefab, SharedInMemoryNestedPrefabIsNotACycle) {
@@ -2104,6 +2287,15 @@ TEST(Prefab, PathlessInMemoryNestedCycle_DetectedByPublicTraversals) {
   MOCHI_DEFER(mochi::DestroyContext(context));
   auto* scene = context->CreateScene("my scene");
   MOCHI_DEFER(context->DestroyScene(scene));
+
+  {
+    auto scenePrefab = MakePathlessSelfCyclePrefab();
+    MOCHI_DEFER(scenePrefab->prefabs.clear());
+    Error error;
+    auto suppressError = test::SuppressLogError();
+    prefab::LoadNestedPrefabs(*scenePrefab, test::GetAssetsDir(), error);
+    ExpectPrefabCycleError(error);
+  }
 
   {
     auto scenePrefab = MakePathlessSelfCyclePrefab();
@@ -4036,7 +4228,7 @@ TEST_IF(MOCHI_INTERNAL, Prefab, AddToSceneResult_NestedPrefabs) {
   {
     auto& nested = topPrefab.prefabs.push_back();
     nested.name = "child";
-    nested.path = "in_memory";
+    // Procedural child with no file backing; leave nested.path empty.
     nested.prefab = childPrefab;
   }
 
@@ -5126,4 +5318,158 @@ TEST(Prefab, LoadShapes_EmptyShapeFileReturnsError) {
   auto suppress = test::SuppressLogError();
   prefab::LoadShapes(scenePrefab, test::GetAssetsDir(), context, test::ExpectNotOK{});
   EXPECT_FALSE(scenePrefab.actors.rigid[0].shape.IsValid());
+}
+
+TEST(Prefab, ContactPairParamsOverride_SerializationPreservesSparseFields) {
+  auto const verify = [](prefab::ScenePrefab const& scenePrefab) {
+    ASSERT_TRUE(scenePrefab.contactPairParamsOverrides.has_value());
+    ASSERT_EQ(2, isize(*scenePrefab.contactPairParamsOverrides));
+
+    auto const& pair = (*scenePrefab.contactPairParamsOverrides)[0];
+    ASSERT_EQ(2, isize(pair.actors));
+    EXPECT_STREQ("ActorA", pair.actors[0].c_str());
+    EXPECT_STREQ("ActorB", pair.actors[1].c_str());
+    EXPECT_EQ(std::optional<real>{12_r}, pair.paramsOverride.penaltyCoefficient);
+    EXPECT_EQ(std::optional<real>{0_r}, pair.paramsOverride.coulombFrictionCoefficient);
+    EXPECT_FALSE(pair.paramsOverride.frictionFalloffVel.has_value());
+    EXPECT_FALSE(pair.paramsOverride.viscousFrictionCoefficient.has_value());
+    EXPECT_FALSE(pair.paramsOverride.normalViscousDampingCoefficient.has_value());
+
+    auto const& self = (*scenePrefab.contactPairParamsOverrides)[1];
+    ASSERT_EQ(2, isize(self.actors));
+    EXPECT_STREQ("Self", self.actors[0].c_str());
+    EXPECT_STREQ("Self", self.actors[1].c_str());
+    EXPECT_EQ(std::optional<real>{0_r}, self.paramsOverride.frictionFalloffVel);
+    EXPECT_FALSE(self.paramsOverride.penaltyCoefficient.has_value());
+  };
+
+  auto scenePrefab = prefab::ShallowLoadFromJsonString(
+      R"({
+        "contactPairParamsOverrides": [
+          {
+            "actors": ["ActorA", "ActorB"],
+            "paramsOverride": {
+              "penaltyCoefficient": 12,
+              "coulombFrictionCoefficient": 0
+            }
+          },
+          {
+            "actors": ["Self", "Self"],
+            "paramsOverride": {"frictionFalloffVel": 0}
+          }
+        ]
+      })",
+      test::ExpectOK{});
+  verify(scenePrefab);
+
+  auto const json = prefab::SaveToJsonString(scenePrefab, test::ExpectOK{});
+  EXPECT_NE(std::string::npos, json.find("\"coulombFrictionCoefficient\": 0"));
+  verify(prefab::ShallowLoadFromJsonString(json, test::ExpectOK{}));
+}
+
+TEST_IF(
+    MOCHI_INTERNAL,
+    Prefab,
+    ContactPairParamsOverride_AppliesNestedPrefabPathsAndLastEntryWins) {
+  auto* context = mochi::CreateContext(0);
+  MOCHI_DEFER(mochi::DestroyContext(context));
+  auto* scene = context->CreateScene("test");
+  MOCHI_DEFER(context->DestroyScene(scene));
+
+  auto child = std::make_shared<prefab::ScenePrefab>();
+  child->actors.rigid.push_back(MakeRigidBox("A"));
+  child->actors.rigid.push_back(MakeRigidBox("B"));
+  auto& childOverrides = child->contactPairParamsOverrides.emplace();
+  auto& childEntry = childOverrides.push_back();
+  childEntry.actors = {"A", "B"};
+  childEntry.paramsOverride.penaltyCoefficient = 3_r;
+  auto& childSelf = childOverrides.push_back();
+  childSelf.actors = {"A", "A"};
+  childSelf.paramsOverride.normalViscousDampingCoefficient = 4_r;
+
+  prefab::ScenePrefab scenePrefab;
+  scenePrefab.actors.rigid.push_back(MakeRigidBox("Self"));
+  auto& childRef = scenePrefab.prefabs.push_back();
+  childRef.name = "child";
+  childRef.prefab = child;
+  childRef.scale = 2_r;
+
+  auto& overrides = scenePrefab.contactPairParamsOverrides.emplace();
+  auto& firstReplacement = overrides.push_back();
+  firstReplacement.actors = {"child/A", "child/B"};
+  firstReplacement.paramsOverride.penaltyCoefficient = 6_r;
+  auto& lastReplacement = overrides.push_back();
+  lastReplacement.actors = {"child/B", "child/A"};
+  lastReplacement.paramsOverride.viscousFrictionCoefficient = 0.25_r;
+  auto& self = overrides.push_back();
+  self.actors = {"Self", "Self"};
+  self.paramsOverride.frictionFalloffVel = 0_r;
+
+  prefab::LoadShapes(scenePrefab, test::GetAssetsDir(), context, test::ExpectOK{});
+  prefab::AddToScene(scenePrefab, scene, {}, test::ExpectOK{});
+
+  auto const actorA = FindActorByName(scene, "child/A");
+  auto const actorB = FindActorByName(scene, "child/B");
+  auto const selfActor = FindActorByName(scene, "Self");
+  auto const pairOverride = scene->GetContactPairParamsOverride(actorB, actorA, test::ExpectOK{});
+  EXPECT_FALSE(pairOverride.penaltyCoefficient.has_value());
+  EXPECT_EQ(std::optional<real>{0.25_r}, pairOverride.viscousFrictionCoefficient);
+  auto const childSelfOverride =
+      scene->GetContactPairParamsOverride(actorA, actorA, test::ExpectOK{});
+  EXPECT_EQ(std::optional<real>{4_r}, childSelfOverride.normalViscousDampingCoefficient);
+  auto const selfOverride =
+      scene->GetContactPairParamsOverride(selfActor, selfActor, test::ExpectOK{});
+  EXPECT_EQ(std::optional<real>{0_r}, selfOverride.frictionFalloffVel);
+}
+
+TEST_IF(MOCHI_INTERNAL, Prefab, ContactPairParamsOverride_RejectsInvalidActorNames) {
+  auto* context = mochi::CreateContext(0);
+  MOCHI_DEFER(mochi::DestroyContext(context));
+
+  auto makeEntry = [](prefab::ScenePrefab& scenePrefab, char const* actorA, char const* actorB) {
+    auto& entry = scenePrefab.contactPairParamsOverrides.emplace().push_back();
+    entry.actors = {actorA, actorB};
+    entry.paramsOverride.penaltyCoefficient = 1_r;
+  };
+
+  {
+    auto* scene = context->CreateScene("missing");
+    MOCHI_DEFER(context->DestroyScene(scene));
+    prefab::ScenePrefab scenePrefab;
+    scenePrefab.actors.rigid.push_back(MakeRigidBox("Cube"));
+    makeEntry(scenePrefab, "Cube", "Missing");
+    prefab::LoadShapes(scenePrefab, test::GetAssetsDir(), context, test::ExpectOK{});
+    auto suppress = test::SuppressLogError();
+    prefab::AddToScene(scenePrefab, scene, {}, test::ExpectNotOK{});
+  }
+
+  {
+    auto* scene = context->CreateScene("ambiguous");
+    MOCHI_DEFER(context->DestroyScene(scene));
+    prefab::ScenePrefab scenePrefab;
+    scenePrefab.actors.rigid.push_back(MakeRigidBox("Cube"));
+    scenePrefab.actors.rigid.push_back(MakeRigidBox("Cube"));
+    makeEntry(scenePrefab, "Cube", "Cube");
+    prefab::LoadShapes(scenePrefab, test::GetAssetsDir(), context, test::ExpectOK{});
+    ExpectAmbiguousActorNameError(scenePrefab, scene);
+  }
+
+  for (int numActors : {0, 1, 3}) {
+    auto* scene = context->CreateScene("wrong-size");
+    MOCHI_DEFER(context->DestroyScene(scene));
+    prefab::ScenePrefab scenePrefab;
+    auto& entry = scenePrefab.contactPairParamsOverrides.emplace().push_back();
+    entry.paramsOverride.penaltyCoefficient = 1_r;
+    for (int i = 0; i < numActors; ++i) {
+      auto const actorName = "Actor" + std::to_string(i);
+      scenePrefab.actors.rigid.push_back(MakeRigidBox(actorName));
+      entry.actors.push_back(DynamicString(actorName));
+    }
+    prefab::LoadShapes(scenePrefab, test::GetAssetsDir(), context, test::ExpectOK{});
+
+    Error error;
+    prefab::AddToScene(scenePrefab, scene, {}, error);
+    EXPECT_STREQ(
+        "ContactPairParamsOverrideEntry must have exactly 2 actors.", error.GetDescription());
+  }
 }

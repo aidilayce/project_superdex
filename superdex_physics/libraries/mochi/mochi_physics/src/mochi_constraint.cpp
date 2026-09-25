@@ -221,14 +221,15 @@ GetNodeCoordinates(entt::registry const& reg, entt::entity e, int index, Error& 
     if (auto const* tetMesh = reg.try_get<CTetrahedralMesh const>(e)) {
       // Soft actor
       return tetMesh->mesh->GetNodeCoordinates();
-    } else if (auto const* surfMesh = reg.try_get<CSurfaceMesh const>(e)) {
-      // Shell actor
-      MOCHI_ASSERT_VERBOSE(reg.all_of<TagShellActor>(e), "Expected a shell actor");
-      return surfMesh->mesh->GetNodeCoordinates();
     } else if (auto const* polylineMesh = reg.try_get<CPolylineMesh const>(e)) {
-      // Rod actor
+      // Rod actor. Rod constraints always use centerline node indices, even when the actor exposes
+      // an authored surface mesh.
       MOCHI_ASSERT_VERBOSE(reg.all_of<TagRodActor>(e), "Expected a rod actor");
       return polylineMesh->nodes;
+    } else if (auto const* triMesh = reg.try_get<CTriangularMesh const>(e)) {
+      // Shell actor
+      MOCHI_ASSERT_VERBOSE(reg.all_of<TagShellActor>(e), "Expected a shell actor");
+      return triMesh->mesh->GetNodeCoordinates();
     } else {
       MOCHI_ERROR_SET(error, "Expected a soft, shell, or rod actor");
       return Span<Real3 const>{};
@@ -1522,14 +1523,14 @@ void mochi::EvalConstraint(
 #undef MOCHI_TRY_CALL_EVAL_CONSTRAINT
 }
 
-template MOCHI_API void mochi::EvalConstraint<TimeStep::Current>(
+template void mochi::EvalConstraint<TimeStep::Current>(
     entt::registry&,
     entt::entity,
     Span<real>,
     Span<real>,
     Span<real>,
     bool&);
-template MOCHI_API void mochi::EvalConstraint<TimeStep::StageStart>(
+template void mochi::EvalConstraint<TimeStep::StageStart>(
     entt::registry&,
     entt::entity,
     Span<real>,
@@ -2025,22 +2026,22 @@ void mochi::AssembleConstraint(
 #undef MOCHI_TRY_INVOKE_ASSEMBLE_CONSTRAINT
 }
 
-template MOCHI_API void mochi::AssembleConstraint<GradTarget::Current>(
+template void mochi::AssembleConstraint<GradTarget::Current>(
     entt::registry&,
     entt::entity,
     AssemblyParams const&,
     CCompoundConstraintSnle&);
-template MOCHI_API void mochi::AssembleConstraint<GradTarget::Previous>(
+template void mochi::AssembleConstraint<GradTarget::Previous>(
     entt::registry&,
     entt::entity,
     AssemblyParams const&,
     CCompoundConstraintSnle&);
-template MOCHI_API void mochi::AssembleConstraint<GradTarget::CurrentInput>(
+template void mochi::AssembleConstraint<GradTarget::CurrentInput>(
     entt::registry&,
     entt::entity,
     AssemblyParams const&,
     CCompoundConstraintSnle&);
-template MOCHI_API void mochi::AssembleConstraint<GradTarget::PreviousInput>(
+template void mochi::AssembleConstraint<GradTarget::PreviousInput>(
     entt::registry&,
     entt::entity,
     AssemblyParams const&,

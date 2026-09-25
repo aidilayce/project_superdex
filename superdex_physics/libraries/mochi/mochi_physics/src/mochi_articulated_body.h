@@ -22,7 +22,6 @@
 #include "mochi_pose_controller.h"
 #include "mochi_rigid.h"
 #include "mochi_shape.h"
-#include "mochi_skinning.h"
 #include "mochi_snle.h"
 
 #include <mochi_physics/cpp_api/mochi_structs.h> // ArticulatedActorParams, ArticulatedSkinParams
@@ -30,6 +29,7 @@
 #include <mochi_core/articulated_body/articulated_body.h>
 #include <mochi_core/articulated_body/transmission.h>
 #include <mochi_core/integration/integration_utils.h>
+#include <mochi_core/utils/dskinning.h>
 #include <mochi_core/utils/graph.h>
 
 #include <memory>
@@ -102,39 +102,40 @@ template <TimeStep kRelTime>
 struct CArticulatedLinkTransforms : public std::vector<TransformRT>, NoCopy {
   using std::vector<TransformRT>::vector; // Inherit base class' constructors
 };
+struct ArticulatedJointVelocities {
+  ArticulatedJointVelocities() = default;
+  explicit ArticulatedJointVelocities(int size) : value(size) {}
+  explicit ArticulatedJointVelocities(DynamicArray<RigidBodyVel> const& valueIn) : value(valueIn) {}
+  explicit ArticulatedJointVelocities(DynamicArray<RigidBodyVel>&& valueIn)
+      : value(std::move(valueIn)) {}
+
+  DynamicArray<RigidBodyVel> value;
+
+  MOCHI_STRUCT_BEGIN(mochi::ArticulatedJointVelocities);
+  MOCHI_FIELD(value);
+  MOCHI_STRUCT_END();
+};
+
 template <TimeStep kRelTime>
-struct CArticulatedJointVels : NoCopy {
-  CArticulatedJointVels() = default;
-  explicit CArticulatedJointVels(int size) : value(size) {}
-  std::vector<CRigidVel<kRelTime>> value;
+struct CArticulatedJointVels : public ArticulatedJointVelocities, NoCopy {
+  using ArticulatedJointVelocities::ArticulatedJointVelocities;
 
   MOCHI_TEMPLATE_BEGIN(mochi::CArticulatedJointVels, kRelTime);
   MOCHI_ATTRIBUTE_IF(kRelTime == TimeStep::Current, CaptureState);
-  MOCHI_FIELD(value);
+  MOCHI_BASE_CLASS(ArticulatedJointVelocities);
   MOCHI_TEMPLATE_END();
 };
 
-/// @brief Component for time integration of articulated reduced pose.
-struct CIntegrationArticulatedReducedPose : public IntegrationBundle<ArticulatedPose>, NoCopy {
-  using IntegrationBundle<ArticulatedPose>::IntegrationBundle;
-
-  MOCHI_STRUCT_BEGIN(mochi::CIntegrationArticulatedReducedPose);
-  MOCHI_ATTRIBUTE(CaptureState);
-  MOCHI_BASE_CLASS(IntegrationBundle<ArticulatedPose>);
-  MOCHI_STRUCT_END();
+// Derived world-space link velocities, mirroring each link's CRigidVel<TimeStep::Current>.
+struct CArticulatedLinkVels : public DynamicArray<RigidBodyVel>, NoCopy {
+  using DynamicArray<RigidBodyVel>::DynamicArray;
 };
+
+/// @brief Component for time integration of articulated reduced pose.
+MOCHI_DEFINE_INTEGRATION_COMPONENT(CIntegrationArticulatedReducedPose, ArticulatedPose);
 
 /// @brief Component for time integration of articulated joint velocities.
-struct CIntegrationArticulatedJointVels : public NoCopy {
-  CIntegrationArticulatedJointVels() = default;
-  explicit CIntegrationArticulatedJointVels(int numLinks) : value(numLinks) {}
-  DynamicArray<IntegrationRigidVels> value;
-
-  MOCHI_STRUCT_BEGIN(mochi::CIntegrationArticulatedJointVels);
-  MOCHI_ATTRIBUTE(CaptureState);
-  MOCHI_FIELD(value);
-  MOCHI_STRUCT_END();
-};
+MOCHI_DEFINE_INTEGRATION_COMPONENT(CIntegrationArticulatedJointVels, ArticulatedJointVelocities);
 
 struct CArticulatedSkinningData : public ArticulatedSkinningData, NoCopy {};
 
@@ -145,6 +146,7 @@ struct CArticulatedRestTransforms : public articulated::RestTransformArray, NoCo
 struct CArticulatedSkinExportParams : NoCopy {
   ActorBoundaryElementType boundaryElementType = ActorBoundaryElementType::Default;
   std::optional<BoundarySubsamplingParams> boundarySubsampling;
+  std::optional<DynamicArray<DynamicString>> nonCollidingLinks;
 };
 
 struct CArticulatedParents : public articulated::ParentIndexArray, NoCopy {};
@@ -255,13 +257,18 @@ void InitFullDofProblem(entt::registry& reg, entt::entity e);
 void SetArticulatedPoseFromLinks(entt::registry& reg, entt::entity e);
 
 // Set the articulated body's dofs
-MOCHI_API void
-SetArticulatedBodyPose(entt::registry& reg, entt::entity e, Span<real const> pose, Error& error);
+void SetArticulatedBodyPose(
+    entt::registry& reg,
+    entt::entity e,
+    Span<real const> pose,
+    Error& error);
 
 // Set the articulated body's root transform (world-from-root) and recompute derived state (the link
 // world transforms depend on the root via forward kinematics).
-MOCHI_API void
-SetArticulatedRootTransform(entt::registry& reg, entt::entity e, TransformRT const& worldFromRoot);
+void SetArticulatedRootTransform(
+    entt::registry& reg,
+    entt::entity e,
+    TransformRT const& worldFromRoot);
 
 // Get the link transforms
 void GetLinkTransforms(
@@ -383,13 +390,13 @@ Span<real const>
 GetPoseControllerForce(entt::registry& reg, entt::entity e, Scene const* scene, Error& error);
 
 // To be run pre-simulation step for all articulated body actors
-MOCHI_API void PreStepArticulatedBodyActorAsync(entt::registry& reg, entt::entity e);
+void PreStepArticulatedBodyActorAsync(entt::registry& reg, entt::entity e);
 
 /*
  * Pipeline to update quantities that are a function of the state (aka derived state) of the
  * articulated body actor and make them consistent with the state.
  */
-MOCHI_API void UpdateDerivedStatePipeline(entt::registry& reg, Span<entt::entity const> entities);
+void UpdateDerivedStatePipeline(entt::registry& reg, Span<entt::entity const> entities);
 
 /*
  * Pipelines to update articulated Jacobians, based on state or target input.
@@ -428,14 +435,12 @@ void UpdateJacobianState(
 }
 
 /*
- * System to update the displacements of the skinning. Templatized according to time step type.
+ * Pipeline to resolve current skinning displacements for all nodes, including inactive nodes when
+ * subsampling is enabled.
  */
-template <TimeStep kStep, bool kForceUseAllNodes = false>
-void ResolveSkinning(
-    CArticulatedLinkTransforms<kStep> const& linkTransforms,
-    CArticulatedSkinningData const& skinningData,
-    CActiveUniqueNodes const* activeNodes,
-    CDisplacementSlice<real, kStep, DisplacementLayer::Skinned>& outDisplacements);
+void ResolveAllNodeSkinningDisplacementsPipeline(
+    entt::registry& reg,
+    Span<entt::entity const> entities);
 
 /*
  * Function to update the Jacobian of some skinned data w.r.t. the bone dofs (if one exists).
@@ -461,6 +466,16 @@ void ResolveSkinningJacobianDJoints(
     CActiveUniqueNodes const* activeNodes,
     CArticulatedSkinningData& skinningData);
 
+// Compute world-space skinning velocity on demand. Use finite-step rotation velocities.
+inline void UpdateSkinningVelocity(
+    CArticulatedLinkTransforms<TimeStep::Current> const& linkTransforms,
+    CArticulatedLinkVels const& linkVels,
+    CArticulatedSkinningData const& skinningData,
+    CVelocitySlice<real, TimeStep::Current, DisplacementLayer::Skinned>& outVelocity) {
+  skinningData.skinningTransform.DTransformDBones</*kTangentVel*/ false>(
+      linkTransforms, skinningData.restCoords, linkVels, outVelocity.value);
+}
+
 /*
  * System to compute contact Jacobians as colliding actor. It is called after the collision
  * detection pipeline, within each nonlinear solver iteration.
@@ -479,7 +494,7 @@ void SetupCollidingJacobians(
  * System to assemble the objective, residual and dresidual of the damping forces acting on joints
  * of the articulated body. Internally called by EntityAssemble.
  */
-MOCHI_API void AssembleDampingForces(
+void AssembleDampingForces(
     AssemblyParams const& params,
     CArticulatedBodyShape const& bodyShape,
     CArticulatedJointPoseInfo const& poseInfo,
@@ -495,7 +510,7 @@ MOCHI_API void AssembleDampingForces(
  * System to assemble the objective, residual, and dresidual of forces from transmissions attached
  * to the articulated body.
  */
-MOCHI_API void AssembleTransmissionForces(
+void AssembleTransmissionForces(
     AssemblyParams const& params,
     CArticulatedLinkTransforms<TimeStep::Current> const& currLinkTxs,
     CArticulatedLinkTransforms<TimeStep::StageStart> const& stageStartLinkTxs,
@@ -511,7 +526,7 @@ MOCHI_API void AssembleTransmissionForces(
  * kinematics. Reads the entity's joint info / parents / rest transforms / root transform from the
  * registry. `outLinkTransformsCom.size()` must equal the number of links.
  */
-MOCHI_API void GetLinkTransformsComFromPose(
+void GetLinkTransformsComFromPose(
     entt::registry const& reg,
     entt::entity e,
     Span<real const> pose,
@@ -521,7 +536,7 @@ MOCHI_API void GetLinkTransformsComFromPose(
  * System to assemble the objective, residual and dresidual of the inertia forces acting on joints
  * of the articulated body. Internally called by EntityAssemble.
  */
-MOCHI_API void AssembleInertiaForces(
+void AssembleInertiaForces(
     AssemblyParams const& params,
     ecs::OptionalTag<TagUseNewtonEulerInertia> useNewtonEulerInertia,
     CArticulatedBodyShape const& bodyShape,
@@ -539,7 +554,7 @@ MOCHI_API void AssembleInertiaForces(
  * System to assemble the objective, residual and dresidual of the friction forces acting on joints
  * of the articulated body. Internally called by EntityAssemble.
  */
-MOCHI_API void AssembleFrictionForces(
+void AssembleFrictionForces(
     AssemblyParams const& params,
     CArticulatedBodyShape const& bodyShape,
     CArticulatedJointPoseInfo const& poseInfo,
@@ -555,7 +570,7 @@ MOCHI_API void AssembleFrictionForces(
  * System to assemble the objective, residual and dresidual of external forces acting on joint dofs.
  * Internally called by EntityAssemble.
  */
-MOCHI_API void AssembleExternalForces(
+void AssembleExternalForces(
     AssemblyParams const& params,
     CArticulatedProps const& props,
     CArticulatedBodyShape const& bodyShape,
@@ -572,7 +587,7 @@ MOCHI_API void AssembleExternalForces(
  * state). The span of reals is usually the components of the non-linear problem solution vector
  * corresponding to the actor, thereby the name.
  */
-MOCHI_API void EntitySetSolution(
+void EntitySetSolution(
     ColumnVectorView<real const> solution,
     ecs::RequiredTag<TagArticulatedActor>,
     CArticulatedBodyShape const& bodyShape,
@@ -591,7 +606,7 @@ MOCHI_API void EntitySetSolution(
  * components of the non-linear problem solution vector corresponding to the actor, thereby the
  * name.
  */
-MOCHI_API void EntityGetSolution(
+void EntityGetSolution(
     ColumnVectorView<real> outSolution,
     ecs::RequiredTag<TagArticulatedActor>,
     CArticulatedReducedPose<TimeStep::Current> const& reducedPose);
@@ -608,7 +623,7 @@ MOCHI_API void EntityGetSolution(
  * Any derived state that is required for assembly and not updated in this system MUST be
  * updated in EntityAssemble or in mochi_solve's UpdateDerivedStateBeforeAssembly.
  */
-MOCHI_API void EntityPostNewSolution(
+void EntityPostNewSolution(
     ColumnVectorView<real const> solution,
     ecs::RequiredTag<TagArticulatedActor>,
     CDofOffset const& dofOffset,
@@ -635,7 +650,7 @@ MOCHI_API void EntityPostNewSolution(
  * Any derived state that is required for assembly and not updated in this system MUST be
  * updated in EntityAssemble or in mochi_solve's UpdateDerivedStateBeforeAssembly.
  */
-MOCHI_API void EntityPostNewIncrement(
+void EntityPostNewIncrement(
     ColumnVectorView<real const> reference,
     ColumnVectorView<real const> increment,
     ecs::RequiredTag<TagArticulatedActor>,
@@ -688,7 +703,7 @@ void PreStepPipeline(entt::registry& reg);
 /*
  * Executed before the first time integration stage of the time step.
  */
-MOCHI_API void EntityPreFirstStage(
+void EntityPreFirstStage(
     ecs::Included<TagArticulatedActor>,
     CArticulatedBodyShape const& bodyShape,
     CArticulatedJointPoseInfo const& poseInfo,
@@ -701,7 +716,7 @@ MOCHI_API void EntityPreFirstStage(
 /*
  * Pipeline executed before each time integration stage.
  */
-MOCHI_API void PreStagePipeline(entt::registry& reg, Span<entt::entity const> entities);
+void PreStagePipeline(entt::registry& reg, Span<entt::entity const> entities);
 
 /*
  * Pipeline executed after each time integration stage.
@@ -734,18 +749,13 @@ void RecordState(
     CRecordingData& outData);
 
 /*
- * ECS system to possibly update vsym of joint velocities at the beginning of a time step.
+ * ECS system to possibly update vsym of joint and link velocities at the beginning of a time step.
  */
 void UpdateVSym(
     ecs::Included<TagArticulatedActor>,
     ecs::CtxGlobal<CSceneTime const> time,
-    CArticulatedJointVels<TimeStep::Current>& outJointVels);
-
-/*
- * Helper function to produce a SkinningParams data structure for an articulated body
- */
-SkinningParams
-CreateSkinningParams(entt::registry& reg, entt::entity e, bool allowUnusedBones, Error& error);
+    CArticulatedJointVels<TimeStep::Current>& outJointVels,
+    CArticulatedLinkVels& outLinkVels);
 
 /*
  * [Differentiability] System to project a derived state gradient to a state gradient.
@@ -796,14 +806,14 @@ void ProjectContactForceAdjoints(
     CArticulatedJacobian const& jacobian,
     CDiffContactGrad<kGradTarget>& outGrad);
 
-// Update CBoundingVolume<TimeStep::Current>.localShape from the deformation of a triangular skin
-// mesh on a compound (articulated/blended) actor.
+// Update CBoundingVolume.localShape from the deformation of a triangular skin mesh on a compound
+// (articulated/blended) actor. kStep selects the state used to compute the bounds.
 template <TimeStep kStep>
 void UpdateBounds(
     ecs::RequiredTag<TagCompoundActor>,
     CTriangularMesh const& meshComponent,
     CFinalDisplacementRef<kStep> const& solComponent,
-    CBoundingVolume<TimeStep::Current>& outBounds);
+    CBoundingVolume& outBounds);
 
 } // namespace articulated::compound
 
@@ -815,7 +825,7 @@ namespace articulated::rigid {
 /*
  * System to update Jacobian
  */
-MOCHI_API void EntityUpdateJacobian(
+void EntityUpdateJacobian(
     ecs::Included<TagArticulatedLinkActor>,
     ecs::PartialRegistry<CArticulatedJacobian const> reg,
     CArticulatedEntity const& entArticulated,
@@ -869,20 +879,20 @@ MOCHI_FORCE_INLINE void SetupColliderJacobians(
  * Copies the position state of the articulated actor to the position state of the underlying rigid
  * actors.
  */
-MOCHI_API void EntitySetSolution(
+void EntitySetSolution(
     ecs::RequiredTag<TagArticulatedLinkActor>,
     CDofOffset const& rigidDofOffset,
     CArticulatedFullPoseRef const& fullPoseRef,
     CRigidState<TimeStep::Current>& outCurrPose);
 
-MOCHI_API void EntityPreStep(
+void EntityPreStep(
     ecs::RequiredTag<TagArticulatedLinkActor>,
     CRigidState<TimeStep::Current> const& currPose,
     CRigidVel<TimeStep::Current>& currVel,
     CRigidState<TimeStep::Previous>& prevPose,
     CRigidVel<TimeStep::Previous>& prevVel);
 
-MOCHI_API void EntityPreFirstStage(
+void EntityPreFirstStage(
     ecs::RequiredTag<TagArticulatedLinkActor>,
     CTimeIntegratorState const& intState,
     CRigidVel<TimeStep::Previous> const& prevVel,
@@ -900,7 +910,7 @@ void EntityPreStage(
     CRigidVel<TimeStep::StageStart>& stageStartVel,
     CRootTransform& rootTransform);
 
-MOCHI_API void EntityPostStage(
+void EntityPostStage(
     ecs::RequiredTag<TagArticulatedLinkActor>,
     CConvergenceStatus const& convergence,
     CDofOffset const& rigidDofOffset,
@@ -933,7 +943,7 @@ void EntityPostLastStage(
  * Any derived state that is required for assembly and not updated in this system MUST be
  * updated in EntityAssemble or in mochi_solve's UpdateDerivedStateBeforeAssembly.
  */
-MOCHI_API void EntityPostNewSolution(
+void EntityPostNewSolution(
     ecs::RequiredTag<TagArticulatedLinkActor>,
     ecs::Excluded<TagStaticActor>,
     CRigidBodyInertia const& rigidInertia,

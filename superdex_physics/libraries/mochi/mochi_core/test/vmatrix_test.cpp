@@ -89,8 +89,8 @@ TEST(BasicTypes, LoadMatrix) {
       for (int j = 0; j < dense.dims[1]; ++j) {
         for (int k = 0; k < dense.dims[2]; ++k) {
           for (int l = 0; l < dense.dims[3]; ++l) {
-            EXPECT_EQ(value, Get(simd1[i][j][k], l));
-            EXPECT_EQ(value, Get(simd2[i][j][k], l));
+            EXPECT_EQ(value, simd1[i][j][k][l]);
+            EXPECT_EQ(value, simd2[i][j][k][l]);
             value += 1_r;
           }
         }

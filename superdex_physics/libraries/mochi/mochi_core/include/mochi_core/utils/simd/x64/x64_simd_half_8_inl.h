@@ -167,17 +167,17 @@ class Simd<Half, 8> {
     return ReinterpretCast<Half>(static_cast<uint16_t>(_mm_extract_epi16(v.raw, i)));
   }
 
-  [[nodiscard]] static MOCHI_FORCE_INLINE Scalar Get(Simd v, int i) {
+  [[nodiscard]] MOCHI_FORCE_INLINE Scalar operator[](int i) const {
     MOCHI_ASSERT_VERBOSE(i >= 0 && i < kSize, "Index out of range.");
     switch (i) { // clang-format off
-      case 0: return Get<0>(v);
-      case 1: return Get<1>(v);
-      case 2: return Get<2>(v);
-      case 3: return Get<3>(v);
-      case 4: return Get<4>(v);
-      case 5: return Get<5>(v);
-      case 6: return Get<6>(v);
-      case 7: return Get<7>(v);
+      case 0: return Get<0>(*this);
+      case 1: return Get<1>(*this);
+      case 2: return Get<2>(*this);
+      case 3: return Get<3>(*this);
+      case 4: return Get<4>(*this);
+      case 5: return Get<5>(*this);
+      case 6: return Get<6>(*this);
+      case 7: return Get<7>(*this);
       MOCHI_UNLIKELY default: return Scalar{};
     } // clang-format on
   }

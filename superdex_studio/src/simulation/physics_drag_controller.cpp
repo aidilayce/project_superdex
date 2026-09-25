@@ -23,11 +23,13 @@
 #include <mochi_renderer/debug.h>
 #include <mochi_renderer/type_conversions.h>
 
+#include <mochi_core/geometry/aabb.h>
 #include <mochi_core/utils/basic_utils.h>
 #include <mochi_core/utils/constants.h>
 #include <mochi_core/utils/math_utils.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <limits>
 #include <utility>
@@ -194,11 +196,56 @@ void PhysicsDragController::BuildActorMap(mochi::Scene* scene) {
           }
         }
       }
+      // A skin is folded into the compound entity (it shares this actor's handle and is not a
+      // link), so register it under its skin staged name; a pick there resolves to the nearest link
+      // at grab time (see OnPreStep).
+      if (!actor->GetSurfaceMesh().IsEmpty()) {
+        if (char const* name = actor->GetName()) {
+          _skinNameToArticulated[SkinStagedName(name)] = actor->GetHandle();
+        }
+      }
     }
   });
 }
 
-std::optional<mochi::ActorHandle> PhysicsDragController::ResolveActor(
+mochi::ActorHandle PhysicsDragController::NearestLinkToPoint(
+    mochi::Scene* scene,
+    mochi::ActorHandle articulated,
+    mochi::Real3 point) {
+  mochi::Actor* actor = scene->GetActor(articulated);
+  if (actor == nullptr) {
+    return {};
+  }
+  mochi::Error error;
+  mochi::Span<mochi::ActorHandle const> const links = actor->GetNestedLinkActors(error);
+  if (!error.IsOK()) {
+    return {};
+  }
+  mochi::ActorHandle best = {};
+  mochi::real bestSq = std::numeric_limits<mochi::real>::max();
+  for (mochi::ActorHandle const& link : links) {
+    mochi::Actor* linkActor = scene->GetActor(link);
+    if (linkActor == nullptr) {
+      continue;
+    }
+    mochi::Error aabbError;
+    mochi::Aabb const aabb = linkActor->GetAabbWorld(aabbError);
+    if (!aabbError.IsOK()) {
+      continue;
+    }
+    // Squared distance from the grab point to the link's world AABB (zero if inside): clamp the
+    // point into the box, then measure. Picks the enclosing/closest link under the skin surface.
+    mochi::Real3 const clamped = mochi::Max(aabb.GetMin(), mochi::Min(point, aabb.GetMax()));
+    mochi::real const distSq = mochi::NormSqr(clamped - point);
+    if (distSq < bestSq) {
+      bestSq = distSq;
+      best = link;
+    }
+  }
+  return best;
+}
+
+std::optional<std::string> PhysicsDragController::ResolveStagedName(
     mochi_renderer::SceneObject* object) const {
   if (object == nullptr || _stage == nullptr) {
     return std::nullopt;
@@ -207,11 +254,7 @@ std::optional<mochi::ActorHandle> PhysicsDragController::ResolveActor(
   if (idx < 0 || idx >= _stage->GetNumActors()) {
     return std::nullopt;
   }
-  auto const it = _nameToHandle.find(_stage->GetActors()[idx].name);
-  if (it == _nameToHandle.end()) {
-    return std::nullopt;
-  }
-  return it->second;
+  return _stage->GetActors()[idx].name;
 }
 
 mochi::Real3 PhysicsDragController::FilamentToMochi(filament::math::float3 point) const {
@@ -221,20 +264,43 @@ mochi::Real3 PhysicsDragController::FilamentToMochi(filament::math::float3 point
 bool PhysicsDragController::BeginDrag(
     mochi_renderer::SceneObject* object,
     filament::math::float3 filamentHitPoint) {
-  std::optional<mochi::ActorHandle> const handle = ResolveActor(object);
-  if (!handle.has_value()) {
-    return false; // not a grabbable object
+  std::optional<std::string> const name = ResolveStagedName(object);
+  if (!name.has_value()) {
+    return false; // not a staged object
   }
   mochi::Real3 const target = FilamentToMochi(filamentHitPoint);
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    _actor = *handle;
-    _targetMochi = target;
-    _active = true;
-    ++_generation;
+
+  // Direct grab: rigid body, soft body, or articulated link.
+  if (auto const it = _nameToHandle.find(*name); it != _nameToHandle.end()) {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _actor = it->second;
+      _targetMochi = target;
+      _active = true;
+      _pendingSkinResolve = false;
+      ++_generation;
+    }
+    _dragging = true;
+    return true;
   }
-  _dragging = true;
-  return true;
+
+  // Skin grab: the pick maps to the owning articulated actor; the concrete link is resolved on the
+  // sim thread on the first step (OnPreStep) using the grab point.
+  if (auto const it = _skinNameToArticulated.find(*name); it != _skinNameToArticulated.end()) {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _actor = it->second;
+      _targetMochi = target;
+      _skinGrabPoint = target;
+      _active = true;
+      _pendingSkinResolve = true;
+      ++_generation;
+    }
+    _dragging = true;
+    return true;
+  }
+
+  return false; // not a grabbable object
 }
 
 void PhysicsDragController::UpdateDrag(filament::math::float3 filamentTargetPoint) {
@@ -263,6 +329,8 @@ void PhysicsDragController::OnPreStep(mochi::StepInfo const& info) {
   mochi::Real3 target = {};
   uint64_t generation = 0;
   PhysicsDragSettings settings;
+  bool pendingSkinResolve = false;
+  mochi::Real3 skinGrabPoint = {};
   {
     std::lock_guard<std::mutex> lock(_mutex);
     active = _active;
@@ -270,6 +338,8 @@ void PhysicsDragController::OnPreStep(mochi::StepInfo const& info) {
     target = _targetMochi;
     generation = _generation;
     settings = _settings;
+    pendingSkinResolve = _pendingSkinResolve;
+    skinGrabPoint = _skinGrabPoint;
   }
 
   mochi::Scene* scene = info.scene;
@@ -367,6 +437,31 @@ void PhysicsDragController::OnPreStep(mochi::StepInfo const& info) {
   bool const setUp = _simCreatedGeneration == generation &&
       (_simConstraintValid || _simStatic || !_simSoftConstraints.empty() || _simSetupFailed);
   if (!setUp) {
+    // A skin grab initially targets the articulated compound actor (the skin shares its handle and
+    // is not a draggable link). Resolve it to the nearest nested link now -- on the sim thread,
+    // where live link AABBs are available -- and grab that link with the normal rigid path below.
+    if (pendingSkinResolve) {
+      mochi::ActorHandle const link = NearestLinkToPoint(scene, actor, skinGrabPoint);
+      std::lock_guard<std::mutex> lock(_mutex);
+      // The lock was released while resolving, so the UI thread may have started a new grab in the
+      // meantime. Writing _actor now would point that grab at a link resolved for the previous one,
+      // and clearing _pendingSkinResolve would strand it on the compound root. Leave it for the
+      // next step, which re-reads the current state.
+      if (_generation != generation) {
+        return;
+      }
+      _pendingSkinResolve = false;
+      if (scene->GetActor(link) != nullptr) {
+        actor = link;
+        _actor = link;
+      } else {
+        // No resolvable link (e.g. query failure); drop the grab rather than trying to spring the
+        // compound root, and avoid retrying every step.
+        _active = false;
+        publishDebug(false, true, {}, {}, 0_r);
+        return;
+      }
+    }
     destroyConstraints();
     _simStatic = false;
     _simSoft = false;
@@ -636,9 +731,9 @@ void PhysicsDragController::DrawDebug(
   debugDraw->DrawSolidSphere(target, sphereRadius, color);
   debugDraw->DrawLine(anchor, target, color);
   if (debugText != nullptr && data.grabbable) {
-    char label[32];
-    std::snprintf(label, sizeof(label), "%.3f N", static_cast<double>(data.forceNewtons));
-    debugText->Draw(target, label, color, kForceLabelOffset);
+    std::array<char, 32> label{};
+    std::snprintf(label.data(), label.size(), "%.3f N", static_cast<double>(data.forceNewtons));
+    debugText->Draw(target, label.data(), color, kForceLabelOffset);
   }
 }
 

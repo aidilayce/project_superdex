@@ -19,255 +19,141 @@
 #include <mochi_core/linear_algebra/matrix.h>
 #include <mochi_core/mochi_config.h>
 #include <mochi_core/utils/dynamic_array.h>
+#include <mochi_core/utils/group_rw.h>
 #include <mochi_core/utils/nd_array_utils.h>
 
-// The current implementation of DeepFlowMap requires libtorch
-#if MOCHI_USE_TORCH
-
-MOCHI_WARNING_PUSH()
-MOCHI_WARNING_IGNORE_MSVC(4067 4244 4251 4267 4275 4324 4458 4522 4624 4702 4805 4996)
-#include <torch/script.h>
-#include <torch/torch.h>
-MOCHI_WARNING_POP()
-
-#if MOCHI_PLATFORM_WINDOWS
-#include <Windows.h>
-#endif
-
 #include <algorithm>
-#include <array>
+#include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <utility>
 
-// Must come after torch includes because the compiler complains about ambiguous references to
-// c10::Allocator vs mochi::Allocator
-using namespace mochi;
-
 namespace mochi {
 
-// TODO: The current implementation assumes the Torch module is an MLP with ELU activations,
-// except the last layer that has no activation.
-static ai::Mlp<real> ToMochiMlp(torch::jit::script::Module const& module) {
-  DynamicArray<Matrix<real>> weights;
-  DynamicArray<ColumnVector<real>> biases;
-  for (auto const& param : module.named_parameters()) {
-    auto tensor = param.value.to(torch::kCPU);
-    if (param.name.find("weight") != std::string::npos) {
-      weights.emplace_back(
-          RowMatrixView<real const>(tensor.data_ptr<real>(), tensor.size(0), tensor.size(1)));
-    } else if (param.name.find("bias") != std::string::npos) {
-      biases.emplace_back(ColumnVectorView<real const>(tensor.data_ptr<real>(), tensor.size(0)));
-    }
-  }
+static std::optional<ai::MlpLayer<real>> LoadMlpLayer(GroupReader& reader, Error& error) {
+  MOCHI_ERROR_RETURN(error, {});
 
-  int const numLayers = isize(weights);
-  MOCHI_ASSERT(numLayers == biases.size(), "Inconsistent weight and bias sizes.");
-  DynamicArray<ai::MlpLayer<real>> mlpLayers;
-  mlpLayers.reserve(numLayers);
-  for (int iLayer = 0; iLayer < numLayers; ++iLayer) {
-    if (iLayer < (numLayers - 1)) {
-      mlpLayers.emplace_back(
-          std::move(weights[iLayer]), std::move(biases[iLayer]), ai::ELUActivation<real>());
-    } else {
-      mlpLayers.emplace_back(
-          std::move(weights[iLayer]), std::move(biases[iLayer]), ai::IdentityActivation<real>());
-    }
-  }
+  DynamicArray<real> weightData;
+  size_t weightDims[2] = {};
+  reader.ReadDataSet("weight", weightData, weightDims, error);
+  MOCHI_ERROR_RETURN(error, {});
+  MOCHI_ERROR_IF(
+      weightDims[0] == 0 || weightDims[1] == 0 ||
+          weightDims[0] > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+          weightDims[1] > static_cast<size_t>(std::numeric_limits<int>::max()),
+      error,
+      "MLP layer weight dimensions must be positive and fit in an int.");
+  MOCHI_ERROR_RETURN(error, {});
 
-  return ai::Mlp<real>(std::move(mlpLayers));
+  DynamicArray<real> biasData;
+  reader.ReadDataSet("bias", biasData, error);
+  MOCHI_ERROR_RETURN(error, {});
+  MOCHI_ERROR_IF(
+      biasData.size() != weightDims[0],
+      error,
+      "MLP layer bias size must match the weight output dimension.");
+  MOCHI_ERROR_RETURN(error, {});
+
+  Matrix<real> weights{RowMatrixView<real const>(
+      weightData.data(), static_cast<int>(weightDims[0]), static_cast<int>(weightDims[1]))};
+  ColumnVector<real> biases{ColumnVectorView<real const>(biasData.data(), isize(biasData))};
+
+  MOCHI_ERROR_IF_NOT(
+      reader.HasGroup("activation"), error, "MLP layer activation group is required.");
+  MOCHI_ERROR_RETURN(error, {});
+
+  auto activationGroup = reader.EnterGroup("activation", error);
+  std::string kind;
+  reader.ReadAttribute("kind", kind, error);
+  MOCHI_ERROR_RETURN(error, {});
+  if (kind == "elu") {
+    real alpha = 0_r;
+    reader.ReadAttribute("alpha", alpha, error);
+    MOCHI_ERROR_RETURN(error, {});
+    return ai::MlpLayer<real>{
+        std::move(weights), std::move(biases), ai::ELUActivation<real>{alpha}};
+  }
+  MOCHI_ERROR_IF(kind != "identity", error, "Only ELU and identity activation are supported.");
+  MOCHI_ERROR_RETURN(error, {});
+
+  return ai::MlpLayer<real>{std::move(weights), std::move(biases), ai::IdentityActivation<real>{}};
 }
 
-class TorchDeepFlow final : public DeepFlow {
- public:
-  TorchDeepFlow(
-      torch::jit::script::Module&& module,
-      torch::Device device,
-      int numDofs,
-      real scale,
-      Real3 shift,
-      bool computeGradient = true,
-      int maxPoints = kMochiSamplesPrealloc)
-      : DeepFlow(numDofs, scale, shift, computeGradient),
-        _maxPoints(maxPoints),
-        _module(std::move(module)),
-        _device(device) {
-    _module.to(device);
+static std::optional<ai::Mlp<real>>
+LoadMlp(GroupReader& reader, int expectedInputDim, int expectedOutputDim, Error& error) {
+  MOCHI_ERROR_RETURN(error, {});
 
-    _objFromLocalShiftTensor =
-        torch::tensor({objFromLocalShift[0], objFromLocalShift[1], objFromLocalShift[2]})
-            .to(device);
-    _objFromLocalScaleTensor = torch::tensor(objFromLocalScale).to(device);
+  std::map<int, ai::MlpLayer<real>> layers;
+  auto const groupNames = reader.GetGroupNames(error);
+  MOCHI_ERROR_RETURN(error, {});
+  for (auto const& groupName : groupNames) {
+    auto layerGroup = reader.EnterGroup(groupName, error);
+    std::string name;
+    reader.ReadAttribute("name", name, error);
+    MOCHI_ERROR_IF(name != "Linear", error, "Only linear MLP layers are supported.");
+    MOCHI_ERROR_RETURN(error, {});
 
-    _gradOutputTemplate[0] = _gradOutputTemplate[0].to(_device);
-    _gradOutputTemplate[1] = _gradOutputTemplate[1].to(_device);
-    _gradOutputTemplate[2] = _gradOutputTemplate[2].to(_device);
+    int index = -1;
+    reader.ReadAttribute("index", index, error);
+    MOCHI_ERROR_IF(index < 0, error, "Invalid MLP layer index.");
+    MOCHI_ERROR_RETURN(error, {});
 
-    if (_device == torch::DeviceType::CUDA) {
-      // Libtorch suffers a GPU memory leak when a module is queried with tensors of increasing
-      // size. Every time a larger tensor is passed, the necessary memory is allocated, but previous
-      // memory is not freed. As a preemptive measure, we run a very large query when the module is
-      // loaded, to ensure that a sufficiently large cache is allocated.
-      // TODO: Is this still true of CUDA12?
-      DynamicArray<real> result;
-      DynamicArray<Real3> pointsLocal(_maxPoints);
-      DynamicArray<Real3> pointsWorld(_maxPoints);
-      DynamicArray<int> inds(_maxPoints);
-      DynamicArray<real> dofs(numDofs);
-      RunQuery(std::move(pointsLocal), std::move(pointsWorld), std::move(inds), dofs, result);
-    }
+    auto layer = LoadMlpLayer(reader, error);
+    MOCHI_ERROR_RETURN(error, {});
+    bool const inserted = layers.emplace(index, std::move(*layer)).second;
+    MOCHI_ERROR_IF_NOT(inserted, error, "MLP layer indices must be unique.");
+    MOCHI_ERROR_RETURN(error, {});
   }
+  MOCHI_ERROR_IF(layers.empty(), error, "No MLP layers found.");
+  MOCHI_ERROR_RETURN(error, {});
 
-  void RunQueries(Span<MapQueryPtr> queries, DynamicArray<real>& outResult) override;
+  DynamicArray<ai::MlpLayer<real>> layerArray;
+  layerArray.reserve(layers.size());
+  int expectedIndex = 0;
+  int previousOutputDim = 0;
+  for (auto& indexedLayer : layers) {
+    auto const& layer = indexedLayer.second;
+    MOCHI_ERROR_IF(
+        indexedLayer.first != expectedIndex,
+        error,
+        "MLP layer indices must be contiguous and start at zero.");
+    MOCHI_ERROR_IF(
+        expectedIndex > 0 && layer.InputDim() != previousOutputDim,
+        error,
+        "Adjacent MLP layer dimensions are incompatible.");
+    MOCHI_ERROR_RETURN(error, {});
 
- private:
-  // For small queries, it is more convenient to obtain all three components of the gradient
-  // together, by replicating the query points three times. For large queries, it is more convenient
-  // to loop through the three components of the gradient. The threshold query size was determined
-  // by running 'PerformanceTest' in deep_flow_map_test.cpp.
-  static constexpr int kNumPointsThreshold = 5000;
-
-  // Size of expected largest query, to preallocate GPU memory and avoid memory leaks
-  int const _maxPoints;
-
-  at::Tensor _objFromLocalScaleTensor; // Tensor form of objFromLocalScale
-  at::Tensor _objFromLocalShiftTensor; // Tensor form of objFromLocalShift
-
-  // Torch module
-  torch::jit::script::Module _module;
-  torch::Device _device = torch::kCPU;
-
-  // Template directions for gradients
-  DynamicArray<at::Tensor> _gradOutputTemplate = {
-      torch::tensor({1.0, 0.0, 0.0}),
-      torch::tensor({0.0, 1.0, 0.0}),
-      torch::tensor({0.0, 0.0, 1.0})};
-};
-
-void TorchDeepFlow::RunQueries(Span<MapQueryPtr> queries, DynamicArray<real>& outResult) {
-  MOCHI_PROFILE_SCOPE();
-  MOCHI_PROFILE_DESCRIPTION_F(
-      "TorchDeepFlow::RunQueries with %d queries and %d points.\n",
-      isize(queries),
-      [](Span<MapQueryPtr const> queries) {
-        int numPoints = 0;
-        for (auto const& q : queries) {
-          numPoints += isize(q->_pointsLocal);
-        }
-        return numPoints;
-      }(queries));
-  if (queries.empty()) {
-    return;
+    previousOutputDim = layer.OutputDim();
+    layerArray.emplace_back(std::move(indexedLayer.second));
+    ++expectedIndex;
   }
-
-  // Concatenate input data for all queries
-  DynamicArray<at::Tensor> inputs;
-  inputs.reserve(queries.size());
-  int numPoints = 0;
-  for (int i = 0; i < queries.size(); i++) {
-    auto const& query = queries[i];
-    auto const& points = query->_pointsLocal;
-    auto const& dofs = query->_dofs;
-    int const numPointsThis = isize(points);
-
-    // Torch needs a non-const pointer even though it doesn't modify the data. :-(
-    real* pointsData = const_cast<real*>(Flatten(MakeSpan(points)).data());
-    at::Tensor x =
-        torch::from_blob(pointsData, {numPointsThis, 3}, torch::requires_grad(computeGradient));
-
-    // Concatenate the deformation descriptor to the input
-    real* dofsData = const_cast<real*>(dofs.data());
-    at::Tensor dofsTensor =
-        torch::from_blob(dofsData, {1, numDofs}, torch::requires_grad(computeGradient));
-    at::Tensor descriptor = torch::tile(dofsTensor, {numPointsThis, 1});
-    inputs.push_back(torch::cat({x, descriptor}, -1));
-
-    numPoints += numPointsThis;
-  }
-  if (numPoints > _maxPoints) {
-    MOCHI_LOG_WARNING(
-        "Querying deep flow with %d points, larger than the maximum %d points of the preallocated GPU memory. This will likely turn into a GPU memory leak.",
-        numPoints,
-        _maxPoints);
-  }
-  at::Tensor input = torch::cat(inputs, 0).to(_device);
-
-  // If the number of points is small, compute all gradients together
-  if (numPoints < kNumPointsThreshold) {
-    input = torch::cat({input, input, input}, 0);
-  }
-
-  // Module::forward is a non-const method because it could modify state in the generic case (e.g.
-  // when we are training the network). During network inference, however, it should be immutable
-  // and it should be safe to call from multiple threads.
-  // TODO: However, the computational graph should be retained for backward passes, and this
-  // is likely not thread-safe. If that's the case, we should wrap the forward and backward queries
-  // in a mutex (ideally at GPU level).
-  at::Tensor mapTensor = _module.forward({input}).toTensor();
-
-  // Transform the mapped points from local to object coords.
-  mapTensor = _objFromLocalScaleTensor * mapTensor + _objFromLocalShiftTensor;
-
-  at::Tensor gpuData;
-  if (computeGradient) {
-    // Compute gradients with respect to full input (points and deformation code).
-    if (numPoints < kNumPointsThreshold) {
-      // Do it together for all coordinates of the gradient.
-      at::Tensor gradOutput = torch::cat(
-          {torch::tile(_gradOutputTemplate[0], {numPoints, 1}),
-           torch::tile(_gradOutputTemplate[1], {numPoints, 1}),
-           torch::tile(_gradOutputTemplate[2], {numPoints, 1})},
-          0);
-      at::Tensor gradTensor = torch::autograd::grad({mapTensor}, {input}, {gradOutput}, false)[0];
-
-      // Select and pack the output data
-      mapTensor = mapTensor.view({3, numPoints, 3}).select(0, 0);
-      gradTensor = gradTensor.view({3, numPoints, gradSize});
-      gpuData = torch::cat(
-          {mapTensor, gradTensor.select(0, 0), gradTensor.select(0, 1), gradTensor.select(0, 2)},
-          1);
-    } else {
-      // Do it separately for each coordinate of the gradient.
-      std::array<at::Tensor, 3> gradTensor;
-      for (int i = 0; i < 3; i++) {
-        at::Tensor gradOutput = torch::tile(_gradOutputTemplate[i], {numPoints, 1});
-        gradTensor[i] = torch::autograd::grad({mapTensor}, {input}, {gradOutput}, i != 2)[0];
-      }
-
-      // Pack the output data
-      gpuData = torch::cat({mapTensor, gradTensor[0], gradTensor[1], gradTensor[2]}, 1);
-    }
-  } else {
-    // Pack the output data without gradient
-    gpuData = mapTensor;
-  }
-
-  // Copy the result to the CPU
-  at::Tensor cpuData = gpuData.to(torch::kCPU);
-  real* cpuDataPtr = cpuData.data_ptr<real>();
-  outResult.assign(cpuDataPtr, cpuDataPtr + (numPoints * dataSize));
-
-  // Organize result views per query
-  int offset = 0;
-  for (auto& query : queries) {
-    int const numPointsThis = isize(query->_pointsLocal);
-    query->_result = Span(&outResult[offset], numPointsThis * dataSize);
-    offset += numPointsThis * dataSize;
-  }
+  MOCHI_ERROR_IF(
+      layerArray.front().InputDim() != expectedInputDim,
+      error,
+      "Deep Flow MLP input dimension must equal 3 + numDofs.");
+  MOCHI_ERROR_IF(
+      layerArray.back().OutputDim() != expectedOutputDim,
+      error,
+      "Deep Flow MLP output dimension must equal 3.");
+  MOCHI_ERROR_RETURN(error, {});
+  return ai::Mlp<real>{std::move(layerArray)};
 }
+
+namespace {
 
 class MochiDeepFlow final : public DeepFlow {
  public:
   MochiDeepFlow(
-      torch::jit::script::Module const& module,
+      ai::Mlp<real>&& network,
       int numDofs,
       real scale,
       Real3 shift,
       bool computeGradient = true)
-      : DeepFlow(numDofs, scale, shift, computeGradient) {
-    _network = std::make_unique<ai::Mlp<real>>(ToMochiMlp(module));
-  }
+      : DeepFlow(numDofs, scale, shift, computeGradient),
+        _network(std::make_unique<ai::Mlp<real>>(std::move(network))) {}
 
   void RunQueries(Span<MapQueryPtr> queries, DynamicArray<real>& outResult) override;
 
@@ -343,6 +229,8 @@ void MochiDeepFlow::RunQueries(Span<MapQueryPtr> queries, DynamicArray<real>& ou
     offset += queryResultSize;
   }
 }
+
+} // namespace
 
 void DeepFlowMap::UpdateMap(Span<real const> dofs) {
   if (dofs.size() != _numDoFs) {
@@ -459,63 +347,35 @@ void DeepFlowMap::TransformResult(
 
 } // namespace mochi
 
-#endif // MOCHI_USE_TORCH
-
 std::shared_ptr<mochi::DeepFlow> mochi::LoadDeepFlow(
-    [[maybe_unused]] char const* torchFilePath,
-    [[maybe_unused]] real scale,
-    [[maybe_unused]] Real3 shift,
-    [[maybe_unused]] int numDofs,
-    [[maybe_unused]] NeuralComputeType computeType,
-    [[maybe_unused]] int preallocMemSize,
+    char const* h5FilePath,
+    real scale,
+    Real3 shift,
+    int numDofs,
     Error& error,
-    [[maybe_unused]] bool computeGradient) {
-  MOCHI_ERROR_RETURN(error, {});
-#if MOCHI_USE_TORCH
-  torch::jit::script::Module module;
-  try {
-    module = torch::jit::load(torchFilePath);
-  } catch (c10::Error const&) {
-    MOCHI_ERROR_SET(error, "Failed to load Deep flow map from torch module file");
-    return {};
-  }
-  if (computeType == NeuralComputeType::TorchCpu || computeType == NeuralComputeType::TorchGpu) {
-    torch::Device device = torch::kCPU;
-    if (computeType == NeuralComputeType::TorchGpu) {
-      if (torch::cuda::is_available()) {
-        device = torch::kCUDA;
-      } else {
-        MOCHI_LOG_WARNING("CUDA is NOT available for Flow Map evaluations. Using CPU instead.");
-      }
-    }
-    return std::make_shared<TorchDeepFlow>(
-        std::move(module), device, numDofs, scale, shift, computeGradient, preallocMemSize);
-  } else {
-    static_assert(
-        static_cast<int>(NeuralComputeType::Count) == 3,
-        "Please update this if statement if other neural compute types are added");
-    MOCHI_ASSERT(computeType == NeuralComputeType::MochiCpu, "Unexpected deep flow compute type.");
-    return std::make_shared<MochiDeepFlow>(module, numDofs, scale, shift, computeGradient);
-  }
-#else
-  MOCHI_ERROR_SET(
+    bool computeGradient) {
+  MOCHI_ERROR_IF(h5FilePath == nullptr, error, "Deep Flow model path must not be null.");
+  MOCHI_ERROR_IF(
+      numDofs < 0 || numDofs > ColliderJacDofs::kMaxDoFs,
       error,
-      "DeepFlow requires libtorch. Compile Mochi with MOCHI_USE_TORCH=1 to enable this feature.");
-  return {};
-#endif
+      "Deep Flow numDofs is outside the supported range.");
+  MOCHI_ERROR_RETURN(error, {});
+  auto reader = CreateGroupReaderHDF5(h5FilePath, error);
+  MOCHI_ERROR_IF(!reader, error, "Failed to create a Deep Flow HDF5 reader.");
+  MOCHI_ERROR_RETURN(error, {});
+  MOCHI_ERROR_IF_NOT(
+      reader->HasGroup("deep_flow"), error, "Deep Flow model must contain a 'deep_flow' group.");
+  MOCHI_ERROR_RETURN(error, {});
+
+  auto deepFlowGroup = reader->EnterGroup("deep_flow", error);
+  auto network = LoadMlp(*reader, 3 + numDofs, 3, error);
+  MOCHI_ERROR_RETURN(error, {});
+  return std::make_shared<MochiDeepFlow>(
+      std::move(*network), numDofs, scale, shift, computeGradient);
 }
 
-std::unique_ptr<mochi::DeepFlowMap> mochi::CreateDeepFlowMap(
-    [[maybe_unused]] std::shared_ptr<DeepFlow> flow,
-    [[maybe_unused]] real scaleDofs,
-    Error& error) {
+std::unique_ptr<mochi::DeepFlowMap>
+mochi::CreateDeepFlowMap(std::shared_ptr<DeepFlow> flow, real scaleDofs, Error& error) {
   MOCHI_ERROR_RETURN(error, {});
-#if MOCHI_USE_TORCH
   return std::make_unique<DeepFlowMap>(flow, scaleDofs);
-#else
-  MOCHI_ERROR_SET(
-      error,
-      "DeepFlowMap requires libtorch. Compile Mochi with MOCHI_USE_TORCH=1 to enable this feature.");
-  return {};
-#endif
 }

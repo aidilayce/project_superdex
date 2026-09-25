@@ -30,6 +30,12 @@ namespace superdex::studio {
 
 class AssetManager;
 
+/// Drop every cached `ShapeHandle` in @p prefab, recursively including loaded nested prefabs, so
+/// the next physics load re-reads them from their shape files. `prefab::EnsureFullyLoaded` skips
+/// actors that already hold a valid handle, so a shape is otherwise pinned to the geometry (and
+/// bake transform) it was first loaded with.
+void ClearCachedShapes(mochi::prefab::ScenePrefab& prefab);
+
 class MochiPrefabAsset : public Asset, public IAssetReferencer {
  public:
   ~MochiPrefabAsset() override = default;

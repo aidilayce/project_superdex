@@ -180,11 +180,10 @@ struct CQueryNodeContactForces : RefCounted {
 
   void AddContactForce(Real3 force, Int3 nodeIndices, Real3 nodeWeights) {
     for (int i = 0; i < 3; i++) {
-      auto nodeForce = nodeWeights[i] * force;
-      auto nodeTotalForce = nodeContactForcesMap.find(nodeIndices[i]);
-      if (nodeTotalForce == nodeContactForcesMap.end()) {
-        nodeContactForcesMap[nodeIndices[i]] = nodeForce;
-      } else {
+      auto const nodeForce = nodeWeights[i] * force;
+      auto const [nodeTotalForce, wasInserted] =
+          nodeContactForcesMap.try_emplace(nodeIndices[i], nodeForce);
+      if (!wasInserted) {
         nodeTotalForce->second += nodeForce;
       }
     }

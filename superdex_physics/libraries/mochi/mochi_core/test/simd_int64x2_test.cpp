@@ -17,6 +17,7 @@
 #include "simd_test.h"
 
 #include <array>
+#include <limits>
 #include <type_traits>
 #include <vector>
 
@@ -206,11 +207,7 @@ TEST(Vec2l, Get) {
   EXPECT_EQ(1, Get<0>(a));
   EXPECT_EQ(2, Get<1>(a));
 
-  // Slower runtime version
-  EXPECT_EQ(1, Get(a, 0));
-  EXPECT_EQ(2, Get(a, 1));
-
-  // Same but with operator[] (read only)
+  // Runtime version
   EXPECT_EQ(1, a[0]);
   EXPECT_EQ(2, a[1]);
 }
@@ -391,10 +388,15 @@ TEST(Vec2l, Store) {
   EXPECT_SPAN_EQ((std::array<int64_t, 2>{1, 0}), Span(&result[1], 2));
   Store<2>(&result[1], v);
   EXPECT_SPAN_EQ((std::array<int64_t, 2>{1, 2}), Span(&result[1], 2));
-  result.clear();
-  result.resize(5);
-  Store(&result[1], v, 0);
-  EXPECT_SPAN_EQ((std::array<int64_t, 2>{0, 0}), Span(&result[1], 2));
+  for (int n = 0; n <= Vec2l::kSize; ++n) {
+    result.assign(4, 911);
+    auto expected = result;
+    for (int i = 0; i < n; ++i) {
+      expected[i + 1] = i + 1;
+    }
+    Store(&result[1], v, n);
+    EXPECT_EQ(expected, result);
+  }
   Store(&result[1], v);
   EXPECT_SPAN_EQ((std::array<int64_t, 2>{1, 2}), Span(&result[1], 2));
 }
@@ -451,7 +453,17 @@ TEST(Vec2l, ShiftLeft) {
 }
 
 TEST(Vec2l, ShiftRight) {
+  static constexpr int kSingleBitShift = 1;
+  static constexpr int kHalfWidthShift = 8 * sizeof(Vec2l::Scalar) / 2;
+  static constexpr int64_t kHalfWidthScale = int64_t{1} << kHalfWidthShift;
+  static constexpr int64_t kInt64Min = std::numeric_limits<int64_t>::min();
+
   Vec2l v(8, 40);
   EXPECT_VEC2L(1, 5, ShiftRight<3>(v));
   EXPECT_EQ(v, ShiftRight<0>(v));
+  // Shift by one catches logical shifts; half-width catches multi-bit sign fill.
+  // clang-format off
+  EXPECT_VEC2L(-1, -2, ShiftRight<kSingleBitShift>(Vec2l{-1, -3}));
+  EXPECT_VEC2L(-1, kInt64Min / kHalfWidthScale, ShiftRight<kHalfWidthShift>(Vec2l{-1, kInt64Min}));
+  // clang-format on
 }

@@ -1,9 +1,49 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 namespace experimental;
+
+// @brief [Experimental] Parameters defining a Reduced-Order Model (ROM) actor.
+//
+// @warning ROMs are experimental and may change or be removed without warning.
+struct experimental::RomParams [no_cpp_definition, no_reflection, no_capi, no_python] {}
+
+// @brief Load and instantiate a scene prefab with a uniform ROM override.
+//
+// @details Applies the provided ROM parameters to every standalone and nested soft actor in the
+// prefab hierarchy.
+//
+// @param[in] prefabPath File path to the prefab file.
+// @param[in] rootPath Root directory for resolving relative paths, except those resolved against
+// a prefab file.
+// @param[in,out] scene The @ref Scene to add things to.
+// @param[in] params Parameters for how and where to instantiate the prefab.
+// @param[in] romParams ROM parameters applied to every soft actor in the prefab hierarchy.
+//
+// @return An @ref prefab::AddToSceneResult containing pointers to all created actors and constraints.
+//
+// @warning This function is not transactional. If it returns an error, the prefab may have been
+// partially instantiated in the scene.
+// @warning This function requires `MOCHI_ENABLE_ROM_ACTORS=1`.
+//
+// @see prefab::AddToScene, experimental::RomParams
+fn experimental::AddToScene(StringView prefabPath, StringView rootPath, Scene* scene, prefab::PrefabParams const& params, experimental::RomParams const& romParams) -> prefab::AddToSceneResult [mochi_error, no_capi, no_python];
 
 fn experimental::RestoreStateFromScene(Scene* sceneTo, Scene const* sceneFrom, StateHandle handleFrom) -> void [mochi_error];
 fn experimental::ApplyImprovedConvergenceSettings(Scene* scene) -> void [mochi_error];
 
-fn experimental::GetContactForceWorldBatch(Span<Actor const* const> actors, Span<Actor const* const> colliders) -> real [mochi_error, units(N)];
+fn experimental::GetContactForceWorldBatch(Span<Actor const* const> actors, Span<Actor const* const> colliders) -> real [mochi_error, units("N")];
 fn experimental::EnableNewtonEulerInertia(Actor* actor, bool enable) -> void [mochi_error];
 fn experimental::IsNewtonEulerInertiaEnabled(Actor const* actor) -> bool [mochi_error];
 fn experimental::SetSoftMaterialParamsField(Actor* actor, SoftMaterialParams const& params, int elementIndex) -> void [mochi_error];
@@ -153,10 +193,10 @@ struct experimental::IKSolverParams [no_reflection] {
   real relTol = 1e-8;
 
   // @brief Position error threshold [m] for determining if IK targets are reachable.
-  real positionErrorThres [units(m)] = 1e-2;
+  real positionErrorThres [units("m")] = 1e-2;
 
   // @brief Rotation error threshold [radians] for determining if IK targets are reachable.
-  real rotationErrorThres [units(rad)] = 1e-2;
+  real rotationErrorThres [units("rad")] = 1e-2;
 
   // @brief Maximum line search iterations per Newton step.
   //
@@ -182,7 +222,7 @@ struct experimental::IKSolverParams [no_reflection] {
 // target position and orientation of rigid links in articulated bodies.
 //
 // @note The IK solver takes ownership of the scene passed at creation. The scene is mutated
-// (e.g., gravity zeroed, single-island forced, contact friction zeroed, articulated inertia and joint
+// (e.g., gravity zeroed, single-island forced, contact dissipation zeroed, articulated inertia and joint
 // friction removed) and is unsuitable for general simulation afterward. Use it only via this
 // @ref IKSolver.
 // @note Targets must be set before calling @ref IKSolver::SolveIK.
@@ -219,6 +259,8 @@ class experimental::IKSolver [no_init, no_destruct, no_reflection] {
   // actor replaces the previous target and invalidates the previously returned @ref Constraint
   // pointer.
   //
+  // @note If replacing the previous target fails, the existing target and its pointer remain valid.
+  //
   // @see IKSolver::ClearPositionTarget, IKSolver::CreateRotationTarget
   fn CreatePositionTarget(ActorHandle actor, Real3 localPosition, Real3 targetPosition, real weight) -> Constraint* [pure, virtual, mochi_error, nullable];
 
@@ -244,6 +286,7 @@ class experimental::IKSolver [no_init, no_destruct, no_reflection] {
   // actor replaces the previous target and invalidates the previously returned @ref Constraint
   // pointer.
   //
+  // @note If replacing the previous target fails, the existing target and its pointer remain valid.
   // @note Both rotations are rotation vectors (axis * angle).
   //
   // @see IKSolver::ClearRotationTarget, IKSolver::CreatePositionTarget
@@ -276,10 +319,14 @@ class experimental::IKSolver [no_init, no_destruct, no_reflection] {
 //
 // @return Pointer to the created @ref experimental::IKSolver, or nullptr on error.
 //
-// @note The @ref experimental::IKSolver assumes exclusive control of the provided scene. The scene
-// must not be used directly and will be destroyed by @ref experimental::DestroyIKSolver.
+// @note The scene must have been created with @ref Context::CreateScene and must not be owned or
+// managed by another API.
+// @note On success, ownership transfers to the @ref experimental::IKSolver, which assumes exclusive
+// control and destroys the scene when @ref experimental::DestroyIKSolver is called. Do not use the
+// scene directly after ownership transfers. On error, ownership is unchanged.
+// @note Returns an error if scene ownership has already been claimed.
 // @note The scene must contain only @ref ActorType::Articulated and @ref ActorType::Rigid actors.
-// @note The scene's solver parameters, gravity, single-island setting, contact friction, and
+// @note The scene's solver parameters, gravity, single-island setting, contact dissipation, and
 // articulated inertia/joint-friction terms are reconfigured for IK and cannot be relied upon
 // afterwards.
 //
@@ -343,17 +390,17 @@ struct experimental::ExperimentalSoftSkinnedActorParams [no_reflection] {
 }
 
 struct experimental::RodMaterialParams [no_reflection] {
-  real linearDensity [units(kg/m)] = 1e-1;
-  real linearRotationalInertia [units(kg*m)] = 1e-6;
-  real axialStiffness [units(N)] = 1e2;
-  real torsionalStiffness [units(N*m^2)] = 5e-4;
-  Real2 flexuralStiffness [units(N*m^2)] = {5e-4, 5e-4};
-  real massDampingCoefficient [units(1/s)] = 0;
-  real stiffnessDampingCoefficient [units(s)] = 0;
+  real linearDensity [units("kg/m")] = 1e-1;
+  real linearRotationalInertia [units("kg*m")] = 1e-6;
+  real axialStiffness [units("N")] = 1e2;
+  real torsionalStiffness [units("N*m^2")] = 5e-4;
+  Real2 flexuralStiffness [units("N*m^2")] = {5e-4, 5e-4};
+  real massDampingCoefficient [units("1/s")] = 0;
+  real stiffnessDampingCoefficient [units("s")] = 0;
 }
 
 struct experimental::PointCloudColliderParams [no_reflection] {
-  real radius [units(m)] = 0.01;
+  real radius [units("m")] = 0.01;
   real selfContactExclusionRatio = 1.5;
   real spatialHashLoadFactor = 0.0625;
   bool selfContact = false;
@@ -378,6 +425,14 @@ struct experimental::RodActorParams [no_reflection] {
   // @note Each element's frame axis is interpreted as one cross-sectional principal axis (the other
   // is the cross product of the segment direction and that axis); the flexural stiffness components
   // are defined with respect to these axes.
+  // @note A rod actor uses a visual mesh only when the shape has embedding data. For shapes created
+  // from @ref ModelData, the embedding is built from the skinning data in @ref
+  // ModelData::visualMesh. Without visual-mesh skinning, @ref Context::GetShapeVisualMesh still
+  // returns the shape's visual mesh, but the rod actor ignores it: @ref Actor::GetVisualMesh returns
+  // an empty view, and @ref QueryType::VisualNodePositions and @ref QueryType::VisualNodeNormals are
+  // unsupported.
+  // @note Setting @ref useContactSkin to true requires @ref ModelData::contactSkinMesh and its
+  // skinning data.
   ShapeHandle shape;
 
   // @brief Contact properties for interactions with volume actors.
@@ -398,29 +453,30 @@ struct experimental::RodActorParams [no_reflection] {
   // @brief Enables gravity.
   bool hasGravity = true;
 
-  // @brief Places contact samples on the rod's visual (triangular) mesh instead of the centerline.
+  // @brief Use the rod shape's contact skin for contact instead of its centerline.
   //
-  // @note Forces are transmitted to rod degrees of freedom through the skinning Jacobian. Requires
-  // the rod shape to have a visual mesh with embedding data.
-  bool useVisualMeshContact = false;
+  // @details Actor creation fails if the shape does not have a triangular contact skin with rod
+  // embedding data.
+  bool useContactSkin = false;
 
-  // @brief Element type controlling the number of visual-mesh contact samples per triangle. Only
-  // used when visual-mesh contact is enabled.
-  ActorBoundaryElementType visualMeshContactElementType = Default;
+  // @brief Triangle element type for contact-skin quadrature.
+  //
+  // @note @ref RodActorParams::contactElementType controls centerline sampling instead.
+  ActorBoundaryElementType contactSkinElementType = Default;
 }
 
 fn experimental::CreateRodActor(Scene* scene, experimental::RodActorParams const& params) -> Actor* [mochi_error, nullable];
 
-fn experimental::GenerateTubularRodModelData(Span<Real3 const> nodes [units(m)], Span<Real3 const> elementFrameAxes, real radius [units(m)], int numCrossSectionSegments, bool isClosedLoop) -> ModelData [mochi_error, no_capi];
+fn experimental::GenerateTubularRodModelData(Span<Real3 const> nodes [units("m")], Span<Real3 const> elementFrameAxes, real radius [units("m")], int numCrossSectionSegments, bool isClosedLoop) -> ModelData [mochi_error, no_capi];
 
 struct experimental::ShellMaterialParams [no_reflection] {
-  real membraneLambda [units(Pa*m)] = 300;
-  real membraneMu [units(Pa*m)] = 400;
-  real bendingAlpha [units(Pa*m^3)] = 0.00002;
-  real bendingBeta [units(Pa*m^3)] = 0.00007;
-  real density [units(kg/m^2)] = 1.0;
-  real massDampingCoefficient [units(1/s)] = 0;
-  real stiffnessDampingCoefficient [units(s)] = 0;
+  real membraneLambda [units("Pa*m")] = 300;
+  real membraneMu [units("Pa*m")] = 400;
+  real bendingAlpha [units("Pa*m^3")] = 0.00002;
+  real bendingBeta [units("Pa*m^3")] = 0.00007;
+  real density [units("kg/m^2")] = 1.0;
+  real massDampingCoefficient [units("1/s")] = 0;
+  real stiffnessDampingCoefficient [units("s")] = 0;
 }
 
 // @brief Parameters for creating an experimental shell actor.
@@ -456,8 +512,16 @@ struct experimental::ShellActorParams [no_reflection] {
   // @brief Enables gravity.
   bool hasGravity = true;
 
-  // @brief Element type controlling the number of contact samples per triangle.
+  // @brief Element type controlling the number of contact samples per triangle on the selected
+  // contact mesh.
   ActorBoundaryElementType contactElementType = Default;
+
+  // @brief Use the shape's authored contact skin for colliding contact samples.
+  //
+  // @details Actor creation fails unless the shape has a triangular contact skin with node-based
+  // linear skinning data. This changes the shell's colliding contact samples. The point-cloud
+  // collider, when enabled, remains discretized on the physics mesh.
+  bool useContactSkin = false;
 }
 
 fn experimental::CreateShellActor(Scene* scene, experimental::ShellActorParams const& params) -> Actor* [mochi_error, nullable];
@@ -481,7 +545,7 @@ fn experimental::ShellMaterialParamsFrom3dIsotropic(real youngsModulus3d, real p
 // @return Normal viscous damping coefficient [s/m]; 0 on error.
 //
 // @see EffectiveCoefficientOfRestitution, ContactParams::normalViscousDampingCoefficient
-fn experimental::CalibrateNormalViscousDampingCoefficient(real cor, real impactVelocity) -> real [mochi_error, units(s/m)];
+fn experimental::CalibrateNormalViscousDampingCoefficient(real cor, real impactVelocity) -> real [mochi_error, units("s/m")];
 
 // @brief Effective coefficient of restitution (CoR) produced by a normal viscous damping
 // coefficient at an impact velocity.

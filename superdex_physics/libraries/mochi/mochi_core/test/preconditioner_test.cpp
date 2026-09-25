@@ -28,6 +28,8 @@
 #include <mochi_core/linear_algebra/krylov/sym_inverse_prec.h>
 #include <mochi_core/linear_algebra/matrix.h>
 #include <mochi_core/solvers/island_operators.h>
+#include <mochi_core/utils/defer.h>
+#include <mochi_core/utils/log.h>
 
 #include <gtest/gtest.h>
 
@@ -114,4 +116,34 @@ TEST(PreconditionerUtils, IsReusable) {
   static_assert(
       static_cast<int>(PreconditionerType::Count) == 13,
       "Please update unit test if PreconditionerType enumerator changes");
+}
+
+TEST(PreconditionerRecyclingManager, ResizeToIncompatibleBlockSize) {
+  // Disable warnings about falling back to no preconditioner.
+  bool const wasWarningEnabled = IsLogChannelEnabled(LogChannel::Warning);
+  EnableLogChannel(LogChannel::Warning, false);
+  MOCHI_DEFER(EnableLogChannel(LogChannel::Warning, wasWarningEnabled));
+
+  auto MakeDiagonalMatrix = [](int size) {
+    Matrix<Scalar> A = Matrix<Scalar>::Zero(size, size);
+    for (int i = 0; i < size; ++i) {
+      A(i, i) = Scalar{2};
+    }
+    return A;
+  };
+  Matrix<Scalar> const A6 = MakeDiagonalMatrix(6);
+  Matrix<Scalar> const A7 = MakeDiagonalMatrix(7);
+  Matrix<Scalar> const A9 = MakeDiagonalMatrix(9);
+
+  for (auto const preconType : {PreconditionerType::BlockJacobi, PreconditionerType::BlockSSOR}) {
+    PreconditionerRecyclingManager<Scalar> manager;
+    auto SetupType = [&](Matrix<Scalar> const& A) {
+      manager.SetupPreconditioner</*kPrecBlockSize*/ 3>(
+          A, /*hasMatrixChanged*/ true, preconType, /*preconditionerLifespan*/ 1);
+      return manager.GetPreconditioner()->GetType();
+    };
+    EXPECT_EQ(preconType, SetupType(A6));
+    EXPECT_EQ(PreconditionerType::None, SetupType(A7));
+    EXPECT_EQ(preconType, SetupType(A9));
+  }
 }

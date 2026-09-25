@@ -37,9 +37,9 @@ namespace mochi::test {
 inline constexpr int kBatchTestMaxSize = 16;
 
 template <int kBatchSize>
-[[nodiscard]] BatchReal6<kBatchSize> LoadBatchSymMatrix3x3(Span<Matrix3x3r const> mats) {
+[[nodiscard]] BatchSymMatrix3x3<kBatchSize> LoadBatchSymMatrix3x3(Span<Matrix3x3r const> mats) {
   MOCHI_ASSERT_VERBOSE(mats.size() >= kBatchSize, "Insufficient matrices.");
-  BatchReal6<kBatchSize> result = {};
+  BatchSymMatrix3x3<kBatchSize> result = {};
   for (int i = 0; i < kBatchSize; ++i) {
     result[0] = Set(result[0], i, mats[i][0][0]);
     result[1] = Set(result[1], i, mats[i][1][1]);
@@ -118,5 +118,11 @@ auto GetLane(NdArray<V, D0, Dims...> const& a, int lane) {
     TestFn<7>();                              \
     TestFn<8>();                              \
     TestFn<9>();                              \
+    TestFn<10>();                             \
+    TestFn<11>();                             \
+    TestFn<12>();                             \
+    TestFn<13>();                             \
+    TestFn<14>();                             \
+    TestFn<15>();                             \
     TestFn<test::kBatchTestMaxSize>();        \
   }

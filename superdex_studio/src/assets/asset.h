@@ -51,7 +51,7 @@ enum class AssetType {
 
 constexpr int kAssetTypeCount = static_cast<int>(AssetType::Count);
 
-constexpr ImU32 kAssetTypeColors[kAssetTypeCount] = {
+constexpr std::array<ImU32, kAssetTypeCount> kAssetTypeColors = {
     IM_COL32(134, 197, 62, 255), // RenderModel (green)
     IM_COL32(0, 128, 255, 255), // MochiModel (blue)
     IM_COL32(128, 128, 255, 255), // MochiPrefab (purple)
@@ -61,7 +61,7 @@ constexpr ImU32 kAssetTypeColors[kAssetTypeCount] = {
     IM_COL32(192, 192, 192, 192), // Unknown (gray)
 };
 
-constexpr char const* kAssetTypeLabels[kAssetTypeCount] =
+constexpr std::array<char const*, kAssetTypeCount> kAssetTypeLabels =
     {"Render Model", "Collision Model", "Prefab", "Bot", "Bot Scene", "CAD Model", "(Unknown)"};
 
 inline constexpr ImU32 GetAssetTypeColor(AssetType type) {

@@ -47,6 +47,7 @@
 #include "view_settings.h"
 
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <numbers>
 
@@ -105,7 +106,7 @@ Scene::~Scene() {
         _debugDraw->GetSolidEntity(),
         _debugDraw->GetOverlayEntity(),
     };
-    _scene->removeEntities(debugEntities, 3);
+    _scene->removeEntities(debugEntities, std::size(debugEntities));
     _debugDraw.reset();
   }
   _scene->removeAllEntities();
@@ -303,7 +304,7 @@ float Scene::ComputeGroundPlaneHeight() const {
   float minY = std::numeric_limits<float>::max();
   bool hasValidBounds = false;
   for (auto object : _objectsPublic) {
-    if (object && !object->_internal) {
+    if (object && !object->_internal && object->IsVisible()) {
       filament::Box aabb = object->GetAABB();
       // GetAABB returns Filament/render space coordinates (Y-up)
       float linkMinY = aabb.center.y - aabb.halfExtent.y;
@@ -475,7 +476,7 @@ DebugDraw* Scene::CreateDebugDraw() {
   if (_debugDraw) {
     return _debugDraw.get();
   }
-  _debugDraw = DebugDraw::Create(_engine);
+  _debugDraw = DebugDraw::Create(_engine, _scene);
   _scene->addEntity(_debugDraw->GetEntity());
   _scene->addEntity(_debugDraw->GetSolidEntity());
   _scene->addEntity(_debugDraw->GetOverlayEntity());
@@ -621,14 +622,25 @@ bool Scene::GetCameraFocusOnAllSceneObjects(
     filament::math::double3& outFrom,
     filament::math::double3& outTo,
     float& outOrthoHeight) const {
-  if (_objectsPublic.empty()) {
-    return false;
+  // Only what is actually drawn should influence framing: a hidden representation (the collision
+  // mesh while the render model is shown, a surface staged ahead of time) would otherwise pull the
+  // camera toward geometry the user cannot see. Internal objects (the ground plane, gizmos) are
+  // skipped for the same reason ComputeGroundPlaneHeight skips them -- they are not content.
+  filament::Box box;
+  bool hasBox = false;
+  for (auto* object : _objectsPublic) {
+    if (!object || object->_internal || !object->IsVisible()) {
+      continue;
+    }
+    filament::Box const aabb = object->GetAABB();
+    if (hasBox) {
+      box.unionSelf(aabb);
+    } else {
+      box = aabb;
+    }
+    hasBox = true;
   }
-  filament::Box box = _objectsPublic[0]->GetAABB();
-  for (size_t i = 1; i < _objectsPublic.size(); i++) {
-    box.unionSelf(_objectsPublic[i]->GetAABB());
-  }
-  if (box.isEmpty()) {
+  if (!hasBox || box.isEmpty()) {
     return false;
   }
   outOrthoHeight = CalculateOrthographicHeightFromBox(box);

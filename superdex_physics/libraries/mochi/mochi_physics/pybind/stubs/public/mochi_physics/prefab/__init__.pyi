@@ -14,8 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pyre-strict
-
 from typing import Any, Callable, Iterator, Optional, Sequence, overload
 import numpy as np
 import numpy.typing as npt
@@ -234,6 +232,35 @@ class DynamicArrayArticulatedSingleDofTargetConstraintPrefab:
 type ArrayLikeArticulatedSingleDofTargetConstraintPrefab = (
     Sequence[ArticulatedSingleDofTargetConstraintPrefab] |
     DynamicArrayArticulatedSingleDofTargetConstraintPrefab |
+    npt.NDArray[Any]
+)
+
+class DynamicArrayContactPairParamsOverrideEntry:
+    @overload
+    def __init__(self) -> None: ...
+    @overload
+    def __init__(
+        self,
+        size: int,
+        value: ContactPairParamsOverrideEntry = ...,
+    ) -> None: ...
+    @overload
+    def __init__(self, sequence: Sequence[ContactPairParamsOverrideEntry]) -> None: ...
+    def __len__(self) -> int: ...
+    def __getitem__(self, index: int) -> ContactPairParamsOverrideEntry: ...
+    def __setitem__(
+        self,
+        index: int,
+        value: ContactPairParamsOverrideEntry,
+    ) -> None: ...
+    def __iter__(self) -> Iterator[ContactPairParamsOverrideEntry]: ...
+    def append(self, value: ContactPairParamsOverrideEntry) -> None: ...
+    def clear(self) -> None: ...
+    def resize(self, size: int) -> None: ...
+
+type ArrayLikeContactPairParamsOverrideEntry = (
+    Sequence[ContactPairParamsOverrideEntry] |
+    DynamicArrayContactPairParamsOverrideEntry |
     npt.NDArray[Any]
 )
 
@@ -732,8 +759,8 @@ class RigidActorPrefab(mochi_physics.RigidActorParams):
 
     Note:
         The inherited :attr:`~superdex.physics.RigidActorParams.name` field need not
-        be unique, but a name shared by more than one actor cannot be referenced by
-        a constraint, pose controller, or contact filter.
+        be unique, but a name shared by more than one actor cannot be used by
+        name-based prefab references.
     """
     comment: Optional[str]
     """Optional serialized comment."""
@@ -886,8 +913,8 @@ class SoftActorPrefab(mochi_physics.SoftActorParams):
     Note:
         When used as a standalone soft actor prefab, the inherited
         :attr:`~superdex.physics.SoftActorParams.name` field need not be unique, but
-        a name shared by more than one actor cannot be referenced by a constraint,
-        pose controller, or contact filter.
+        a name shared by more than one actor cannot be used by name-based prefab
+        references.
     """
     comment: Optional[str]
     """Optional serialized comment."""
@@ -946,7 +973,8 @@ class SoftActorPrefab(mochi_physics.SoftActorParams):
         actors that move far from their initial position.
 
     Note:
-        Ignored by soft skinned actors, which do not support recentering.
+        Ignored for nested soft actors in soft-skinned actors, which do not support
+        recentering.
 
     Warning:
         This is an experimental feature. It may be changed or removed in the future.
@@ -1304,6 +1332,7 @@ class ArticulatedSkinPrefab(mochi_physics.ArticulatedSkinParams):
         contact: mochi_physics.ContactParams = ...,
         boundary_element_type: mochi_physics.ActorBoundaryElementType | int = ...,
         boundary_subsampling: Optional[mochi_physics.BoundarySubsamplingParams] = ...,
+        non_colliding_links: Optional[mochi_physics.ArrayLikeString] = ...,
         shape_file: str = ...,
         render_model_file: str = ...,
         render_model_scale: mochi_physics.Real3Like = ...,
@@ -1334,9 +1363,8 @@ class ArticulatedActorPrefab:
         nested actors.
 
     Note:
-        A name shared by more than one actor cannot be referenced by a constraint,
-        pose controller, or contact filter (see
-        :class:`~superdex.physics.prefab.PoseControllerPrefab`).
+        A name shared by more than one actor cannot be used by name-based prefab
+        references.
     """
     scale: float
     """Uniform scale baked into all link and skin shapes when the prefab is
@@ -1434,9 +1462,9 @@ class ArticulatedActorPrefab:
     def __ne__(self, other: object) -> bool: ...
 
 class SoftSkinnedActorPrefab:
-    """Prefab parameters for a soft skinned actor.
+    """Prefab parameters for a soft-skinned actor.
 
-    A soft skinned actor consists of an articulated skeleton with one or more
+    A soft-skinned actor consists of an articulated skeleton with one or more
     attached soft bodies.
     """
     comment: Optional[str]
@@ -1445,22 +1473,23 @@ class SoftSkinnedActorPrefab:
     """Articulated actor parameters for the skeleton."""
     @property
     def soft_params(self) -> DynamicArraySoftActorPrefab:
-        """Soft body parameters, one per soft actor.
+        """Parameters for each nested soft actor.
 
         Note:
-            The per-soft-actor :attr:`~superdex.physics.prefab.SoftActorPrefab.rotation`
-            and :attr:`~superdex.physics.prefab.SoftActorPrefab.translation` fields are
-            ignored. Soft actor transforms are determined by the skeleton's link
-            attachments (see
+            The :attr:`~superdex.physics.prefab.SoftActorPrefab.rotation` and
+            :attr:`~superdex.physics.prefab.SoftActorPrefab.translation` fields for each
+            nested soft actor are ignored. Nested soft actor transforms are determined
+            by the skeleton's link attachments (see
             :attr:`~superdex.physics.prefab.SoftSkinnedActorPrefab.soft_attach_links`).
 
         Note:
-            Each per-soft-actor :attr:`~superdex.physics.prefab.SoftActorPrefab.scale`
-            must be uniform (three equal, strictly positive, finite values). Non-uniform
-            soft shape scale is not supported for soft-skinned prefabs.
+            Each nested soft actor's
+            :attr:`~superdex.physics.prefab.SoftActorPrefab.scale` must be uniform
+            (three equal, strictly positive, finite values). Non-uniform soft shape
+            scale is not supported for soft-skinned prefabs.
 
         Note:
-            If a per-soft-actor
+            If a nested soft actor's
             :attr:`~superdex.physics.prefab.SoftActorPrefab.flow_file` is set, that
             entry's :attr:`~superdex.physics.prefab.SoftActorPrefab.scale` must be (1,
             1, 1).
@@ -1481,7 +1510,7 @@ class SoftSkinnedActorPrefab:
     def soft_params(self, value: ArrayLikeSoftActorPrefab) -> None: ...
     @property
     def soft_attach_links(self) -> mochi_physics.DynamicArrayString:
-        """Local link names to attach each soft actor to. Empty or one entry per
+        """Local link names to attach each nested soft actor to. Empty or one entry per
         :attr:`~superdex.physics.prefab.SoftSkinnedActorPrefab.soft_params` element.
 
         Note:
@@ -1534,7 +1563,7 @@ class ActorLists:
     def soft(self, value: ArrayLikeSoftActorPrefab) -> None: ...
     @property
     def soft_skinned(self) -> DynamicArraySoftSkinnedActorPrefab:
-        """Soft skinned actors."""
+        """Soft-skinned actors."""
     @soft_skinned.setter
     def soft_skinned(self, value: ArrayLikeSoftSkinnedActorPrefab) -> None: ...
     @overload
@@ -2271,7 +2300,7 @@ class PoseControllerPrefab:
     ) -> None: ...
 
 class PrefabReference:
-    """Reference to another prefab file (scene or actor) for prefab nesting."""
+    """Reference to another prefab (scene or actor) for prefab nesting."""
     comment: Optional[str]
     """Optional serialized comment."""
     name: str
@@ -2280,14 +2309,34 @@ class PrefabReference:
 
     Note:
         Name-reference ambiguity is evaluated per nested subtree. A nested prefab's
-        own references (from its constraints, pose controllers, and contact filters)
-        resolve within its own instance first, so a name reused across independent
-        sibling instances is not ambiguous for each instance's internal references.
-        It becomes ambiguous only for a reference written at the enclosing (parent)
-        scope or above.
+        own name-based references resolve within its own instance first, so a name
+        reused across independent sibling instances is not ambiguous for each
+        instance's internal references. It becomes ambiguous only for a reference
+        written at the enclosing (parent) scope or above.
     """
     path: str
-    """File path of the nested prefab."""
+    """Path to the nested prefab file.
+
+    If non-empty, :func:`~superdex.physics.prefab.load_nested_prefabs` reloads the
+    prefab from this path on every call.
+    :func:`~superdex.physics.prefab.ensure_fully_loaded` loads it from this path
+    only if the reference does not already contain a loaded prefab. If empty, both
+    functions require the reference to already contain a loaded prefab; they keep
+    that prefab and load all prefabs nested within it.
+
+    Note:
+        A reference created with the Python constructor needs a non-empty path
+        before loading because the constructor cannot accept a loaded prefab. C++
+        callers may instead assign a loaded prefab directly and leave this path
+        empty.
+
+    Warning:
+        The loaded prefab is not serialized. After deserialization, an empty-path
+        reference has no loaded prefab and is rejected by
+        :func:`~superdex.physics.prefab.load_nested_prefabs` and
+        :func:`~superdex.physics.prefab.ensure_fully_loaded`. Set a non-empty path
+        before saving if the reference must remain loadable after deserialization.
+    """
     scale: float
     """Uniform scale of the nested prefab, relative to the parent prefab.
 
@@ -2428,6 +2477,60 @@ class ActorContactEntry:
     def __eq__(self, other: object) -> bool: ...
     def __ne__(self, other: object) -> bool: ...
 
+class ContactPairParamsOverrideEntry:
+    """Overrides selected contact parameters for an unordered actor pair.
+
+    See Also:
+        :meth:`~superdex.physics.Scene.set_contact_pair_params_override`,
+        :class:`~superdex.physics.ContactPairParamsOverride`
+    """
+    @property
+    def actors(self) -> mochi_physics.DynamicArrayString:
+        """Identifies two actors by name or hierarchy path.
+
+        If the actor is in this prefab, reference it by name, e.g., "myActor". If the
+        actor is in a nested prefab, reference it by hierarchy path, e.g.,
+        "myPrefab/myActor".
+
+        Note:
+            Each referenced name must identify exactly one existing actor. Actor names
+            need not be unique, but referencing a name shared by more than one actor, or
+            a name that matches no actor, is invalid and rejected at
+            :func:`~superdex.physics.prefab.add_to_scene`.
+
+        Note:
+            Both referenced actors must have contact parameters.
+
+        Note:
+            Parent actor names identify only the parent. Name nested actors explicitly
+            to override their contact pairs.
+
+        Note:
+            If both names identify the same actor, the entry applies to that actor's
+            self-pair.
+
+        Warning:
+            Must contain exactly 2 elements.
+        """
+    @actors.setter
+    def actors(self, value: mochi_physics.ArrayLikeString) -> None: ...
+    params_override: mochi_physics.ContactPairParamsOverride
+    """Partial contact parameter override for the actor pair.
+
+    Note:
+        At least one field must be present.
+    """
+    @overload
+    def __init__(self) -> None: ...
+    @overload
+    def __init__(
+        self,
+        actors: mochi_physics.ArrayLikeString = ...,
+        params_override: mochi_physics.ContactPairParamsOverride = ...,
+    ) -> None: ...
+    def __eq__(self, other: object) -> bool: ...
+    def __ne__(self, other: object) -> bool: ...
+
 class LayerContactEntry:
     """Used by :class:`~superdex.physics.prefab.ContactFilter` to enable or disable
     contact for a pair of layers.
@@ -2523,7 +2626,8 @@ class ContactFilter:
         Exporting may emit a canonical representation whose contact-filter category
         differs from the original JSON. For example, self-contact may be emitted as
         :attr:`actor_contact_symmetric` because the forward and reverse resolved
-        actor pair are the same.
+        actor pair are the same. Entry order and duplicate, redundant, or overridden
+        entries from the source prefab are not preserved.
 
     Warning:
         Scene export does not record explicit settings that enable contact between
@@ -2637,6 +2741,22 @@ class ScenePrefab:
     """Global scene parameters (top-level prefab only)."""
     contact_filter: Optional[ContactFilter]
     """Contact filter settings for selective contact filtering."""
+    @property
+    def contact_pair_params_overrides(
+        self,
+    ) -> Optional[DynamicArrayContactPairParamsOverrideEntry]:
+        """Optional actor-pair contact parameter overrides.
+
+        Entries are applied in array order after all actors in their prefab have been
+        created. A later entry for the same unordered actor pair replaces the earlier
+        override rather than merging with it. Nested child prefab entries are applied
+        before parent entries.
+        """
+    @contact_pair_params_overrides.setter
+    def contact_pair_params_overrides(
+        self,
+        value: Optional[ArrayLikeContactPairParamsOverrideEntry],
+    ) -> None: ...
     @overload
     def __init__(self) -> None: ...
     @overload
@@ -2649,6 +2769,7 @@ class ScenePrefab:
         prefabs: ArrayLikePrefabReference = ...,
         scene: Optional[SceneParams] = ...,
         contact_filter: Optional[ContactFilter] = ...,
+        contact_pair_params_overrides: Optional[ArrayLikeContactPairParamsOverrideEntry] = ...,
     ) -> None: ...
 
 class PrefabParams:
@@ -2709,6 +2830,7 @@ class PrefabParams:
     - density (intrinsic material property; mass/density are mutually exclusive in
       the prefab API, so no double-application)
     - linearVelocity / angularVelocity / jointVelocities
+    - Contact-pair parameter overrides, whose authored values are preserved
     - Constraint stiffness/damping coefficients and saturation thresholds inherited
       from :class:`~superdex.physics.ConstraintParams`. These parameters define the
       constraint's response, not just geometry: different goals (preserving material
@@ -2803,8 +2925,8 @@ class AddToSceneResult:
 
         Note:
             Contains only top-level actors. Articulated actors' nested link actors and
-            soft-skinned actors' nested link and soft sub-actors are created but not
-            listed here. Reach them via
+            soft-skinned actors' nested link actors and nested soft actors are created
+            but not listed here. Reach them via
             :meth:`~superdex.physics.Actor.get_nested_link_actors` and
             :meth:`~superdex.physics.Actor.get_nested_soft_actors`.
 
@@ -2852,11 +2974,11 @@ class AddToSceneResult:
             order.
 
         Note:
-            For a single prefab (no nested prefabs) whose actors have no nested link or
-            soft sub-actors, the result is 1-to-1 with the prefab's actors of that type
-            (same size, same order). Nested link/soft sub-actors are not listed, and
-            soft-skinned actors are reported under :class:`ARTICULATED
-            <superdex.physics.ActorType>`.
+            For a single prefab (no nested prefabs) whose actors have no nested link
+            actors or nested soft actors, the result is 1-to-1 with the prefab's actors
+            of that type (same size, same order). Nested link actors and nested soft
+            actors are not listed, and soft-skinned actors are reported under
+            :class:`ARTICULATED <superdex.physics.ActorType>`.
         """
     @overload
     def filter(
@@ -2996,8 +3118,8 @@ def add_to_scene(
 
     Creates the prefab's actors, constraints, and controllers, applies any scene
     settings enabled by
-    :attr:`~superdex.physics.prefab.PrefabParams.apply_scene_settings`, and applies
-    contact filter entries.
+    :attr:`~superdex.physics.prefab.PrefabParams.apply_scene_settings`, contact
+    filter entries, and contact-pair parameter overrides.
 
     Args:
         prefab (ScenePrefab): The fully loaded
@@ -3255,12 +3377,21 @@ def load_nested_prefabs(prefab: ScenePrefab, root_path: str) -> None:
         nested content for you.
 
     Note:
-        If called a second time, the nested prefabs will be reloaded. If your
-        intention is to avoid redundant loads, then use
-        :func:`~superdex.physics.prefab.ensure_fully_loaded` instead.
+        A reference with a non-empty path is reloaded from its file on every call. A
+        reference with an empty path must already contain a loaded prefab; this
+        function keeps that prefab and loads all prefabs nested within it. See
+        :attr:`~superdex.physics.prefab.PrefabReference.path` for when a path is
+        required. Use :func:`~superdex.physics.prefab.ensure_fully_loaded` to avoid
+        reloading prefabs that are already loaded.
 
     Note:
         A prefab must not reference itself, directly or indirectly.
+
+    Warning:
+        If this function returns an error, the input prefab may remain partially
+        loaded. A reference with a non-empty path keeps its previously loaded prefab
+        if its file or any prefab nested within it fails to load; if it had no
+        loaded prefab, it remains unloaded.
 
     See Also:
         :func:`~superdex.physics.prefab.ensure_fully_loaded`,
@@ -3340,6 +3471,18 @@ def ensure_fully_loaded(prefab: ScenePrefab, root_path: str) -> None:
     Note:
         A prefab must not reference itself, directly or indirectly.
 
+    Note:
+        If a reference already contains a loaded prefab, this function does not
+        reload its file, even when its path is non-empty; it still loads any missing
+        nested prefabs. A reference with neither a path nor a loaded prefab is
+        invalid. See :attr:`~superdex.physics.prefab.PrefabReference.path` for when
+        a path is required.
+
+    Warning:
+        If this function returns an error, the input prefab may remain partially
+        loaded. A reference that was unloaded when the call began remains unloaded
+        if its file or any prefab nested within it fails to load.
+
     See Also:
         :func:`~superdex.physics.prefab.load_nested_prefabs`,
         :func:`~superdex.physics.prefab.load_shapes`,
@@ -3369,6 +3512,11 @@ def export_scene(scene: mochi_physics.Scene, export_name: str, output_dir: str) 
         Exported actor names are made unique: when two actors share a name, later
         ones receive a numeric suffix (e.g. "box", "box1"), so an exported name may
         differ from the runtime name.
+
+    Note:
+        Scene export reconstructs supported creation and configuration data from
+        effective runtime state. It is not a lossless or structure-preserving round
+        trip of any prefab used to create the scene.
 
     Warning:
         Currently exports only rigid, soft, articulated, and soft-skinned actors.
@@ -3411,8 +3559,9 @@ def export_scene_excluding(
         exclude_actors (ArrayLikeActorHandle): Handles of actors that should not be
             exported. Excluding an articulated actor also excludes all of its nested
             link actors. Excluding a soft-skinned actor also excludes all of its
-            nested link and soft sub-actors. Any contact filter entries that
-            reference excluded actors are dropped.
+            nested link actors and nested soft actors. Any contact filter or
+            contact-pair parameter override entries that reference excluded actors
+            are dropped.
 
     Raises:
         :class:`~superdex.physics.Error`: If an error occurs.
@@ -3453,8 +3602,7 @@ def export_actor(actor: mochi_physics.Actor, export_name: str, output_dir: str) 
     ``outputDir/exportName/<exportName>.mochi_scene``.
 
     Extracts creation parameters from the actor and writes the prefab plus any
-    generated mesh assets to disk. Only supported for standalone rigid actors, soft
-    actors and articulated actors.
+    generated mesh assets to disk.
 
     Args:
         actor (Actor): The actor to export. Must not be None.
@@ -3468,32 +3616,30 @@ def export_actor(actor: mochi_physics.Actor, export_name: str, output_dir: str) 
         :class:`~superdex.physics.Error`: If an error occurs.
 
     Note:
-        Uses the same prefab export path as
-        :func:`~superdex.physics.prefab.export_scene`. In addition to the
-        soft-skinned restriction above, any limitations documented in
-        :func:`~superdex.physics.prefab.export_scene` also apply here.
+        Any limitations documented in :func:`~superdex.physics.prefab.export_scene`
+        also apply here.
 
     Note:
-        When exporting an articulated actor, pass the top-level articulated actor
-        (the one returned by
-        :meth:`~superdex.physics.Scene.create_articulated_actor` or by
-        :meth:`~superdex.physics.Actor.get_articulated_actor` on a nested link), not
-        a nested actor.
+        When exporting an articulated actor, pass the articulated actor itself (the
+        one returned by :meth:`~superdex.physics.Scene.create_articulated_actor` or
+        by :meth:`~superdex.physics.Actor.get_articulated_actor` on a nested link),
+        not a nested actor.
 
     Note:
         Generated mesh files (.mochi.h5) are written under generated_assets/ and
         referenced from the prefab using "./generated_assets/" paths.
 
     Warning:
-        Only supported for standalone rigid, soft, and articulated actors.
-        Soft-skinned actors are not supported here.
+        Only supported for standalone rigid actors, standalone soft actors, and
+        articulated actors. Soft-skinned actors are not supported.
 
     Warning:
-        Contact-filter settings are not exported. Adding an exported articulated
-        actor to a scene applies automatic adjacent-link filtering, even if contact
-        between adjacent links was explicitly enabled before export. To preserve
-        this behavior, add an equivalent enabling entry to the exported prefab or
-        re-enable the pair after adding the prefab to a scene.
+        Scene-level contact-filter settings and contact-pair parameter overrides are
+        not exported. Adding an exported articulated actor to a scene applies
+        automatic adjacent-link filtering, even if contact between adjacent links
+        was explicitly enabled before export. To preserve this behavior, add an
+        equivalent enabling entry to the exported prefab or re-enable the pair after
+        adding the prefab to a scene.
 
     See Also:
         :func:`~superdex.physics.prefab.export_scene`,

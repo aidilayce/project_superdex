@@ -600,13 +600,7 @@ TEST(Vec4r, Get) {
   EXPECT_EQ(3_r, Get<2>(a));
   EXPECT_EQ(4_r, Get<3>(a));
 
-  // Slower runtime version
-  EXPECT_EQ(1_r, Get(a, 0));
-  EXPECT_EQ(2_r, Get(a, 1));
-  EXPECT_EQ(3_r, Get(a, 2));
-  EXPECT_EQ(4_r, Get(a, 3));
-
-  // Same but with operator[] (read only)
+  // Runtime version
   EXPECT_EQ(1_r, a[0]);
   EXPECT_EQ(2_r, a[1]);
   EXPECT_EQ(3_r, a[2]);
@@ -736,6 +730,7 @@ TEST(Vec4r, Load) {
   EXPECT_VEC4R(1_r, 2_r, 3_r, 4_r, (Load<4, Vec4r>(values + 1)));
   EXPECT_VEC4R(1_r, 2_r, 3_r, 4_r, (Load<Vec4r>(values + 1)));
 
+  EXPECT_VEC4R(0_r, 0_r, 0_r, 0_r, (Load<Vec4r>(values + 1, 0)));
   EXPECT_VEC4R(1_r, 0_r, 0_r, 0_r, (Load<Vec4r>(values + 1, 1)));
   EXPECT_VEC4R(1_r, 2_r, 0_r, 0_r, (Load<Vec4r>(values + 1, 2)));
   EXPECT_VEC4R(1_r, 2_r, 3_r, 0_r, (Load<Vec4r>(values + 1, 3)));
@@ -1155,9 +1150,7 @@ TEST(Vec4r, ExpExtreme) {
   auto expv = Exp(v), expmv = Exp(-v);
   auto tol = real(2.0) * std::numeric_limits<real>::epsilon();
   for (int i = 0; i < 4; ++i) {
-    EXPECT_NEAR_RTOL(Vec4r::Get(expv, i), std::exp(x[i]), tol);
-    EXPECT_LE(
-        Abs(Vec4r::Get(expmv, i) - std::exp(-x[i])),
-        Max(Vec4r::Get(expmv, i), std::exp(-x[i])) * tol);
+    EXPECT_NEAR_RTOL(expv[i], std::exp(x[i]), tol);
+    EXPECT_LE(Abs(expmv[i] - std::exp(-x[i])), Max(expmv[i], std::exp(-x[i])) * tol);
   }
 }

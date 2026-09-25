@@ -17,6 +17,7 @@
 #include "mochi_physics_test_fixture.h"
 
 #include <mochi_core/geometry/tetrahedral_mesh.h>
+#include <mochi_core/geometry/triangular_mesh.h>
 #include <mochi_core/utils/rand_utils.h>
 #include <mochi_core/utils/rigid_body_utils.h>
 #include <mochi_physics/mochi_physics.h>
@@ -26,10 +27,12 @@
 #include <mochi_physics/src/mochi_articulated_body.h>
 #include <mochi_physics/src/mochi_contact.h>
 #include <mochi_physics/src/mochi_context.h>
+#include <mochi_physics/src/mochi_deformable.h>
 #include <mochi_physics/src/mochi_group.h>
 #include <mochi_physics/src/mochi_island.h>
 #include <mochi_physics/src/mochi_rigid.h>
 #include <mochi_physics/src/mochi_shape.h>
+#include <mochi_physics/src/mochi_snle.h>
 #include <mochi_physics/src/mochi_soft.h>
 #include <mochi_physics/src/mochi_soft_rom_linear_systems.h>
 #include <mochi_physics/src/mochi_soft_rom_systems.h>
@@ -37,12 +40,16 @@
 #include <mochi_physics/src/mochi_step.h>
 
 #include <gtest/gtest.h>
-
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 using namespace mochi;
@@ -170,6 +177,50 @@ TEST(MochiContact, ComputeCollisionResponse) {
   runTest(/* explicitNormals */ false, /*coulombCoefficient*/ 0.5_r, /*viscousCoefficient*/ 0_r);
   runTest(/* explicitNormals */ true, /*coulombCoefficient*/ 0_r, /*viscousCoefficient*/ 100.0_r);
   runTest(/* explicitNormals */ true, /*coulombCoefficient*/ 0.5_r, /*viscousCoefficient*/ 0_r);
+}
+
+TEST(MochiContact, SetupActiveCollisionNormalsCachesLinearElementNormal) {
+  CSimulationParams simulationParams;
+  TetrahedralMesh const tetMesh{CreateMinimalTetMeshSingleTet()};
+  auto const displacements = ColumnVector<real>::Zero(kSpaceDim3 * tetMesh.GetNumNodes());
+  CRootTransform const transform{
+      TransformRT{Quaternion::FromRotationVector(Real3{0.2_r, -0.3_r, 0.4_r})}};
+  CContactSamples<TimeStep::Current> const contactPositions{0};
+  auto const surfaceMesh = CreateBoundaryMesh(tetMesh);
+  Real3 const expectedNormal =
+      transform.worldFromLocal.GetRotation() * surfaceMesh.GetElementNormals()[0];
+  auto runTest = [&](auto const& discretization) {
+    CActiveCollisions<ContactType::Sync, TimeStep::Current> collisions;
+    collisions.emplace_back(ActiveCollision{});
+    auto& result = collisions.front().collisionResult;
+    result.sampleIndices = {0, 1, 3};
+    result.jacColliderFromWorld.resize(3, VEye<3>());
+    deformable::SetupActiveCollisionNormals<ContactType::Sync>(
+        {},
+        ecs::CtxGlobal<CSimulationParams const>{simulationParams},
+        discretization,
+        CFinalDisplacementRef<TimeStep::Current>{AsConstView(displacements)},
+        CFinalDisplacementRef<TimeStep::StageStart>{AsConstView(displacements)},
+        transform,
+        contactPositions,
+        collisions);
+    EXPECT_NEAR_EQ(expectedNormal, result.normalColliding[0]);
+    EXPECT_NEAR_EQ(result.normalColliding[0], result.normalColliding[1]);
+    EXPECT_NEAR_EQ(
+        transform.worldFromLocal.GetRotation() * surfaceMesh.GetElementNormals()[1],
+        result.normalColliding[2]);
+  };
+
+  CFemVolumeDiscretizationP1Q1 volumeDiscretization;
+  volumeDiscretization.femElements.emplace_back(
+      0,
+      tetMesh.GetNodeCoordinates(),
+      tetMesh.GetElementConnectivity(),
+      tetrahedral::kTetrahedralQuadrature1);
+  runTest(
+      CFemBoundaryDiscretization::Create(
+          tetMesh, volumeDiscretization, ActorBoundaryElementType::P1Q3));
+  runTest(CFemSurfaceDiscretization::Create(ActorBoundaryElementType::P1Q3, surfaceMesh));
 }
 
 namespace {
@@ -545,10 +596,10 @@ class MochiContactTestBase : public test::MochiSceneTestBase,
         flowParams.shiftY = 0.51221045_r;
         flowParams.shiftZ = 0.49657665_r;
         flowParams.scale = 1.3309090553162923_r;
-        flowParams.deepModelPath = test::GetAssetPath("cube/cube_minimal_flow_revised.pt");
+        flowParams.deepModelPath = test::GetAssetPath("cube/cube_minimal_flow_revised.mochi.h5");
         flowParams.numDof = 24;
-        mochi::ShapeHandle flow = CreateDeepFlowShape(
-            _scene->GetContext(), flowParams, NeuralComputeType::MochiCpu, {}, test::ExpectOK());
+        mochi::ShapeHandle flow =
+            CreateDeepFlowShape(_scene->GetContext(), flowParams, test::ExpectOK());
         experimentalParams.flow = flow;
         caparams.contact.objScale = 1_r;
         caparams.contact.distanceErrorBound = flowParams.errorBound;
@@ -1155,9 +1206,7 @@ class MochiSoftSoftContactDeepFlow : public MochiSoftSoftContact {
 };
 
 // Test of the integration of deep flow and biharmonic ROMs
-// TODO[T152549129] DISABLED because it torch::jit::load crashes or never returns in debug builds.
-// TODO Also disabled when real is type double, because the saved torch files only support floats.
-#if MOCHI_USE_TORCH && !MOCHI_DEBUG && !MOCHI_USE_DOUBLE_PRECISION && MOCHI_ENABLE_DEEP_FLOW_ACTORS
+#if MOCHI_ENABLE_DEEP_FLOW_ACTORS && MOCHI_USE_HDF5
 #define MOCHI_CAN_TEST_DEEP_FLOW 0 // TODO(T228959906): Re-enable deep flow tests
 #else
 #define MOCHI_CAN_TEST_DEEP_FLOW 0
@@ -1214,14 +1263,13 @@ class DeepFlowBiharmonicRom : public MochiContactTestBase {
         test::ExpectOK());
     DeepModelParams dflowparams;
     dflowparams.deepModelPath =
-        test::GetAssetPath("duck/duck_coarse_biharmonic_rom/duck_10handles_flow.pt");
+        test::GetAssetPath("duck/duck_coarse_biharmonic_rom/duck_10handles_flow.mochi.h5");
     dflowparams.shiftX = 0.43273339_r;
     dflowparams.shiftY = 0.290418_r;
     dflowparams.shiftZ = 0.49103763_r;
     dflowparams.scale = 0.6447050910181614_r;
     dflowparams.numDof = 30;
-    ShapeHandle flow = CreateDeepFlowShape(
-        _mochiContext, dflowparams, NeuralComputeType::MochiCpu, {}, test::ExpectOK());
+    ShapeHandle flow = CreateDeepFlowShape(_mochiContext, dflowparams, test::ExpectOK());
     SoftActorParams params;
     params.layer = "Collider";
     params.shape = duck;
@@ -1537,6 +1585,509 @@ INSTANTIATE_TEST_SUITE_P(
         TestParams{"CoulombExplicit", GradTarget::Current, 0.5_r, 0_r, 0_r, true, 2e-3_r, 1e-2_r},
         TestParams{"DampingExplicit", GradTarget::Current, 0_r, 0_r, 10_r, true, 2e-3_r, 1e-2_r}),
     [](::testing::TestParamInfo<TestParams> const& info) { return info.param.name; });
+
+class SkinnedContactPairCapacityTest : public test::MochiSceneTestBase {
+ protected:
+  static constexpr int kNumActiveBones = 5;
+  static constexpr int kNumPartitions = (1 << kNumActiveBones) - 1;
+
+  ShapeHandle CreatePartitionedSkinShape() {
+    DynamicArray<Real3> coordinates;
+    DynamicArray<Int3> connectivity;
+    SkinningData skinning;
+    skinning.weightsPerNode = kNumActiveBones;
+    coordinates.reserve(3 * kNumPartitions);
+    connectivity.reserve(kNumPartitions);
+    skinning.indices.reserve(3 * kNumPartitions * kNumActiveBones);
+    skinning.weights.reserve(3 * kNumPartitions * kNumActiveBones);
+
+    for (int partition = 0; partition < kNumPartitions; ++partition) {
+      auto const boneMask = static_cast<unsigned int>(partition + 1);
+      real const boneWeight = 1_r / static_cast<real>(std::popcount(boneMask));
+
+      real const y = 0.08_r + 0.14_r * static_cast<real>(partition % 6);
+      real const z = 0.08_r + 0.14_r * static_cast<real>(partition / 6);
+      int const firstNode = isize(coordinates);
+      coordinates.emplace_back(Real3{0.01_r, y, z});
+      coordinates.emplace_back(Real3{0.01_r, y + 0.04_r, z});
+      coordinates.emplace_back(Real3{0.01_r, y, z + 0.04_r});
+      connectivity.emplace_back(Int3{firstNode, firstNode + 1, firstNode + 2});
+
+      for (int vertex = 0; vertex < 3; ++vertex) {
+        for (int bone = 0; bone < kNumActiveBones; ++bone) {
+          skinning.indices.emplace_back(bone + 1);
+          skinning.weights.emplace_back(((boneMask >> bone) & 1U) != 0 ? boneWeight : 0_r);
+        }
+      }
+    }
+
+    auto mesh = std::make_unique<TriangularMesh>(coordinates, connectivity);
+    auto shape = std::make_shared<TriangularMeshShape>(
+        std::move(mesh), std::make_shared<SkinningData const>(std::move(skinning)));
+    return assert_cast<ContextImpl*>(_mochiContext)->RegisterShape(shape, test::ExpectOK{});
+  }
+
+  ArticulatedActorParams MakeArticulationParams(
+      ShapeHandle skinShape,
+      std::string_view skinLayer,
+      std::string_view linkLayer) {
+    ArticulatedActorParams params;
+    params.joints.resize(kNumActiveBones + 1);
+    params.links.resize(kNumActiveBones + 1);
+    params.joints[0].type = ArticulatedJointType::Hard;
+
+    ShapeHandle const linkShape = test::CreateUnitCubeTetMeshShape(_mochiContext);
+    for (int bone = 0; bone < kNumActiveBones; ++bone) {
+      int const link = bone + 1;
+      params.joints[link].type = ArticulatedJointType::Prismatic;
+      params.joints[link].axis = Real3{1_r, 0_r, 0_r};
+      params.links[link].parentLink = 0;
+      params.links[link].shape = linkShape;
+      params.links[link].layer = linkLayer;
+      params.links[link].colliderType = ColliderType::Box;
+      params.links[link].hasGravity = false;
+      params.links[link].contact.penaltyThresholdDefault = 0_r;
+    }
+
+    ArticulatedSkinParams skin;
+    skin.shape = skinShape;
+    skin.layer = skinLayer;
+    skin.nonCollidingLinks = DynamicArray<DynamicString>{};
+    skin.contact.penaltyThresholdDefault = 0_r;
+    params.skin = std::move(skin);
+    return params;
+  }
+};
+
+TEST_F(SkinnedContactPairCapacityTest, PartitionedPairsCanExceedActorPairs) {
+  _scene->SetGravity(Real3{});
+  ShapeHandle const skinShape = CreatePartitionedSkinShape();
+  Actor* const actorA = _scene->CreateArticulatedActor(
+      MakeArticulationParams(skinShape, "SkinA", "LinksA"), test::ExpectOK{});
+  Actor* const actorB = _scene->CreateArticulatedActor(
+      MakeArticulationParams(skinShape, "SkinB", "LinksB"), test::ExpectOK{});
+  ASSERT_NE(nullptr, actorA);
+  ASSERT_NE(nullptr, actorB);
+
+  std::array<std::string_view, 4> const layers{"SkinA", "LinksA", "SkinB", "LinksB"};
+  for (auto const collidingLayer : layers) {
+    for (auto const colliderLayer : layers) {
+      _scene->EnableLayerContactAsymmetric(collidingLayer, colliderLayer, false, test::ExpectOK{});
+    }
+  }
+  _scene->EnableLayerContactAsymmetric("SkinA", "LinksB", true, test::ExpectOK{});
+  _scene->EnableLayerContactAsymmetric("SkinB", "LinksA", true, test::ExpectOK{});
+
+  auto& reg = GetRegistry();
+  entt::entity const entityA = GetEntity(actorA->GetHandle());
+  entt::entity const entityB = GetEntity(actorB->GetHandle());
+  EXPECT_EQ(kNumPartitions, isize(reg.get<CContactPartitions const>(entityA)));
+  EXPECT_EQ(kNumPartitions, isize(reg.get<CContactPartitions const>(entityB)));
+
+  _scene->Step(1e-3_r);
+
+  entt::entity const island = reg.get<CIslandMemberInfo const>(entityA).island;
+  ASSERT_EQ(island, reg.get<CIslandMemberInfo const>(entityB).island);
+  auto const& actors = reg.get<CIslandDescendants const>(island).actors;
+  int numActiveCollisions = 0;
+  for (auto actor : actors) {
+    if (auto const* activeCollisions =
+            reg.try_get<CActiveCollisions<ContactType::Sync, TimeStep::Current> const>(actor)) {
+      numActiveCollisions += isize(*activeCollisions);
+    }
+  }
+  EXPECT_GT(numActiveCollisions, Sqr(isize(actors)));
+}
+
+class ZeroDofSkinContact : public test::MochiSceneTestBase {
+ protected:
+  static constexpr double kTimeStep = 1e-2;
+  // Box extents along x that overlap only zero-DoF partitions, or both zero-DoF and DoF-bearing
+  // ones.
+  static constexpr real kZeroDofBoxMaxX = 0.05_r;
+  static constexpr real kMixedBoxMaxX = 0.3_r;
+
+  ShapeHandle CreateSkinShape() {
+    auto&& [coordinates, connectivity] = test::CreateMinimalTriMeshUnitCube();
+    auto mesh = std::make_unique<TriangularMesh>(coordinates, connectivity);
+    SkinningData skinning;
+    skinning.weightsPerNode = 1;
+    for (Real3 const& coordinate : coordinates) {
+      skinning.indices.push_back(coordinate[0] == 0_r ? 0 : 1);
+      skinning.weights.push_back(1_r);
+    }
+    auto shape = std::make_shared<TriangularMeshShape>(
+        std::move(mesh), std::make_shared<SkinningData const>(std::move(skinning)));
+    return assert_cast<ContextImpl*>(_mochiContext)->RegisterShape(shape, test::ExpectOK{});
+  }
+
+  ShapeHandle CreatePartiallyBlendedSkinShape() {
+    auto&& [coordinates, connectivity] = test::CreateMinimalTriMeshUnitCube();
+    auto mesh = std::make_unique<TriangularMesh>(coordinates, connectivity);
+    auto skinning = std::make_shared<SkinningData const>(
+        test::MakeSingleBoneSkinning(isize(coordinates), /*boneIndex=*/0));
+    BlendingDataTargetMesh target;
+    target.indices.resize(coordinates.size());
+    target.weights.resize(coordinates.size());
+    for (int node = 0; node < isize(coordinates); ++node) {
+      target.indices[node] = node;
+      target.weights[node] = coordinates[node][0] == 0_r ? 0_r : 0.5_r;
+    }
+    auto blending = std::make_shared<BlendingDataMap>();
+    blending->perSourceShapeData.emplace(DynamicString{"soft"}, std::move(target));
+    auto shape = std::make_shared<TriangularMeshShape>(
+        std::move(mesh), skinning, /*constrainedNodesData=*/nullptr, std::move(blending));
+    return assert_cast<ContextImpl*>(_mochiContext)->RegisterShape(shape, test::ExpectOK{});
+  }
+
+  ArticulatedActorParams MakeSkinParams(ShapeHandle skinShape) {
+    ArticulatedActorParams params;
+    params.joints = {
+        {.type = ArticulatedJointType::Hard},
+        {.type = ArticulatedJointType::Prismatic, .axis = Real3{1_r, 0_r, 0_r}}};
+    ShapeHandle const linkShape = test::CreateUnitCubeTetMeshShape(_mochiContext);
+    params.links = {
+        {.parentLink = -1,
+         .shape = linkShape,
+         .colliderType = ColliderType::None,
+         .hasGravity = false},
+        {.parentLink = 0,
+         .shape = linkShape,
+         .colliderType = ColliderType::None,
+         .hasGravity = false}};
+    params.skin = ArticulatedSkinParams{.shape = skinShape, .layer = "Skin"};
+    params.skin->contact.penaltyThresholdDefault = 0_r;
+    return params;
+  }
+
+  Actor* CreateBox(bool isStatic, real boxMaxX) {
+    RigidActorParams boxParams;
+    boxParams.layer = "Box";
+    auto&& [boxCoordinates, boxConnectivity] =
+        test::CreateMinimalTetMeshUnitCube(Real3{boxMaxX + 0.95_r, 2_r, 2_r});
+    boxParams.shape = _mochiContext->CreateTetMeshShape(
+        Flatten(MakeSpan(boxCoordinates)), Flatten(MakeSpan(boxConnectivity)), test::ExpectOK{});
+    boxParams.worldFromLocal = TransformRT{Real3{-0.95_r, -0.5_r, -0.5_r}};
+    boxParams.colliderType = ColliderType::Box;
+    boxParams.isStatic = isStatic;
+    boxParams.hasGravity = false;
+    boxParams.mass = 1_r;
+    boxParams.contact.penaltyThresholdDefault = 0_r;
+    return _scene->CreateRigidActor(boxParams, test::ExpectOK{});
+  }
+
+  std::pair<Actor*, Actor*> CreateActors(bool isBoxStatic, real boxMaxX = kZeroDofBoxMaxX) {
+    Actor* skin =
+        _scene->CreateArticulatedActor(MakeSkinParams(CreateSkinShape()), test::ExpectOK{});
+    Actor* box = CreateBox(isBoxStatic, boxMaxX);
+
+    _scene->EnableLayerContactSymmetric("Skin", "Box", true, test::ExpectOK{});
+    return {skin, box};
+  }
+
+  std::pair<Actor*, Actor*> CreateBlendedActors(real boxMaxX) {
+    SoftSkinnedActorParams params;
+    params.skeletonParams = MakeSkinParams(CreatePartiallyBlendedSkinShape());
+    SoftActorParams softParams;
+    softParams.name = "soft";
+    softParams.shape = test::CreateUnitCubeTetSoftShape(_mochiContext);
+    softParams.hasGravity = false;
+    softParams.hasStress = false;
+    params.softParams = {softParams};
+    Actor* skin = _scene->CreateSoftSkinnedActor(params, test::ExpectOK{});
+    Actor* box = CreateBox(/*isStatic=*/true, boxMaxX);
+    _scene->EnableLayerContactSymmetric("Skin", "Box", true, test::ExpectOK{});
+    return {skin, box};
+  }
+
+  static void ShiftBoxX(Actor* box, real dx) {
+    TransformRT transform = box->GetRootTransform();
+    transform.SetTranslation(transform.GetTranslation() + Real3{dx, 0_r, 0_r});
+    box->SetRootTransform(transform, test::ExpectOK{});
+  }
+
+  bool UsesSkinnedContactInSolver(entt::entity skinEntity) {
+    return GetRegistry().get<CSkinnedContactSnle const>(skinEntity).useInSolver;
+  }
+
+  real GetPrismaticPose(entt::entity skinEntity) {
+    return GetRegistry().get<CArticulatedReducedPose<TimeStep::Current> const>(skinEntity).value[0];
+  }
+
+  void ExpectEmptyAndNonemptyPartitions(entt::entity skinEntity) {
+    auto const& partitions = GetRegistry().get<CContactPartitions const>(skinEntity);
+    bool hasEmpty = false;
+    bool hasNonempty = false;
+    for (int partitionId = 0; partitionId < isize(partitions); ++partitionId) {
+      auto const& descriptors = partitions[partitionId].GetDofDescriptors();
+      ASSERT_EQ(1, isize(descriptors));
+      auto const& dofs = std::get<DynamicArray<int>>(descriptors[0]);
+      hasEmpty |= dofs.empty();
+      hasNonempty |= !dofs.empty();
+    }
+    EXPECT_TRUE(hasEmpty);
+    EXPECT_TRUE(hasNonempty);
+  }
+
+  template <ContactType kContactType>
+  std::pair<int, int> CountContactsByDofType(entt::entity skinEntity, entt::entity boxEntity) {
+    auto const& reg = GetRegistry();
+    auto const& partitions = reg.get<CContactPartitions const>(skinEntity);
+    auto const& collisions =
+        reg.get<CActiveCollisions<kContactType, TimeStep::Current> const>(skinEntity);
+    int zeroDofContacts = 0;
+    int nonzeroDofContacts = 0;
+    for (auto const& collision : collisions) {
+      if (collision.collisionResult.Empty()) {
+        continue;
+      }
+      EXPECT_EQ(boxEntity, collision.colliderEntity);
+      auto const& descriptors =
+          partitions[collision.collisionResult.collidingPartitionId].GetDofDescriptors();
+      EXPECT_EQ(1, isize(descriptors));
+      if (isize(descriptors) != 1) {
+        continue;
+      }
+      int& count = std::get<DynamicArray<int>>(descriptors[0]).empty() ? zeroDofContacts
+                                                                       : nonzeroDofContacts;
+      count += isize(collision.collisionResult.sampleIndices);
+    }
+    return {zeroDofContacts, nonzeroDofContacts};
+  }
+
+  struct BlendedContactStats {
+    int contactsWithoutSoftDofs = 0;
+    int contactsWithSoftDofs = 0;
+    real maxForceWithoutSoftDofs = 0_r;
+  };
+
+  BlendedContactStats GetBlendedContactStats(entt::entity skinEntity, entt::entity boxEntity) {
+    auto const& reg = GetRegistry();
+    auto const& collisions =
+        reg.get<CActiveCollisions<ContactType::Async, TimeStep::Current> const>(skinEntity);
+    auto const& partitions = reg.get<CContactPartitions const>(skinEntity);
+    BlendedContactStats stats;
+    for (auto const& collision : collisions) {
+      auto const& result = collision.collisionResult;
+      if (result.Empty()) {
+        continue;
+      }
+      EXPECT_EQ(boxEntity, collision.colliderEntity);
+      auto const& descriptors = partitions[result.collidingPartitionId].GetDofDescriptors();
+      EXPECT_EQ(2, isize(descriptors));
+      if (isize(descriptors) != 2) {
+        continue;
+      }
+      EXPECT_TRUE(std::get<DynamicArray<int>>(descriptors[0]).empty());
+      int const softId = std::get<int>(descriptors[1]);
+      if (softId < 0) {
+        stats.contactsWithoutSoftDofs += isize(result.sampleIndices);
+        EXPECT_EQ(result.sampleIndices.size(), result.forcePerUnitArea.size());
+        for (Real3 const& force : result.forcePerUnitArea) {
+          stats.maxForceWithoutSoftDofs = Max(stats.maxForceWithoutSoftDofs, Norm(force));
+        }
+      } else {
+        EXPECT_EQ(0, softId);
+        stats.contactsWithSoftDofs += isize(result.sampleIndices);
+      }
+    }
+    return stats;
+  }
+
+  // Steps once with only zero-DoF contact, then once with mixed contact, which must set up the
+  // skinned contact SNLE for the first time.
+  void ExpectSnleSetUpAfterZeroDofStep(bool registerForceQuery) {
+    auto [skin, box] = CreateActors(/*isBoxStatic=*/true, kZeroDofBoxMaxX);
+    entt::entity const skinEntity = GetEntity(skin->GetHandle());
+    entt::entity const boxEntity = GetEntity(box->GetHandle());
+    if (registerForceQuery) {
+      skin->RegisterQuery(QueryType::TotalContactForce, test::ExpectOK{});
+    }
+
+    _scene->Step(kTimeStep);
+    auto const [zeroDofContacts, nonzeroDofContacts] =
+        CountContactsByDofType<ContactType::Async>(skinEntity, boxEntity);
+    EXPECT_GT(zeroDofContacts, 0);
+    EXPECT_EQ(0, nonzeroDofContacts);
+    EXPECT_FALSE(UsesSkinnedContactInSolver(skinEntity));
+    EXPECT_TRUE(GetRegistry().get<CSkinnedContactSnle const>(skinEntity).residuals.empty());
+
+    ShiftBoxX(box, kMixedBoxMaxX - kZeroDofBoxMaxX);
+    real const poseBefore = GetPrismaticPose(skinEntity);
+    _scene->Step(kTimeStep);
+    EXPECT_GT(CountContactsByDofType<ContactType::Async>(skinEntity, boxEntity).second, 0);
+    EXPECT_TRUE(UsesSkinnedContactInSolver(skinEntity));
+    EXPECT_NE(poseBefore, GetPrismaticPose(skinEntity));
+  }
+};
+
+TEST_F(ZeroDofSkinContact, StaticBoxReportsForceFromAsyncContact) {
+  auto [skin, box] = CreateActors(/*isBoxStatic=*/true);
+  entt::entity const skinEntity = GetEntity(skin->GetHandle());
+  entt::entity const boxEntity = GetEntity(box->GetHandle());
+  ExpectEmptyAndNonemptyPartitions(skinEntity);
+
+  skin->RegisterQuery(QueryType::TotalContactForce, test::ExpectOK{});
+  skin->RegisterQuery(QueryType::ContactPoints, test::ExpectOK{});
+  _scene->Step(kTimeStep);
+
+  auto const [zeroDofContacts, nonzeroDofContacts] =
+      CountContactsByDofType<ContactType::Async>(skinEntity, boxEntity);
+  EXPECT_GT(zeroDofContacts, 0);
+  EXPECT_EQ(0, nonzeroDofContacts);
+  EXPECT_EQ((std::pair{0, 0}), CountContactsByDofType<ContactType::Sync>(skinEntity, boxEntity));
+  EXPECT_FALSE(GetRegistry().get<CSkinnedContactSnle const>(skinEntity).useInSolver);
+  EXPECT_FALSE(skin->GetContactPointsWorld(test::ExpectOK{}).empty());
+  EXPECT_GT(Norm(skin->GetContactForceWorld(test::ExpectOK{})), 0_r);
+}
+
+TEST_F(ZeroDofSkinContact, DynamicBoxMovesFromSyncContact) {
+  auto [skin, box] = CreateActors(/*isBoxStatic=*/false);
+  entt::entity const skinEntity = GetEntity(skin->GetHandle());
+  entt::entity const boxEntity = GetEntity(box->GetHandle());
+  ExpectEmptyAndNonemptyPartitions(skinEntity);
+
+  skin->RegisterQuery(QueryType::TotalContactForce, test::ExpectOK{});
+  box->RegisterQuery(QueryType::TotalContactForce, test::ExpectOK{});
+  real const initialBoxX = box->GetRootTransform().GetTranslation()[0];
+  _scene->Step(kTimeStep);
+
+  auto const [zeroDofContacts, nonzeroDofContacts] =
+      CountContactsByDofType<ContactType::Sync>(skinEntity, boxEntity);
+  EXPECT_GT(zeroDofContacts, 0);
+  EXPECT_EQ(0, nonzeroDofContacts);
+  EXPECT_EQ((std::pair{0, 0}), CountContactsByDofType<ContactType::Async>(skinEntity, boxEntity));
+  EXPECT_LT(box->GetRootTransform().GetTranslation()[0], initialBoxX);
+  Real3 const skinForce = skin->GetContactForceWorld(test::ExpectOK{});
+  Real3 const boxForce = box->GetContactForceWorld(test::ExpectOK{});
+  real const forceScale = Max(Norm(skinForce), Norm(boxForce));
+  ASSERT_GT(forceScale, 0_r);
+  EXPECT_NEAR(Norm(skinForce + boxForce), 0_r, 1e-5_r * forceScale);
+}
+
+TEST_F(ZeroDofSkinContact, MixedPartitionsPreserveAsyncSolverContactAndQueries) {
+  auto [skin, box] = CreateActors(/*isBoxStatic=*/true, kMixedBoxMaxX);
+  entt::entity const skinEntity = GetEntity(skin->GetHandle());
+  entt::entity const boxEntity = GetEntity(box->GetHandle());
+  ExpectEmptyAndNonemptyPartitions(skinEntity);
+
+  skin->RegisterQuery(QueryType::TotalContactForce, test::ExpectOK{});
+  real const initialPose =
+      GetRegistry().get<CArticulatedReducedPose<TimeStep::Current> const>(skinEntity).value[0];
+  _scene->Step(kTimeStep);
+
+  auto const [zeroDofContacts, nonzeroDofContacts] =
+      CountContactsByDofType<ContactType::Async>(skinEntity, boxEntity);
+  EXPECT_GT(zeroDofContacts, 0);
+  EXPECT_GT(nonzeroDofContacts, 0);
+  EXPECT_TRUE(GetRegistry().get<CSkinnedContactSnle const>(skinEntity).useInSolver);
+  EXPECT_NE(
+      initialPose,
+      GetRegistry().get<CArticulatedReducedPose<TimeStep::Current> const>(skinEntity).value[0]);
+
+  auto const& collisions =
+      GetRegistry().get<CActiveCollisions<ContactType::Async, TimeStep::Current> const>(skinEntity);
+  auto const& partitions = GetRegistry().get<CContactPartitions const>(skinEntity);
+  real maxZeroDofForce = 0_r;
+  for (auto const& collision : collisions) {
+    auto const& result = collision.collisionResult;
+    if (result.Empty()) {
+      continue;
+    }
+    auto const& dofs =
+        std::get<DynamicArray<int>>(partitions[result.collidingPartitionId].GetDofDescriptors()[0]);
+    if (dofs.empty()) {
+      EXPECT_EQ(result.sampleIndices.size(), result.forcePerUnitArea.size());
+      for (Real3 const& force : result.forcePerUnitArea) {
+        maxZeroDofForce = Max(maxZeroDofForce, Norm(force));
+      }
+    }
+  }
+  EXPECT_GT(maxZeroDofForce, 0_r);
+}
+
+TEST_F(ZeroDofSkinContact, BlendedContactSkipsOnlyPartitionsWithoutSoftDofs) {
+  auto [skin, box] = CreateBlendedActors(kMixedBoxMaxX);
+  entt::entity const skinEntity = GetEntity(skin->GetHandle());
+  entt::entity const boxEntity = GetEntity(box->GetHandle());
+  skin->RegisterQuery(QueryType::TotalContactForce, test::ExpectOK{});
+  _scene->Step(kTimeStep);
+
+  BlendedContactStats const stats = GetBlendedContactStats(skinEntity, boxEntity);
+  EXPECT_GT(stats.contactsWithoutSoftDofs, 0);
+  EXPECT_GT(stats.contactsWithSoftDofs, 0);
+  EXPECT_GT(stats.maxForceWithoutSoftDofs, 0_r);
+  EXPECT_TRUE(UsesSkinnedContactInSolver(skinEntity));
+}
+
+TEST_F(ZeroDofSkinContact, BlendedContactWithoutSoftDofsReportsForceOutsideSolver) {
+  auto [skin, box] = CreateBlendedActors(kZeroDofBoxMaxX);
+  entt::entity const skinEntity = GetEntity(skin->GetHandle());
+  entt::entity const boxEntity = GetEntity(box->GetHandle());
+  skin->RegisterQuery(QueryType::TotalContactForce, test::ExpectOK{});
+  _scene->Step(kTimeStep);
+
+  BlendedContactStats const stats = GetBlendedContactStats(skinEntity, boxEntity);
+  EXPECT_GT(stats.contactsWithoutSoftDofs, 0);
+  EXPECT_EQ(0, stats.contactsWithSoftDofs);
+  EXPECT_GT(stats.maxForceWithoutSoftDofs, 0_r);
+  EXPECT_FALSE(UsesSkinnedContactInSolver(skinEntity));
+  EXPECT_GT(Norm(skin->GetContactForceWorld(test::ExpectOK{})), 0_r);
+}
+
+TEST_F(ZeroDofSkinContact, StaticBoxWithoutQuerySkipsAsyncContact) {
+  auto [skin, box] = CreateActors(/*isBoxStatic=*/true);
+  entt::entity const skinEntity = GetEntity(skin->GetHandle());
+  entt::entity const boxEntity = GetEntity(box->GetHandle());
+  _scene->Step(kTimeStep);
+
+  auto const [zeroDofContacts, nonzeroDofContacts] =
+      CountContactsByDofType<ContactType::Async>(skinEntity, boxEntity);
+  EXPECT_GT(zeroDofContacts, 0);
+  EXPECT_EQ(0, nonzeroDofContacts);
+  EXPECT_FALSE(UsesSkinnedContactInSolver(skinEntity));
+}
+
+TEST_F(ZeroDofSkinContact, MixedPartitionsWithoutQueryAssembleDofContacts) {
+  auto [skin, box] = CreateActors(/*isBoxStatic=*/true, kMixedBoxMaxX);
+  entt::entity const skinEntity = GetEntity(skin->GetHandle());
+  entt::entity const boxEntity = GetEntity(box->GetHandle());
+  real const initialPose = GetPrismaticPose(skinEntity);
+  _scene->Step(kTimeStep);
+
+  auto const [zeroDofContacts, nonzeroDofContacts] =
+      CountContactsByDofType<ContactType::Async>(skinEntity, boxEntity);
+  EXPECT_GT(zeroDofContacts, 0);
+  EXPECT_GT(nonzeroDofContacts, 0);
+  EXPECT_TRUE(UsesSkinnedContactInSolver(skinEntity));
+  EXPECT_NE(initialPose, GetPrismaticPose(skinEntity));
+}
+
+TEST_F(ZeroDofSkinContact, SolverUseStopsWhenOnlyZeroDofContactRemains) {
+  auto [skin, box] = CreateActors(/*isBoxStatic=*/true, kMixedBoxMaxX);
+  entt::entity const skinEntity = GetEntity(skin->GetHandle());
+  entt::entity const boxEntity = GetEntity(box->GetHandle());
+
+  _scene->Step(kTimeStep);
+  EXPECT_GT(CountContactsByDofType<ContactType::Async>(skinEntity, boxEntity).second, 0);
+  EXPECT_TRUE(UsesSkinnedContactInSolver(skinEntity));
+
+  ShiftBoxX(box, kZeroDofBoxMaxX - kMixedBoxMaxX);
+  _scene->Step(kTimeStep);
+  auto const [zeroDofContacts, nonzeroDofContacts] =
+      CountContactsByDofType<ContactType::Async>(skinEntity, boxEntity);
+  EXPECT_GT(zeroDofContacts, 0);
+  EXPECT_EQ(0, nonzeroDofContacts);
+  EXPECT_FALSE(UsesSkinnedContactInSolver(skinEntity));
+}
+
+TEST_F(ZeroDofSkinContact, SnleSetUpAfterZeroDofStepWithoutQuery) {
+  ExpectSnleSetUpAfterZeroDofStep(/*registerForceQuery=*/false);
+}
+
+TEST_F(ZeroDofSkinContact, SnleSetUpAfterZeroDofStepWithQuery) {
+  ExpectSnleSetUpAfterZeroDofStep(/*registerForceQuery=*/true);
+}
 
 // Verify consistency of contact torque queries on a rigid cube constrained at its center of mass,
 // contacted by another orbiting rigid cube. Checks:

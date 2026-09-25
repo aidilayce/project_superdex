@@ -23,6 +23,7 @@
 #include "meshing/processing_modifiers/preset_discovery.h"
 #include "meshing/processing_modifiers/processing_mesh_utils.h"
 #include "meshing/processing_modifiers/processing_serialization.h"
+#include "rendering/measure_tool.h"
 #include "ui/asset_browser.h"
 
 #include <imgui_internal.h> // ImGuiWindow / WorkRect, to bound the modifier header width
@@ -484,27 +485,7 @@ void ComposeStats(MeshStats& stats) {
 // the content up to a cap, after which it scrolls. @p font (when non-null) renders the block in a
 // monospace face so the space-padded stat columns line up.
 void DrawMeshStatsBlock(char const* id, std::string const& text, ImFont* font) {
-  if (font != nullptr) {
-    ImGui::PushFont(font);
-  }
-  int lineCount = 1;
-  for (char const c : text) {
-    if (c == '\n') {
-      ++lineCount;
-    }
-  }
-  float const height = ImGui::GetTextLineHeight() * static_cast<float>(std::min(lineCount, 10)) +
-      ImGui::GetStyle().FramePadding.y * 2.0f;
-  // ReadOnly: ImGui never writes back, so pointing at the immutable string's buffer is safe.
-  ImGui::InputTextMultiline(
-      id,
-      const_cast<char*>(text.c_str()),
-      text.size() + 1,
-      ImVec2(-FLT_MIN, height),
-      ImGuiInputTextFlags_ReadOnly);
-  if (font != nullptr) {
-    ImGui::PopFont();
-  }
+  ImGui::ReadOnlyTextBlock(id, text, font);
 }
 
 // Shared visualization controls for one held mesh: Surface / Wireframe / Stats toggles on one row,
@@ -567,6 +548,10 @@ ModelEditor::ModelEditor(SuperDexStudio* studio, CadModelAsset* asset)
 void ModelEditor::Initialize() {
   _viewport = Viewport::Create(_studio, _studio->GetViewSettings());
   _viewport->enableViewportPicking = false;
+  // Measure tool (Ctrl+M). It does its own CPU ray cast, so it works here despite object picking
+  // being off; every slot, reference model and processing stage is measurable.
+  _viewport->GetMeasureTool()->SetTargetProvider(
+      [this](std::vector<MeasureTarget>& out) { CollectMeasureTargets(out); });
   if (_cadModelAsset) {
     _cadModelPath = _cadModelAsset->GetPath().ToString();
   }
@@ -698,6 +683,9 @@ void ModelEditor::PollSlotFileChanges() {
       assetManager.UnloadAssetByPath(path);
     }
     assetManager.LoadAsset(path);
+    // The freshly loaded asset has no cached shapes, but Mochi's context file cache and the
+    // ShapeHandles pinned on loaded prefabs still refer to the pre-change file.
+    assetManager.InvalidateShapeCachesForPath(path);
   };
   if (cadChanged) {
     reload(_cadModelPath);
@@ -1392,6 +1380,7 @@ std::vector<AssetEditor::WindowDeclaration> ModelEditor::GetDefaultWindows() {
       // main windows
       {"Model Viewer", true, Dock::SidePanelTop},
       {"Model Processing", true, Dock::SidePanelBottom},
+      MeasureWindowDeclaration(),
       // debug windows
       {"Render Scene Hierarchy", false, Dock::SidePanelTop, true},
       {"Render Scene Details", false, Dock::SidePanelBottom, true}};
@@ -1401,6 +1390,38 @@ std::vector<AssetEditor::WindowDeclaration> ModelEditor::GetAuxiliaryWindows() c
   return GetDefaultWindows();
 }
 
+void ModelEditor::CollectMeasureTargets(std::vector<MeasureTarget>& out) const {
+  MeasureGeometryCache& cache = _viewport->GetMeasureTool()->GetGeometryCache();
+  auto add = [&](mochi_renderer::SceneObject* object,
+                 std::vector<MeshSection> const& sections,
+                 std::string label,
+                 MeasureTargetKind kind) {
+    if (object == nullptr || sections.empty()) {
+      return;
+    }
+    out.push_back({std::move(label), kind, object, [&cache, &sections] {
+                     return cache.GetForSections(&sections, sections);
+                   }});
+  };
+
+  add(_cadModelSurfaceMesh, _cadSections, "CAD Model", MeasureTargetKind::Render);
+  add(_renderModelSurfaceMesh, _renderSections, "Render Model", MeasureTargetKind::Render);
+  add(_mochiModelSurfaceMesh, _mochiSections, "Mochi Model", MeasureTargetKind::Collision);
+  for (ReferenceModel const& rm : _referenceModels) {
+    MeasureTargetKind const kind =
+        rm.type == AssetType::MochiModel ? MeasureTargetKind::Collision : MeasureTargetKind::Render;
+    add(rm.buffer.surfaceMesh, rm.buffer.sections, mochi::Path(rm.path).GetFilename(), kind);
+  }
+  for (auto const& modifier : _modifiers) {
+    // A stage's output is a working mesh with no collision/render identity of its own; treat it as
+    // render geometry so the panel's default filter shows it.
+    add(modifier->output.surfaceMesh,
+        modifier->output.sections,
+        modifier->HeaderLabel(),
+        MeasureTargetKind::Render);
+  }
+}
+
 void ModelEditor::ShowAuxiliaryWindows() {
   if (bool& open = _studio->GetWindowVisible("Model Viewer")) {
     ShowModelViewerWindow(&open);
@@ -1408,6 +1429,7 @@ void ModelEditor::ShowAuxiliaryWindows() {
   if (bool& open = _studio->GetWindowVisible("Model Processing")) {
     ShowModelProcessingWindow(&open);
   }
+  ShowMeasureWindow();
   // debug windows
   if (bool& open = _studio->GetWindowVisible("Render Scene Hierarchy")) {
     _viewport->ShowSceneHierarchyWindow("Render Scene Hierarchy", &open);

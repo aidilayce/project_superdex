@@ -96,7 +96,7 @@ CreateSkinningDofGroups(entt::registry const& reg, entt::entity entity, entt::en
     dofs.erase(std::unique(dofs.begin(), dofs.end()), dofs.end());
 
     // Convert to index groups
-    IndexGroups sampleDoFs = CreateIndexGroups(std::vector<int>(dofs.begin(), dofs.end()), false);
+    IndexGroups sampleDoFs = CreateIndexGroups(dofs, false);
     if (sampleDoFs.size() > kMaxIndexGroups) {
       // Use all DoFs if the number of index groups is too large
       sampleDoFs.clear();

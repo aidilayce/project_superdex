@@ -18,6 +18,10 @@
 #include <superdex_physics.h>
 #include <superdex_robotics/superdex_robotics.h>
 
+namespace mochi {
+struct ModelData;
+} // namespace mochi
+
 namespace superdex::robotics {
 
 /**
@@ -76,6 +80,19 @@ struct MOCHI_API IBotLoader {
       TransformRT const& bakeTransform,
       Context* context,
       superdex::Error& error) const = 0;
+
+  /**
+   * @brief Load raw model data (mesh + skinning) from a model resource.
+   *
+   * @param[in] path File path to the model asset (e.g. .mochi.h5).
+   * @param[in,out] error Error status. Check @ref Error::IsOK for success.
+   * @return Loaded @ref mochi::ModelData, or default-constructed on failure.
+   *
+   * @note Used when a bot must modify a skin's baked skinning data (e.g. remapping bone indices for
+   * a composed mod bot) before creating a shape. The default loads from the local filesystem;
+   * loaders backed by in-memory assets should override it.
+   */
+  virtual mochi::ModelData LoadModelData(std::string_view path, superdex::Error& error) const;
 };
 
 /**

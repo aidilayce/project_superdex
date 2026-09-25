@@ -27,6 +27,7 @@
 #include "mochi_constraint_interface.h"
 #include "mochi_contact.h"
 #include "mochi_contact_filter.h"
+#include "mochi_contact_pair_params.h"
 #include "mochi_context.h"
 #include "mochi_debug_draw.h"
 #include "mochi_differentiable.h"
@@ -43,6 +44,7 @@
 #include "mochi_simulation.h"
 #include "mochi_soft.h"
 #include "mochi_soft_init.h"
+#include "mochi_soft_rom_components.h"
 #include "mochi_soft_rom_init.h"
 #include "mochi_soft_skinned.h"
 #include "mochi_step.h"
@@ -63,7 +65,6 @@
 #include <mochi_physics/utils/mochi_prefab.h>
 
 #include <algorithm>
-#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -81,32 +82,111 @@ using namespace mochi::experimental;
 namespace mochi {
 
 namespace {
-// RAII guard that binds the calling thread to the task scheduler when it is not already bound, and
-// unbinds it again on scope exit. Public API entry points that run parallel work use this so the
-// work still parallelizes when they are called from a thread that has not been bound to the
-// scheduler; otherwise the parallel primitives silently fall back to single-threaded execution.
-class ScopedSchedulerBinding {
+// Rolls back independent cleanup roots during multi-actor construction. When ownership transfers
+// to an aggregate, replace its children with that owner. Roots are destroyed in reverse
+// registration order so later-registered dependents are removed before actors they reference.
+class ScopedActorCreationRollback {
  public:
-  explicit ScopedSchedulerBinding(ContextImpl& context)
-      : _context(TaskScheduler::TryGet() == nullptr ? &context : nullptr) {
-    if (_context != nullptr) {
-      _context->BindThisThread();
+  explicit ScopedActorCreationRollback(SceneImpl& scene) : _scene(scene) {}
+  ~ScopedActorCreationRollback() noexcept {
+    if (!_active) {
+      return;
+    }
+    for (int i = isize(_actors); i-- > 0;) {
+#if MOCHI_ASSERT_VERBOSE_ENABLED
+      auto const entity = GetEntityUnchecked(_actors[i]);
+      auto const& registry = _scene.GetRegistry();
+      MOCHI_ASSERT_VERBOSE(
+          !registry.valid(entity) || !registry.all_of<CGroupMemberInfo>(entity),
+          "Actor creation rollback cannot directly own a nested actor.");
+#endif // MOCHI_ASSERT_VERBOSE_ENABLED
+      _scene.DestroyActor(_actors[i]);
     }
   }
-  ~ScopedSchedulerBinding() {
-    if (_context != nullptr) {
-      _context->UnbindThisThread();
+
+  MOCHI_DECLARE_NO_COPY_NO_MOVE(ScopedActorCreationRollback);
+
+  void Add(ActorHandle actor) {
+    if (actor.IsValid()) {
+      _actors.push_back(actor);
     }
   }
-  ScopedSchedulerBinding(ScopedSchedulerBinding const&) = delete;
-  ScopedSchedulerBinding& operator=(ScopedSchedulerBinding const&) = delete;
-  ScopedSchedulerBinding(ScopedSchedulerBinding&&) = delete;
-  ScopedSchedulerBinding& operator=(ScopedSchedulerBinding&&) = delete;
+
+  void ReplaceWithOwner(ActorHandle actor) {
+    _actors.clear();
+    Add(actor);
+  }
+
+  void Release() {
+    _active = false;
+  }
 
  private:
-  ContextImpl* _context;
+  SceneImpl& _scene;
+  DynamicArray<ActorHandle> _actors;
+  bool _active = true;
 };
 } // namespace
+
+static void
+DestroyAllItemsInArticulatedActor(SceneImpl& scene, entt::registry& registry, entt::entity e) {
+  MOCHI_ASSERT(
+      registry.valid(e) && registry.all_of<TagArticulatedActor>(e),
+      "Not a valid articulated actor.");
+
+  auto& groupMembers = registry.get<CGroupMembers>(e);
+  std::vector<entt::entity> memberActorsCopy = groupMembers.actors;
+  std::vector<entt::entity> memberConstraintsCopy = groupMembers.constraints;
+
+  // Destroy constraints in the articulation.
+  for (auto const& constraint : memberConstraintsCopy) {
+    registry.get<CConstraintInfo>(constraint).isActorOwned = false;
+    scene.DestroyConstraint(GetConstraintHandle(constraint, scene.GetHandle()));
+  }
+
+  // Detach actors from the articulation.
+  groupMembers.actors.clear();
+  for (auto const& actor : memberActorsCopy) {
+    registry.erase<CGroupMemberInfo>(actor);
+  }
+
+  // Destroy actors in the articulation (legal now that they are detached).
+  for (auto const& actor : memberActorsCopy) {
+    scene.DestroyActor(GetActorHandle(actor, scene.GetHandle()));
+  }
+}
+
+static void DestroyActorEntity(SceneImpl& scene, entt::registry& registry, entt::entity e) {
+  // If this actor was affected by constraint, then destroy those constraints.
+  if (auto* constraintMemberInfo = registry.try_get<CConstraintMemberInfo>(e)) {
+    auto constraintsCopy = constraintMemberInfo->constraints;
+    for (entt::entity c : constraintsCopy) {
+      registry.get<CConstraintInfo>(c).isActorOwned = false;
+      scene.DestroyConstraint(GetConstraintHandle(c, scene.GetHandle()));
+    }
+  }
+
+  // If this actor belongs to a compound, then remove it from that compound.
+  auto* groupInfo = registry.try_get<CGroupMemberInfo>(e);
+  if (groupInfo) {
+    RemoveActorFromCompound(registry, groupInfo->group, e, ErrorAssert{});
+  }
+
+  // If this actor is an articulation, destroy its members.
+  if (registry.all_of<TagArticulatedActor>(e)) {
+    DestroyAllItemsInArticulatedActor(scene, registry, e);
+  }
+
+  // Clean actor-vs-actor contact tables.
+  registry.ctx<CContactFilterTable>().RemoveEntity(e);
+  registry.ctx<CContactPairParamsOverrideTable>().RemoveEntity(e);
+
+  // Remove actor from its island (if any)
+  island::RemoveActor(registry, e);
+
+  // Destroy the ECS entity and all components
+  registry.destroy(e);
+}
 
 template <typename EnumT>
 [[nodiscard]] static bool IsValidEnumValue(EnumT value, EnumT count) {
@@ -116,9 +196,9 @@ template <typename EnumT>
 
 static void CheckStateCaptureSupported(entt::registry const& reg, Error& error) {
   MOCHI_ERROR_IF(
-      !reg.storage<TagRomActor>().empty(),
+      !reg.storage<TagRomActor>().empty() || !reg.storage<CRomFomSwitchingParams>().empty(),
       error,
-      "State capture is not supported for scenes with ROM actors.");
+      "State capture is not supported for scenes with ROM actors or ROM/FOM switching.");
 }
 
 [[nodiscard]] static bool ActorCanOwnNestedActors(Actor const& actor) {
@@ -238,9 +318,6 @@ static void ComputeAggregateBackPropSolverSceneStats(
   outStats.residualNorm = Sqrt(sqrResNorm);
 }
 
-// Declared in MochiDebugDrawSystems.cpp
-void RegisterDebugDrawSystems(DebugDrawInternal& debugDraw);
-
 // This ECS component simply ensures that its entity cannot be accidentally
 // destroyed before final shutdown.
 namespace {
@@ -317,7 +394,7 @@ SceneImpl::SceneImpl(ContextImpl* context, std::string_view name, uint64_t uniqu
   _registry.set<CSimulationParams>();
 
   // Create the one DebugDrawImpl
-  _debugDraw = DebugDrawInternal::Create(_registry);
+  _debugDraw = DebugDrawInternal::Create(_registry, _context->GetTaskScheduler());
   RegisterDebugDrawSystems(*_debugDraw);
 }
 
@@ -336,6 +413,10 @@ SceneImpl::~SceneImpl() {
 
   // Destroy all remaining entities and components
   _registry.clear();
+}
+
+bool SceneImpl::TryClaimOwnership() {
+  return !_ownershipClaimed.exchange(true, std::memory_order_relaxed);
 }
 
 char const* SceneImpl::GetName() const {
@@ -436,9 +517,9 @@ void SceneImpl::SetSolverParams(SolverParams const& params, Error& error) {
   }
 
   MOCHI_ERROR_IF(
-      params.linearSolver.maxIter != kAutoLinearSolverMaxIter && params.linearSolver.maxIter < 0,
+      params.linearSolver.maxIter != kAutoLinearSolverMaxIter && params.linearSolver.maxIter <= 0,
       error,
-      "Maximum number of linear solver iterations (LinearSolverParams::maxIter) must not be negative.");
+      "Maximum number of iterations for iterative linear solvers (LinearSolverParams::maxIter) must be positive or Auto.");
   MOCHI_ERROR_IF_NOT(
       IsFinite(params.linearSolver.absTol) && params.linearSolver.absTol >= 0_r,
       error,
@@ -501,7 +582,7 @@ void SceneImpl::Step(double timeStepSec) {
   stepCounter++;
 
   // Enforce scheduler binding to this thread, for parallel work.
-  ScopedSchedulerBinding schedulerBinding(*_context);
+  ScopedSchedulerBinding schedulerBinding(this);
 
   Timer timer;
 
@@ -520,6 +601,13 @@ void SceneImpl::Step(double timeStepSec) {
   stepInfo.timeStepSec = timeStepSec;
 
   timer.Reset();
+
+  // Check if a SceneDebugger needs to be cleaned up on this thread
+  DynamicArray<std::shared_ptr<dbg::SceneDebugger>> debuggersToShutdown;
+  _debugger.Mutate([&](auto& info) { debuggersToShutdown = std::move(info.pendingShutdown); });
+  for (auto& ptr : debuggersToShutdown) {
+    ptr->ShutdownOnSceneThread(this);
+  }
 
   // Fire pre-step callbacks one at a time
   {
@@ -573,13 +661,6 @@ void SceneImpl::Step(double timeStepSec) {
   {
     MOCHI_PROFILE_SCOPE_N("PostStepCallbacks");
     _postStepCallbacks.Call(stepInfo);
-  }
-
-  // Check if a SceneDebugger needs to be cleaned up on this thread
-  DynamicArray<std::shared_ptr<dbg::SceneDebugger>> debuggersToShutdown;
-  _debugger.Mutate([&](auto& info) { debuggersToShutdown = std::move(info.pendingShutdown); });
-  for (auto& ptr : debuggersToShutdown) {
-    ptr->ShutdownOnSceneThread(this);
   }
 
   TimeSpan postStepDuration = timer.GetElapsed();
@@ -675,6 +756,8 @@ Span<uint8_t const> SceneImpl::FindState(StateHandle handle, Error& error) const
 }
 
 void SceneImpl::RestoreState(StateHandle handle, bool releaseImmediately, Error& error) {
+  ScopedSchedulerBinding schedulerBinding(this);
+
   RestorePartialState(handle, releaseImmediately, {}, error);
 }
 
@@ -688,6 +771,8 @@ void SceneImpl::CaptureStateToBytes(DynamicArray<uint8_t>& outData, Error& error
 
 void SceneImpl::RestoreStateFromBytes(Span<uint8_t const> data, Error& error) {
   MOCHI_PROFILE_SCOPE();
+  ScopedSchedulerBinding schedulerBinding(this);
+
   capture::RestoreState(_registry, data, error);
 }
 
@@ -736,10 +821,7 @@ bool SceneImpl::IsEqualState(StateHandle a, StateHandle b) const {
 void SceneImpl::CaptureStateToFile(std::string_view filePath, Error& error) {
   MOCHI_ERROR_RETURN(error);
   MOCHI_ERROR_IF(filePath.empty(), error, "Empty file path");
-  MOCHI_ERROR_IF(
-      !_registry.storage<TagRomActor>().empty(),
-      error,
-      "CaptureStateToFile is not supported for scenes with ROM actors.");
+  CheckStateCaptureSupported(_registry, error);
   MOCHI_ERROR_RETURN(error);
   std::string json = capture::CaptureStateToJson(_registry, /*prettyMultiLine*/ true, error);
   WriteFile(filePath, json, error);
@@ -944,6 +1026,64 @@ void SceneImpl::EnableActorContactSymmetric(
   EnableActorContactAsymmetric(actorB, actorA, enable, includeNestedActors, error);
 }
 
+void SceneImpl::SetContactPairParamsOverride(
+    ActorHandle actorA,
+    ActorHandle actorB,
+    ContactPairParamsOverride const& paramsOverride,
+    Error& error) {
+  MOCHI_ERROR_RETURN(error);
+  ValidateContactPairParamsOverride(paramsOverride, error);
+  MOCHI_ERROR_RETURN(error);
+
+  entt::entity const entityA = GetEntity(_registry, actorA, error);
+  entt::entity const entityB = GetEntity(_registry, actorB, error);
+  MOCHI_ERROR_RETURN(error);
+  MOCHI_ERROR_IF_NOT(
+      _registry.all_of<CContactParams>(entityA) && _registry.all_of<CContactParams>(entityB),
+      error,
+      "Both actors must have contact parameters.");
+  MOCHI_ERROR_RETURN(error);
+
+  _registry.ctx<CContactPairParamsOverrideTable>().Set(entityA, entityB, paramsOverride);
+}
+
+void SceneImpl::ClearContactPairParamsOverride(
+    ActorHandle actorA,
+    ActorHandle actorB,
+    Error& error) {
+  MOCHI_ERROR_RETURN(error);
+  entt::entity const entityA = GetEntity(_registry, actorA, error);
+  entt::entity const entityB = GetEntity(_registry, actorB, error);
+  MOCHI_ERROR_RETURN(error);
+
+  _registry.ctx<CContactPairParamsOverrideTable>().Clear(entityA, entityB);
+}
+
+bool SceneImpl::HasContactPairParamsOverride(ActorHandle actorA, ActorHandle actorB, Error& error)
+    const {
+  MOCHI_ERROR_RETURN(error, false);
+  entt::entity const entityA = GetEntity(_registry, actorA, error);
+  entt::entity const entityB = GetEntity(_registry, actorB, error);
+  MOCHI_ERROR_RETURN(error, false);
+  return _registry.ctx<CContactPairParamsOverrideTable const>().Find(entityA, entityB) != nullptr;
+}
+
+ContactPairParamsOverride SceneImpl::GetContactPairParamsOverride(
+    ActorHandle actorA,
+    ActorHandle actorB,
+    Error& error) const {
+  MOCHI_ERROR_RETURN(error, {});
+  entt::entity const entityA = GetEntity(_registry, actorA, error);
+  entt::entity const entityB = GetEntity(_registry, actorB, error);
+  MOCHI_ERROR_RETURN(error, {});
+
+  auto const* paramsOverride =
+      _registry.ctx<CContactPairParamsOverrideTable const>().Find(entityA, entityB);
+  MOCHI_ERROR_IF(paramsOverride == nullptr, error, "Contact pair has no parameter override.");
+  MOCHI_ERROR_RETURN(error, {});
+  return *paramsOverride;
+}
+
 void SceneImpl::RestoreStatePair(StateHandle curr, StateHandle prev, Error& err) {
   MOCHI_ERROR_RETURN(err);
 
@@ -1086,7 +1226,7 @@ void SceneImpl::PrepareBackPropagate(StateHandle stateNew, StateHandle stateOld,
   MOCHI_ERROR_RETURN(error);
 
   // Enforce scheduler binding to this thread, for parallel work.
-  ScopedSchedulerBinding schedulerBinding(*_context);
+  ScopedSchedulerBinding schedulerBinding(this);
 
   RestoreStatePair(stateNew, stateOld, error);
   MOCHI_ERROR_RETURN(error);
@@ -1134,7 +1274,7 @@ void SceneImpl::BackPropagate(Error& error) {
   MOCHI_ERROR_RETURN(error);
 
   // Enforce scheduler binding to this thread, for parallel work.
-  ScopedSchedulerBinding schedulerBinding(*_context);
+  ScopedSchedulerBinding schedulerBinding(this);
 
   // Validate necessary solver settings for accurate differentiability
   WarnIfNotImprovedConvergenceSettings();
@@ -1250,7 +1390,7 @@ void SceneImpl::GetStepJacobian(
   WarnIfNotImprovedConvergenceSettings();
 
   // Enforce scheduler binding to this thread, for parallel work.
-  ScopedSchedulerBinding schedulerBinding(*_context);
+  ScopedSchedulerBinding schedulerBinding(this);
 
   // Compute scene state offset
   int dofOffset = 0;
@@ -1288,9 +1428,10 @@ void SceneImpl::GetStepJacobian(
 #define MOCHI_DESTROY_AND_RETURN_IF_ERROR()         \
   if (!error.IsOK()) {                              \
     if (_registry.all_of<TagArticulatedActor>(e)) { \
-      DestroyAllItemsInArticulatedActor(e);         \
+      DestroyActorEntity(*this, _registry, e);      \
+    } else {                                        \
+      _registry.destroy(e);                         \
     }                                               \
-    _registry.destroy(e);                           \
   }                                                 \
   MOCHI_ERROR_RETURN(error, {});
 
@@ -1301,6 +1442,8 @@ Actor* SceneImpl::CreateRigidActorImpl(
     std::shared_ptr<Shape const> shapePtr,
     Error& error) {
   MOCHI_ERROR_RETURN(error, {});
+  ScopedSchedulerBinding schedulerBinding(this);
+
   MOCHI_ERROR_IF(
       (isArticulatedLink || params.isStatic) && params.linearVelocity,
       error,
@@ -1352,7 +1495,7 @@ Actor* SceneImpl::CreateRigidActor(RigidActorParams const& params, Error& error)
 Actor* SceneImpl::CreateSoftActorImpl(
     SoftActorParams const& params,
     ExperimentalSoftActorParams const& experimentalParams,
-    bool isSkinned,
+    bool isNestedSoft,
     std::shared_ptr<TetrahedralMeshShape const> shapePtr,
     Error& error) {
   MOCHI_ERROR_IF(
@@ -1363,23 +1506,30 @@ Actor* SceneImpl::CreateSoftActorImpl(
       !MOCHI_ENABLE_DEEP_FLOW_ACTORS && experimentalParams.flow.IsValid(),
       error,
       "Deep Flow actor creation is not supported in this build. To enable, define MOCHI_ENABLE_DEEP_FLOW_ACTORS=1");
+  MOCHI_ERROR_IF(
+      isNestedSoft && experimentalParams.rom &&
+          experimentalParams.rom->romProjectionStrategy ==
+              experimental::RomProjectionStrategy::ElementLevelProjection,
+      error,
+      "Nested soft ROM actors require actor-level projection.");
   MOCHI_ERROR_RETURN(error, {});
+  ScopedSchedulerBinding schedulerBinding(this);
 
   // Create an ECS entity
   entt::entity e = _registry.create();
   ActorHandle newHandle = GetActorHandle(e, GetHandle());
 
   // Initialize it as a soft actor
-  bool const useContact = !isSkinned;
+  bool const useContact = !isNestedSoft;
   std::shared_ptr<DeepFlowShape const> flow = std::dynamic_pointer_cast<DeepFlowShape const>(
       _context->GetShapeSharedPtr(experimentalParams.flow));
   InitSoftActor(
-      _registry, e, params, experimentalParams, useContact, isSkinned, shapePtr, flow, error);
+      _registry, e, params, experimentalParams, useContact, isNestedSoft, shapePtr, flow, error);
   MOCHI_DESTROY_AND_RETURN_IF_ERROR();
 
   // If necessary, initialize ROM actor
   if (experimentalParams.rom) {
-    bool const hasExternalRigidDofs = isSkinned;
+    bool const hasExternalRigidDofs = isNestedSoft;
     rom::InitSoftActorRom(
         _registry, e, *experimentalParams.rom, shapePtr, flow, hasExternalRigidDofs, error);
     MOCHI_DESTROY_AND_RETURN_IF_ERROR();
@@ -1400,6 +1550,7 @@ Actor* SceneImpl::CreateShellActorImpl(
     std::shared_ptr<TriangularMeshShape const> shapePtr,
     Error& error) {
   MOCHI_ERROR_RETURN(error, {})
+  ScopedSchedulerBinding schedulerBinding(this);
 
   // Create an ECS entity
   entt::entity e = _registry.create();
@@ -1423,6 +1574,7 @@ Actor* SceneImpl::CreateRodActorImpl(
     std::shared_ptr<PolylineShape const> shapePtr,
     Error& error) {
   MOCHI_ERROR_RETURN(error, {})
+  ScopedSchedulerBinding schedulerBinding(this);
 
   entt::entity e = _registry.create();
   SceneHandle sceneHandle = GetHandle();
@@ -1446,7 +1598,7 @@ Actor* SceneImpl::CreateSoftActor(SoftActorParams const& params, Error& error) {
 }
 
 // Experimental API
-MOCHI_API Actor* mochi::experimental::CreateSoftActor(
+Actor* mochi::experimental::CreateSoftActor(
     Scene* scene,
     SoftActorParams const& params,
     ExperimentalSoftActorParams const& experimentalParams,
@@ -1464,7 +1616,7 @@ MOCHI_API Actor* mochi::experimental::CreateSoftActor(
   MOCHI_ERROR_RETURN(error, {});
 
   return sceneImpl->CreateSoftActorImpl(
-      params, experimentalParams, /* isSkinned */ false, shapePtr, error);
+      params, experimentalParams, /* isNestedSoft */ false, shapePtr, error);
 }
 
 // Store skin params that are consumed during InitSkinMesh and cannot be recovered afterward.
@@ -1479,6 +1631,7 @@ static void StoreSkinDataForExport(
   auto& skinExport = reg.emplace<CArticulatedSkinExportParams>(e);
   skinExport.boundaryElementType = params->boundaryElementType;
   skinExport.boundarySubsampling = params->boundarySubsampling;
+  skinExport.nonCollidingLinks = params->nonCollidingLinks;
 }
 
 // If the user did not provide a parent actor name, then pretend it is "unnamed_articulation", so
@@ -1539,48 +1692,65 @@ static void AutoCorrectNestedSoftActorNames(SoftSkinnedActorParams& params) {
   }
 }
 
-static void ValidateSoftSkinnedNestedActorNamesAndAttachLinks(
+// Validate that every entry of @p entries names a link in @p linkNames, is non-empty, and carries
+// no reserved characters. @p linkNames is any container keyed by link local name (set or map).
+// Shared by every params field that references links by name.
+//
+// A macro rather than a function because MOCHI_ERROR_SET concatenates string literals, so the field
+// name must be part of the literal at the call site for the message to stay specific. Only the
+// first error sticks (SetFirstError), so the caller checks @p error once afterwards.
+#define MOCHI_VALIDATE_LINK_NAME_REFS(entries, linkNames, fieldLiteral, error)                \
+  for (auto const& mochiLinkNameEntry : (entries)) {                                          \
+    std::string_view const mochiLinkName = mochiLinkNameEntry;                                \
+    MOCHI_ERROR_IF(mochiLinkName.empty(), error, fieldLiteral " entries must be non-empty."); \
+    MOCHI_ERROR_IF(                                                                           \
+        HasInvalidNestedActorNameCharacter(mochiLinkName),                                    \
+        error,                                                                                \
+        fieldLiteral " entries must not contain '/', '\\', or embedded NUL characters.");     \
+    MOCHI_ERROR_IF(                                                                           \
+        (linkNames).count(mochiLinkName) == 0,                                                \
+        error,                                                                                \
+        fieldLiteral " entry does not match any skeleton link local name.");                  \
+  }
+
+// Reserve a unique nested-actor local name for every skeleton link and nested soft actor.
+static void ValidateSoftSkinnedNestedActorNames(
     SoftSkinnedActorParams const& params,
     Error& error) {
   MOCHI_ERROR_RETURN(error);
 
   std::unordered_set<std::string> usedLocalNames;
-  std::unordered_set<std::string> linkLocalNames;
   for (auto const& link : params.skeletonParams.links) {
-    std::string_view const linkName = link.name;
-    ReserveNestedActorLocalName(usedLocalNames, linkName, error);
+    ReserveNestedActorLocalName(usedLocalNames, std::string_view(link.name), error);
     MOCHI_ERROR_RETURN(error);
-    linkLocalNames.insert(std::string(linkName));
   }
 
   for (auto const& softParams : params.softParams) {
     ReserveNestedActorLocalName(usedLocalNames, softParams.name, error);
     MOCHI_ERROR_RETURN(error);
   }
+}
 
-  if (!params.softAttachLinks.empty()) {
-    MOCHI_ERROR_IF(
-        isize(params.softAttachLinks) != isize(params.softParams),
-        error,
-        "SoftSkinnedActorParams::softAttachLinks must be empty or 1-to-1 with softParams.");
-    MOCHI_ERROR_RETURN(error);
-    for (auto const& softAttachLink : params.softAttachLinks) {
-      std::string_view const linkName = softAttachLink;
-      MOCHI_ERROR_IF(
-          linkName.empty(),
-          error,
-          "SoftSkinnedActorParams::softAttachLinks entries must be non-empty.");
-      MOCHI_ERROR_IF(
-          HasInvalidNestedActorNameCharacter(linkName),
-          error,
-          "SoftSkinnedActorParams::softAttachLinks entries must not contain '/', '\\', or embedded NUL characters.");
-      MOCHI_ERROR_IF(
-          linkLocalNames.count(std::string(linkName)) == 0,
-          error,
-          "SoftSkinnedActorParams::softAttachLinks entry does not match any skeleton link local name.");
-      MOCHI_ERROR_RETURN(error);
-    }
+// Validate SoftSkinnedActorParams::softAttachLinks against the skeleton's link local names.
+static void ValidateSoftAttachLinks(SoftSkinnedActorParams const& params, Error& error) {
+  MOCHI_ERROR_RETURN(error);
+  if (params.softAttachLinks.empty()) {
+    return;
   }
+  MOCHI_ERROR_IF(
+      isize(params.softAttachLinks) != isize(params.softParams),
+      error,
+      "SoftSkinnedActorParams::softAttachLinks must be empty or 1-to-1 with softParams.");
+  MOCHI_ERROR_RETURN(error);
+
+  std::unordered_set<std::string_view> linkLocalNames;
+  linkLocalNames.reserve(params.skeletonParams.links.size());
+  for (auto const& link : params.skeletonParams.links) {
+    linkLocalNames.insert(std::string_view(link.name));
+  }
+  MOCHI_VALIDATE_LINK_NAME_REFS(
+      params.softAttachLinks, linkLocalNames, "SoftSkinnedActorParams::softAttachLinks", error);
+  MOCHI_ERROR_RETURN(error);
 }
 
 static void ValidateSoftSkinnedActorEnergyParams(
@@ -1589,13 +1759,12 @@ static void ValidateSoftSkinnedActorEnergyParams(
   MOCHI_ERROR_RETURN(error);
 
   for (auto const& softParams : params.softParams) {
-    MOCHI_ERROR_IF(
-        softParams.hasGravity, error, "Must disable gravity for underlying soft skinned actors.");
+    MOCHI_ERROR_IF(softParams.hasGravity, error, "Must disable gravity for nested soft actors.");
     MOCHI_ERROR_IF_NOT(
         params.hasGravity || params.hasInertia || params.hasStress || softParams.hasInertia ||
             softParams.hasStress,
         error,
-        "Each underlying soft skinned actor must have at least one energy term enabled: gravity, "
+        "Each nested soft actor must have at least one energy term enabled: gravity, "
         "inertia or stress on the SoftSkinnedActorParams (posed), or inertia or stress on its "
         "SoftActorParams (unposed).");
   }
@@ -1612,7 +1781,9 @@ static void ValidateAndAutoCorrect(SoftSkinnedActorParams& params, Error& error)
 
   Validate(params.skeletonParams, error);
   MOCHI_ERROR_RETURN(error);
-  ValidateSoftSkinnedNestedActorNamesAndAttachLinks(params, error);
+  ValidateSoftSkinnedNestedActorNames(params, error);
+  MOCHI_ERROR_RETURN(error);
+  ValidateSoftAttachLinks(params, error);
   MOCHI_ERROR_RETURN(error);
   ValidateSoftSkinnedActorEnergyParams(params, error);
   MOCHI_ERROR_RETURN(error);
@@ -1634,7 +1805,7 @@ static void ValidateAndAutoCorrect(SoftSkinnedActorParams& params, Error& error)
 }
 
 // Experimental API
-MOCHI_API Actor* mochi::experimental::CreateSoftSkinnedActor(
+Actor* mochi::experimental::CreateSoftSkinnedActor(
     Scene* scene,
     SoftSkinnedActorParams const& params,
     experimental::ExperimentalSoftSkinnedActorParams const& experimentalParams,
@@ -1661,8 +1832,7 @@ MOCHI_API Actor* mochi::experimental::CreateSoftSkinnedActor(
 }
 
 // Experimental API
-MOCHI_API Actor*
-experimental::CreateShellActor(Scene* scene, ShellActorParams const& params, Error& error) {
+Actor* experimental::CreateShellActor(Scene* scene, ShellActorParams const& params, Error& error) {
   MOCHI_PROFILE_SCOPE();
   MOCHI_ERROR_IF(!scene, error, "Invalid scene");
   MOCHI_ERROR_RETURN(error, {});
@@ -1682,8 +1852,7 @@ Actor* SceneImpl::CreateSoftSkinnedActor(SoftSkinnedActorParams const& params, E
   return experimental::CreateSoftSkinnedActor(this, params, {}, error);
 }
 
-MOCHI_API Actor*
-experimental::CreateRodActor(Scene* scene, RodActorParams const& params, Error& error) {
+Actor* experimental::CreateRodActor(Scene* scene, RodActorParams const& params, Error& error) {
   MOCHI_PROFILE_SCOPE();
   MOCHI_ERROR_IF(!scene, error, "Invalid scene");
   MOCHI_ERROR_RETURN(error, {});
@@ -1836,7 +2005,7 @@ static void DisableContactForAdjacentActors(
 void SceneImpl::CreateArticulatedLinkActorsImpl(
     std::string_view parentActorName,
     Span<ArticulatedLinkParams const> params,
-    bool useContact,
+    Span<bool const> useContact,
     std::shared_ptr<ArticulatedBodyShape const> shapePtr,
     TransformRT const& rootTransform,
     Span<ActorHandle> outLinks,
@@ -1852,6 +2021,7 @@ void SceneImpl::CreateArticulatedLinkActorsImpl(
       "Bone data arrays should be equal length for any ArticulatedBodyShape that was created successfully.");
   int const numLinks = isize(transforms);
   MOCHI_ASSERT(numLinks > 0, "Every ArticulatedBodyShape should have at least one link");
+  MOCHI_ASSERT_VERBOSE(isize(useContact) == numLinks, "useContact must have one entry per link.");
 
   MOCHI_ERROR_IF(
       isize(params) != numLinks,
@@ -1897,7 +2067,7 @@ void SceneImpl::CreateArticulatedLinkActorsImpl(
         childNameView.empty() ? Format("link_%d", i) : std::string(childNameView);
     linkParams.name = Format("%s/%s", parentName.c_str(), childName.c_str());
 
-    bool useContactLink = useContact && !isStatic[i];
+    bool useContactLink = useContact[i] && !isStatic[i];
 
     auto linkShapePtr = _context->GetShapeSharedPtr(link.shape);
     MOCHI_ERROR_IF(
@@ -1909,8 +2079,10 @@ void SceneImpl::CreateArticulatedLinkActorsImpl(
     // Create actor and assign to output vector
     Actor* actor = CreateRigidActorImpl(
         linkParams, true /*isArticulatedLink*/, useContactLink, linkShapePtr, error);
+    if (actor) {
+      outLinks[i] = actor->GetHandle();
+    }
     MOCHI_ERROR_RETURN(error);
-    outLinks[i] = actor->GetHandle();
   }
 }
 
@@ -1961,8 +2133,11 @@ void SceneImpl::CreateArticulatedActorJointLimitsImpl(
         dofRangeParams.damping = params.joints[i].limitDamping;
 
         // Create constraint
-        constraints.emplace_back(
-            CreateArticulated3dRotationRangeConstraint(dofRangeParams, ErrorAssert{}));
+        auto* constraint =
+            CreateArticulated3dRotationRangeConstraint(dofRangeParams, ErrorAssert{});
+        _registry.get<CConstraintInfo>(GetEntityUnchecked(constraint->GetHandle())).isActorOwned =
+            true;
+        constraints.emplace_back(constraint);
       } break;
 
       case ArticulatedJointType::Prismatic: // Fallthrough
@@ -2001,8 +2176,10 @@ void SceneImpl::CreateArticulatedActorJointLimitsImpl(
         dofRangeParams.damping = params.joints[i].limitDamping;
 
         // Create constraint
-        constraints.emplace_back(
-            CreateArticulatedSingleDofRangeConstraint(dofRangeParams, ErrorAssert{}));
+        auto* constraint = CreateArticulatedSingleDofRangeConstraint(dofRangeParams, ErrorAssert{});
+        _registry.get<CConstraintInfo>(GetEntityUnchecked(constraint->GetHandle())).isActorOwned =
+            true;
+        constraints.emplace_back(constraint);
       } break;
 
       case ArticulatedJointType::Cycle: // Fallthrough
@@ -2053,6 +2230,8 @@ void SceneImpl::CreateArticulatedActorCycleJointsImpl(
       jointParams.stiffness = params.cycles[i - numLinks].stiffness;
       auto* newConstraint = CreateRigidSphericalJointConstraint(jointParams, error);
       MOCHI_ERROR_RETURN(error);
+      _registry.get<CConstraintInfo>(GetEntityUnchecked(newConstraint->GetHandle())).isActorOwned =
+          true;
       constraints.push_back(newConstraint->GetHandle());
     }
   }
@@ -2091,6 +2270,7 @@ Actor* SceneImpl::CreateArticulatedActorImpl(
     std::shared_ptr<Shape const> skinShape,
     Error& error) {
   MOCHI_ERROR_RETURN(error, nullptr);
+  ScopedSchedulerBinding schedulerBinding(this);
 
   // Create an ECS entity
   entt::entity e = _registry.create();
@@ -2132,6 +2312,47 @@ Actor* SceneImpl::CreateArticulatedActorImpl(
   return GetActor(GetActorHandle(e, GetHandle()));
 }
 
+// Resolve ArticulatedSkinParams::nonCollidingLinks into a per-link contact mask (index-aligned
+// with @p boneNames), validating the names against the articulation's link local names as it goes.
+// result[i] == true means link i acts as a colliding actor.
+//
+// A listed link never collides. The two defaults cover the cases the list does not name:
+// @p collidingWhenUnset applies to every link when the list is absent, and @p collidingWhenUnlisted
+// applies to links the list does not mention. They differ for an articulated actor, where an absent
+// list means the skin covers every link (all non-colliding) while a present list names the only
+// links it covers (everything else collides). A soft-skinned actor passes its enableCollidingLinks
+// flag for both, so the list simply subtracts from the links that flag enables.
+static DynamicArray<bool> ResolveLinkContactMask(
+    std::optional<ArticulatedSkinParams> const& skin,
+    Span<DynamicString const> boneNames,
+    bool collidingWhenUnset,
+    bool collidingWhenUnlisted,
+    Error& error) {
+  int const numLinks = isize(boneNames);
+  MOCHI_ERROR_RETURN(error, {});
+  if (!skin.has_value() || !skin->nonCollidingLinks.has_value()) {
+    return DynamicArray<bool>(numLinks, collidingWhenUnset);
+  }
+
+  std::unordered_map<std::string_view, int> linkIndexByName;
+  linkIndexByName.reserve(boneNames.size());
+  for (int i = 0; i < numLinks; ++i) {
+    linkIndexByName.emplace(std::string_view(boneNames[i]), i);
+  }
+  MOCHI_VALIDATE_LINK_NAME_REFS(
+      *skin->nonCollidingLinks, linkIndexByName, "ArticulatedSkinParams::nonCollidingLinks", error);
+  MOCHI_ERROR_RETURN(error, {});
+
+  // Validation above proved every entry names a link, so these lookups always hit.
+  DynamicArray<bool> useContact(numLinks, collidingWhenUnlisted);
+  for (auto const& entry : *skin->nonCollidingLinks) {
+    useContact[linkIndexByName.at(std::string_view(entry))] = false;
+  }
+  return useContact;
+}
+
+#undef MOCHI_VALIDATE_LINK_NAME_REFS
+
 Actor* SceneImpl::CreateArticulatedActorImpl(
     ArticulatedActorParams const& params,
     std::shared_ptr<ArticulatedBodyShape const> shapePtr,
@@ -2140,6 +2361,15 @@ Actor* SceneImpl::CreateArticulatedActorImpl(
 
   ShapeHandle const skinHandle = params.skin.has_value() ? params.skin->shape : ShapeHandle{};
   auto skinShape = ResolveSkinShape(_context, skinHandle, error);
+  MOCHI_ERROR_RETURN(error, nullptr);
+
+  // ResolveSkinShape returns null without an error only for an invalid handle. Skin params without
+  // a shape describe a skin that cannot exist, and would silently discard every other skin setting,
+  // so reject them rather than ignoring them.
+  MOCHI_ERROR_IF(
+      params.skin.has_value() && skinShape == nullptr,
+      error,
+      "ArticulatedSkinParams::shape must be a valid shape handle when a skin is provided.");
   MOCHI_ERROR_RETURN(error, nullptr);
 
   // A zero-DOF articulated actor (every joint Hard/weld, so reducedDofsDim == 0) is a static welded
@@ -2153,19 +2383,34 @@ Actor* SceneImpl::CreateArticulatedActorImpl(
     MOCHI_ERROR_RETURN(error, nullptr);
   }
 
+  // Resolve which links act as colliding actors before creating any actors, so an invalid link name
+  // leaves the scene unchanged. Without a skin every link collides; with one, only those the skin
+  // does not cover (see ArticulatedSkinParams::nonCollidingLinks).
+  auto const boneNames = MakeConstSpan(shapePtr->GetBoneData()->boneNames);
+  DynamicArray<bool> const useContact = ResolveLinkContactMask(
+      params.skin,
+      boneNames,
+      /*collidingWhenUnset=*/!params.skin.has_value(),
+      /*collidingWhenUnlisted=*/true,
+      error);
+  MOCHI_ERROR_RETURN(error, nullptr);
+
   // Create link actors from the articulated link params.
   DynamicArray<ActorHandle> links(shapePtr->GetNumBones());
   DynamicArray<ShapeHandle> linkShapes(shapePtr->GetNumBones());
-  bool const useContactLinks = skinShape == nullptr;
+  ScopedActorCreationRollback actorRollback(*this);
   CreateArticulatedLinkActorsImpl(
       params.name,
       params.links,
-      useContactLinks,
+      MakeConstSpan(useContact),
       shapePtr,
       params.worldFromRoot,
       links,
       linkShapes,
       error);
+  for (auto link : links) {
+    actorRollback.Add(link);
+  }
   MOCHI_ERROR_RETURN(error, {});
 
   // Disable contact for actors that are adjacent in the hierarchy. Adjacency also considers hard
@@ -2177,8 +2422,14 @@ Actor* SceneImpl::CreateArticulatedActorImpl(
   MOCHI_ERROR_RETURN(error, {});
 
   // Finally create the articulated body actor
-  return CreateArticulatedActorImpl(
-      params, /* useContact */ true, shapePtr, links, skinShape, error);
+  Actor* actor =
+      CreateArticulatedActorImpl(params, /* useContact */ true, shapePtr, links, skinShape, error);
+  if (actor) {
+    actorRollback.ReplaceWithOwner(actor->GetHandle());
+  }
+  MOCHI_ERROR_RETURN(error, {});
+  actorRollback.Release();
+  return actor;
 }
 
 Actor* SceneImpl::CreateArticulatedActor(ArticulatedActorParams const& params, Error& error) {
@@ -2200,8 +2451,7 @@ Actor* SceneImpl::CreateArticulatedActor(ArticulatedActorParams const& params, E
 }
 
 static DynamicArray<int> FindSoftLinkParents(
-    SceneImpl* scene,
-    Span<ActorHandle const> links,
+    Span<ArticulatedLinkParams const> links,
     Span<DynamicString const> softAttachLinks,
     Error& error) {
   DynamicArray<int> outParents;
@@ -2211,14 +2461,7 @@ static DynamicArray<int> FindSoftLinkParents(
   std::unordered_map<std::string, int> linkNameToIndex;
   linkNameToIndex.reserve(links.size());
   for (int i = 0; i < isize(links); ++i) {
-    auto const* actor = scene->GetActor(links[i]);
-    MOCHI_ASSERT(actor, "Invalid actor");
-    char const* linkName = actor->GetName();
-    // The link name is formatted like "parentName/linkName".
-    // We are interested in the link name, starting after the last forward slash.
-    char const* slash = std::strrchr(linkName, '/');
-    linkName = slash ? slash + 1 : linkName;
-    linkNameToIndex[linkName] = i;
+    linkNameToIndex[std::string(links[i].name)] = i;
   }
 
   outParents.reserve(softAttachLinks.size());
@@ -2253,11 +2496,88 @@ static std::shared_ptr<TetrahedralMeshShape const> CreateDuplicateShapeWithSkinn
       srcShape->GetMeshBlending(),
       srcShape->GetVisualMesh(),
       srcShape->GetVisualEmbedding(),
+      srcShape->GetContactSkin(),
+      srcShape->GetContactSkinEmbedding(),
       srcShape->GetGridSdf(),
       srcShape->GetRomData(), // Deep copy
       srcShape->GetSampleMeshes(), // Deep copy
       srcShape->GetBoundingSphereHierarchies(), // Deep copy
       srcShape->GetSoftMaterialParamsField());
+}
+
+static void ValidateBlendedVertexConsistency(
+    Shape const& blendedShape,
+    Span<SoftActorParams const> softParams,
+    Span<std::shared_ptr<TetrahedralMeshShape const> const> softShapes,
+    Error& error) {
+  MOCHI_ERROR_RETURN(error);
+
+  auto const& blending = blendedShape.GetMeshBlending();
+  MOCHI_ERROR_IF_NOT(blending, error, "Blended skin shape carries no blending data.");
+  MOCHI_ERROR_RETURN(error);
+
+  auto const& targetMesh = blendedShape.GetSurfaceMesh();
+  auto const& targetSkinning = blendedShape.GetMeshSkinning();
+  MOCHI_ERROR_IF_NOT(targetMesh, error, "Blended skin shape carries no mesh data.");
+  MOCHI_ERROR_IF_NOT(targetSkinning, error, "Blended skin shape carries no skinning data.");
+  MOCHI_ERROR_RETURN(error);
+
+  auto const targetCoordinates = targetMesh->GetNodeCoordinates();
+  for (int softIndex = 0; softIndex < isize(softShapes); ++softIndex) {
+    auto const& softName = softParams[softIndex].name;
+    auto const blendingIt = blending->perSourceShapeData.find(softName);
+    MOCHI_ERROR_IF(
+        blendingIt == blending->perSourceShapeData.end(),
+        error,
+        "Blended skin shape carries no blending data for a nested soft actor.");
+    MOCHI_ERROR_RETURN(error);
+
+    auto const& sourceShape = *softShapes[softIndex];
+    auto const sourceCoordinates = sourceShape.GetMesh()->GetNodeCoordinates();
+    auto const& sourceSkinning = sourceShape.GetMeshSkinning();
+    auto const& sourceBlending = blendingIt->second;
+    int const numTargetVertices = isize(targetCoordinates);
+
+    for (int targetVertex = 0; targetVertex < numTargetVertices; ++targetVertex) {
+      if (sourceBlending.weights[targetVertex] == 0_r) {
+        continue;
+      }
+
+      int const sourceVertex = sourceBlending.indices[targetVertex];
+      MOCHI_ERROR_IF(
+          sourceVertex < 0 || sourceVertex >= isize(sourceCoordinates),
+          error,
+          "Nested soft actor has an out-of-range blended source vertex");
+      MOCHI_ERROR_RETURN(error);
+      MOCHI_ERROR_IF(
+          targetCoordinates[targetVertex] != sourceCoordinates[sourceVertex],
+          error,
+          "Nested soft actor has blended vertices with different rest positions");
+      MOCHI_ERROR_IF(
+          !sourceSkinning, error, "Nested soft actor with blended vertices has no skinning data");
+      MOCHI_ERROR_RETURN(error);
+      MOCHI_ERROR_IF(
+          targetSkinning->weightsPerNode != sourceSkinning->weightsPerNode,
+          error,
+          "Nested soft actor has blended vertices with different skinning influence counts");
+      MOCHI_ERROR_RETURN(error);
+
+      int const weightsPerNode = targetSkinning->weightsPerNode;
+      for (int influence = 0; influence < weightsPerNode; ++influence) {
+        int const targetInfluence = targetVertex * weightsPerNode + influence;
+        int const sourceInfluence = sourceVertex * weightsPerNode + influence;
+        MOCHI_ERROR_IF(
+            targetSkinning->indices[targetInfluence] != sourceSkinning->indices[sourceInfluence],
+            error,
+            "Nested soft actor has blended vertices with different ordered skinning indices");
+        MOCHI_ERROR_IF(
+            targetSkinning->weights[targetInfluence] != sourceSkinning->weights[sourceInfluence],
+            error,
+            "Nested soft actor has blended vertices with different ordered skinning weights");
+        MOCHI_ERROR_RETURN(error);
+      }
+    }
+  }
 }
 
 Actor* SceneImpl::CreateSoftSkinnedActorImpl(
@@ -2266,6 +2586,7 @@ Actor* SceneImpl::CreateSoftSkinnedActorImpl(
     std::shared_ptr<ArticulatedBodyShape const> articulatedShapePtr,
     Error& error) {
   MOCHI_ERROR_RETURN(error, {});
+  ScopedSchedulerBinding schedulerBinding(this);
 
   // Validate experimental params size
   int const numSoftActors = isize(params.softParams);
@@ -2302,9 +2623,17 @@ Actor* SceneImpl::CreateSoftSkinnedActorImpl(
       error,
       "Do not pass skin subsampling settings to non-blended soft skinned actor");
   MOCHI_ERROR_RETURN(error, {});
+  // Without a blended surface no skin collides in a listed link's place, so honoring the list would
+  // silently leave those links with no collision at all.
+  MOCHI_ERROR_IF(
+      skeletonParams.skin.has_value() && skeletonParams.skin->nonCollidingLinks.has_value() &&
+          !blendedShapePtr,
+      error,
+      "Do not pass skin nonCollidingLinks to non-blended soft skinned actor");
+  MOCHI_ERROR_RETURN(error, {});
 
   // Get the soft-actor shapes
-  std::vector<std::shared_ptr<TetrahedralMeshShape const>> softShapes;
+  DynamicArray<std::shared_ptr<TetrahedralMeshShape const>> softShapes;
   softShapes.reserve(numSoftActors);
   for (auto const& softParams : params.softParams) {
     auto softShapePtr = std::dynamic_pointer_cast<TetrahedralMeshShape const>(
@@ -2314,32 +2643,8 @@ Actor* SceneImpl::CreateSoftSkinnedActorImpl(
     softShapes.emplace_back(softShapePtr);
   }
 
-  // Create bone actors. Their names will be formatted like "skeletonName/linkName".
-  DynamicArray<ActorHandle> links(articulatedShapePtr->GetNumBones());
-  DynamicArray<ShapeHandle> linkShapes(articulatedShapePtr->GetNumBones());
-  CreateArticulatedLinkActorsImpl(
-      skeletonParams.name,
-      skeletonParams.links,
-      /* useContact */ params.enableCollidingLinks,
-      articulatedShapePtr,
-      skeletonParams.worldFromRoot,
-      links,
-      linkShapes,
-      error);
-  MOCHI_ERROR_RETURN(error, {});
-
-  // Create the articulated body. If there's blending, skin the blended surface.
-  Actor* skeletonActor = CreateArticulatedActorImpl(
-      skeletonParams,
-      /* useContact */ false,
-      articulatedShapePtr,
-      links,
-      blendedShapePtr,
-      error);
-  MOCHI_ERROR_RETURN(error, {});
-
   // If soft actors are externally attached, identify parent links
-  auto softLinkParents = FindSoftLinkParents(this, links, params.softAttachLinks, error);
+  auto softLinkParents = FindSoftLinkParents(skeletonParams.links, params.softAttachLinks, error);
   MOCHI_ERROR_RETURN(error, {});
 
   // If externally given, add attachment info to soft shapes.
@@ -2348,8 +2653,8 @@ Actor* SceneImpl::CreateSoftSkinnedActorImpl(
     MOCHI_ERROR_RETURN(error, {});
     for (int i = 0; i < numSoftActors; ++i) {
       // Create SkinningData which will attach the soft shape to the parent link.
-      auto const numNodes = softShapes[i]->GetMesh()->GetNumNodes();
       SkinningData skinning;
+      int const numNodes = softShapes[i]->GetMesh()->GetNumNodes();
       skinning.weightsPerNode = 1;
       skinning.weights.resize(numNodes, 1_r);
       skinning.indices.resize(numNodes, softLinkParents[i]);
@@ -2361,9 +2666,56 @@ Actor* SceneImpl::CreateSoftSkinnedActorImpl(
     }
   }
 
+  if (blendedShapePtr) {
+    ValidateBlendedVertexConsistency(
+        *blendedShapePtr, MakeConstSpan(params.softParams), softShapes, error);
+    MOCHI_ERROR_RETURN(error, {});
+  }
+
+  // Create bone actors. Their names will be formatted like "skeletonName/linkName".
+  DynamicArray<ActorHandle> links(articulatedShapePtr->GetNumBones());
+  DynamicArray<ShapeHandle> linkShapes(articulatedShapePtr->GetNumBones());
+  ScopedActorCreationRollback actorRollback(*this);
+  // Skeleton links collide only when enabled, and never when the skin covers them (see
+  // ArticulatedSkinParams::nonCollidingLinks). Resolved before any actor is created so an invalid
+  // link name leaves the scene unchanged.
+  DynamicArray<bool> const useContact = ResolveLinkContactMask(
+      skeletonParams.skin,
+      MakeConstSpan(articulatedShapePtr->GetBoneData()->boneNames),
+      /*collidingWhenUnset=*/params.enableCollidingLinks,
+      /*collidingWhenUnlisted=*/params.enableCollidingLinks,
+      error);
+  MOCHI_ERROR_RETURN(error, {});
+  CreateArticulatedLinkActorsImpl(
+      skeletonParams.name,
+      skeletonParams.links,
+      MakeConstSpan(useContact),
+      articulatedShapePtr,
+      skeletonParams.worldFromRoot,
+      links,
+      linkShapes,
+      error);
+  for (auto link : links) {
+    actorRollback.Add(link);
+  }
+  MOCHI_ERROR_RETURN(error, {});
+
+  // Create the articulated body. If there's blending, skin the blended surface.
+  Actor* skeletonActor = CreateArticulatedActorImpl(
+      skeletonParams,
+      /* useContact */ false,
+      articulatedShapePtr,
+      links,
+      blendedShapePtr,
+      error);
+  if (skeletonActor) {
+    actorRollback.ReplaceWithOwner(skeletonActor->GetHandle());
+  }
+  MOCHI_ERROR_RETURN(error, {});
+
   // Create the soft actors
   std::string const softParentName = GetNestedActorParentName(skeletonActor->GetName());
-  std::vector<ActorHandle> softActors(numSoftActors);
+  DynamicArray<ActorHandle> softActors(numSoftActors);
   for (int i = 0; i < numSoftActors; ++i) {
     auto softParams = params.softParams[i]; // Copy
 
@@ -2378,9 +2730,12 @@ Actor* SceneImpl::CreateSoftSkinnedActorImpl(
     experimentalSoftParams.useRecentering = false;
 
     Actor* softActor = CreateSoftActorImpl(
-        softParams, experimentalSoftParams, /* isSkinned */ true, softShapes[i], error);
+        softParams, experimentalSoftParams, /* isNestedSoft */ true, softShapes[i], error);
+    if (softActor) {
+      softActors[i] = softActor->GetHandle();
+      actorRollback.Add(softActors[i]);
+    }
     MOCHI_ERROR_RETURN(error, {});
-    softActors[i] = softActor->GetHandle();
 
     // If not ROM, set Dirichlet boundary conditions on constrained nodes (as specified by the
     // soft shape) to couple soft actor to articulated actor.
@@ -2399,12 +2754,12 @@ Actor* SceneImpl::CreateSoftSkinnedActorImpl(
   DisableContactForAdjacentActors(this, nodes, edges, error);
   MOCHI_ERROR_RETURN(error, {});
 
-  // Initialize the soft-skinned actor components. The entities are the same as the soft actors.
-  bool const useContactSoftSkinned = !blendedShapePtr;
+  // Initialize the nested soft actor components. The entities are the same as the soft actors.
+  bool const useNestedSoftContact = !blendedShapePtr;
   for (int i = 0; i < numSoftActors; ++i) {
     auto entity = GetEntity(_registry, softActors[i], error);
     skinned::InitSkinnedActor(
-        _registry, entity, params, useContactSoftSkinned, skeletonActor->GetHandle(), error);
+        _registry, entity, params, useNestedSoftContact, skeletonActor->GetHandle(), error);
     MOCHI_ERROR_RETURN(error, {});
   }
 
@@ -2413,38 +2768,22 @@ Actor* SceneImpl::CreateSoftSkinnedActorImpl(
   blended::InitBlendedActor(_registry, entity, skeletonParams, softActors, blendedShapePtr, error);
   MOCHI_ERROR_RETURN(error, {});
 
+  // The skeleton can now destroy its nested soft actors, so it is the only rollback root needed.
+  actorRollback.ReplaceWithOwner(skeletonActor->GetHandle());
+
   // Store the soft attachment links in the ECS for export purposes
   if (!softLinkParents.empty()) {
     _registry.emplace<CSoftAttachmentLinks>(entity, std::move(softLinkParents));
   }
 
   // Return the skeleton actor
+  actorRollback.Release();
   return skeletonActor;
 }
 
-void SceneImpl::DestroyAllItemsInArticulatedActor(entt::entity e) {
-  MOCHI_ASSERT(
-      _registry.valid(e) && _registry.all_of<TagArticulatedActor>(e),
-      "Not a valid articulated actor.");
-
-  auto& groupMembers = _registry.get<CGroupMembers>(e);
-  std::vector<entt::entity> memberActorsCopy = groupMembers.actors;
-  std::vector<entt::entity> memberConstraintsCopy = groupMembers.constraints;
-
-  // Destroy constraints in the articulation.
-  for (auto const& constraint : memberConstraintsCopy) {
-    DestroyConstraint(GetConstraintHandle(constraint, GetHandle()));
-  }
-
-  // Detach actors from the articulation.
-  groupMembers.actors.clear();
-  for (auto const& actor : memberActorsCopy) {
-    _registry.erase<CGroupMemberInfo>(actor);
-  }
-
-  // Destroy actors in the articulation (legal now that they are detached).
-  for (auto const& actor : memberActorsCopy) {
-    DestroyActor(GetActorHandle(actor, GetHandle()));
+void SceneImpl::DestroyActor(Actor* actor) {
+  if (actor) {
+    DestroyActor(actor->GetHandle());
   }
 }
 
@@ -2493,35 +2832,7 @@ void SceneImpl::DestroyActor(ActorHandle actorHandle) {
 
   MOCHI_ASSERT(_numActors >= 1);
   --_numActors;
-
-  // If this actor was affected by constraint, then destroy those constraints.
-  if (auto* constraintMemberInfo = _registry.try_get<CConstraintMemberInfo>(e)) {
-    auto constraintsCopy = constraintMemberInfo->constraints;
-    for (entt::entity c : constraintsCopy) {
-      DestroyConstraint(GetConstraintHandle(c, GetHandle()));
-    }
-  }
-
-  // If this actor belongs to a compound, then remove it from that compound.
-  auto* groupInfo = _registry.try_get<CGroupMemberInfo>(e);
-  if (groupInfo) {
-    RemoveActorFromCompound(_registry, groupInfo->group, e, ErrorAssert{});
-  }
-
-  // If this actor is an articulation, destroy its members.
-  if (_registry.all_of<TagArticulatedActor>(e)) {
-    DestroyAllItemsInArticulatedActor(e);
-  }
-
-  // Clean actor-vs-actor contact table
-  auto& contactTable = _registry.ctx<CContactFilterTable>();
-  contactTable.RemoveEntity(e);
-
-  // Remove actor from its island (if any)
-  island::RemoveActor(_registry, e);
-
-  // Destroy the ECS entity and all components
-  _registry.destroy(e);
+  DestroyActorEntity(*this, _registry, e);
 }
 
 Actor* SceneImpl::GetActor(ActorHandle actor) {
@@ -2794,9 +3105,15 @@ void SceneImpl::DestroyConstraint(ConstraintHandle constraint) {
     return;
   }
 
+  auto& constraintInfo = _registry.get<CConstraintInfo>(constraintEntity);
+  if (constraintInfo.isActorOwned) {
+    MOCHI_LOG_WARNING(
+        "Constraints created automatically while creating or configuring an actor cannot be destroyed individually. Remove the corresponding actor feature, if supported, or destroy the actor.");
+    return;
+  }
+
   // Update CConstraintMemberInfo on each affected actor, so that they no longer point
   // back to this constraint entity.
-  auto& constraintInfo = _registry.get<CConstraintInfo>(constraintEntity);
   std::unordered_set<entt::entity> processedActors;
   for (entt::entity actor : constraintInfo.actors) {
     if (!processedActors.insert(actor).second) {
@@ -2931,10 +3248,7 @@ void SceneImpl::ValidateNewActorComposition(entt::entity e) const {
   bool const hasCollider = colliderInfo && (colliderInfo->type != ColliderType::None);
   bool const canDetectContact = _registry.all_of<TagUseContact>(e);
   if (hasCollider || canDetectContact) {
-    MOCHI_ASSERT(
-        _registry.all_of<CBoundingVolume<TimeStep::Previous>>(e), "Missing required component");
-    MOCHI_ASSERT(
-        _registry.all_of<CBoundingVolume<TimeStep::Current>>(e), "Missing required component");
+    MOCHI_ASSERT(_registry.all_of<CBoundingVolume>(e), "Missing required component");
     MOCHI_ASSERT(_registry.all_of<CContactLayer>(e), "Missing required component");
     MOCHI_ASSERT(_registry.all_of<CContactParams>(e), "Missing required component");
   }
@@ -2946,6 +3260,36 @@ void SceneImpl::ValidateNewActorComposition(entt::entity e) const {
         _registry.all_of<CPotentialColliders<ContactType::Async>>(e), "Missing required component");
     MOCHI_ASSERT(
         _registry.all_of<CPotentialColliders<ContactType::Sync>>(e), "Missing required component");
+  }
+
+  bool const usesContactSkin = _registry.all_of<TagUseDeformableContactSkin>(e);
+  bool const hasContactSkinComponents = _registry.all_of<
+      CContactSkinningData,
+      CDeformedContactSkinNodes,
+      CSkinnedContactSnle,
+      TagSkinnedContact>(e);
+  MOCHI_ASSERT(
+      usesContactSkin == hasContactSkinComponents,
+      "Contact-skin tag and shared components must be installed together.");
+  if (usesContactSkin) {
+    auto const& surfaceMesh = _registry.get<CSurfaceMesh const>(e);
+    MOCHI_ASSERT(surfaceMesh.embedding != nullptr || _registry.all_of<TagRodActor>(e));
+  }
+
+  if (_registry.all_of<TagRodActor>(e)) {
+    MOCHI_ASSERT(
+        usesContactSkin == _registry.all_of<CRodContactSkin>(e),
+        "Rod contact skin requires its nonlinear embedding component.");
+    MOCHI_ASSERT(
+        usesContactSkin != _registry.all_of<CFemSegmentDiscretization>(e),
+        "Rod contact must use exactly one of contact-skin or centerline discretization.");
+  }
+  if (_registry.all_of<TagShellActor>(e)) {
+    bool const hasDirectContactAssembly =
+        _registry.all_of<CContactLocal2GlobalMap, CContactNodalBasedStructure>(e);
+    MOCHI_ASSERT(
+        usesContactSkin != hasDirectContactAssembly,
+        "Shell contact must use exactly one of contact-skin or direct assembly.");
   }
 
   // All actors must have a CConvergenceStatus, except static actors and internal-only compounds
@@ -2998,7 +3342,7 @@ std::shared_ptr<dbg::SceneDebugger> SceneImpl::GetDebugger() const {
   return _debugger.Read(&DebuggerInfo::debugger);
 }
 
-MOCHI_API void experimental::ApplyImprovedConvergenceSettings(Scene* scene, Error& error) {
+void experimental::ApplyImprovedConvergenceSettings(Scene* scene, Error& error) {
   MOCHI_ERROR_IF(!scene, error, "Invalid scene");
   MOCHI_ERROR_RETURN(error);
   auto* sceneImpl = assert_cast<SceneImpl*>(scene);
@@ -3074,7 +3418,7 @@ void MakeSceneDifferentiableInternal(Scene* scene, Error& error) {
   reg.set<CStatePair>();
 }
 
-MOCHI_API void diffsim::MakeSceneDifferentiable(Scene* scene, Error& error) {
+void diffsim::MakeSceneDifferentiable(Scene* scene, Error& error) {
   MakeSceneDifferentiableInternal(scene, error);
 }
 
@@ -3086,6 +3430,7 @@ void experimental::RestoreStateFromScene(
   MOCHI_ERROR_IF(!sceneFrom, error, "Invalid scene");
   MOCHI_ERROR_IF(!sceneTo, error, "Invalid scene");
   MOCHI_ERROR_RETURN(error);
+  ScopedSchedulerBinding schedulerBinding(assert_cast<SceneImpl*>(sceneTo));
 
   Span<uint8_t const> stateBuffer =
       assert_cast<SceneImpl const*>(sceneFrom)->FindState(handleFrom, error);
@@ -3105,7 +3450,7 @@ void experimental::RestoreStateFromScene(
   MOCHI_ERROR_RETURN(error, __VA_ARGS__);
 
 // [Differentiability] Get solver parameters.
-MOCHI_API diffsim::BackPropagationSolverParams diffsim::GetBackPropagationSolverParams(
+diffsim::BackPropagationSolverParams diffsim::GetBackPropagationSolverParams(
     Scene const* scene,
     Error& error) {
   MOCHI_RETURN_IF_NOT_DIFFERENTIABLE(const, {});
@@ -3113,7 +3458,7 @@ MOCHI_API diffsim::BackPropagationSolverParams diffsim::GetBackPropagationSolver
 }
 
 // [Differentiability] Set solver parameters.
-MOCHI_API void diffsim::SetBackPropagationSolverParams(
+void diffsim::SetBackPropagationSolverParams(
     Scene* scene,
     BackPropagationSolverParams const& params,
     Error& error) {
@@ -3122,7 +3467,7 @@ MOCHI_API void diffsim::SetBackPropagationSolverParams(
 }
 
 // [Differentiability] Get the performance metrics of the last back-propagation step.
-[[nodiscard]] MOCHI_API diffsim::BackPropagationSceneStats diffsim::GetBackPropagationSceneStats(
+[[nodiscard]] diffsim::BackPropagationSceneStats diffsim::GetBackPropagationSceneStats(
     Scene const* scene,
     Error& error) {
   MOCHI_RETURN_IF_NOT_DIFFERENTIABLE(const, {});
@@ -3130,12 +3475,12 @@ MOCHI_API void diffsim::SetBackPropagationSolverParams(
 }
 
 // [Differentiability] Reset accumulated gradient containers used during backpropagation.
-MOCHI_API void diffsim::ResetBackPropagation(Scene* scene, Error& error) {
+void diffsim::ResetBackPropagation(Scene* scene, Error& error) {
   MOCHI_RETURN_IF_NOT_DIFFERENTIABLE(, );
   sceneImpl->ResetBackPropagation();
 }
 
-MOCHI_API void diffsim::PrepareBackPropagate(
+void diffsim::PrepareBackPropagate(
     Scene* scene,
     StateHandle stateNew,
     StateHandle stateOld,
@@ -3144,12 +3489,12 @@ MOCHI_API void diffsim::PrepareBackPropagate(
   sceneImpl->PrepareBackPropagate(stateNew, stateOld, error);
 }
 
-MOCHI_API void diffsim::BackPropagate(Scene* scene, Error& error) {
+void diffsim::BackPropagate(Scene* scene, Error& error) {
   MOCHI_RETURN_IF_NOT_DIFFERENTIABLE(, );
   sceneImpl->BackPropagate(error);
 }
 
-MOCHI_API void diffsim::GetStepJacobian(
+void diffsim::GetStepJacobian(
     Scene* scene,
     StateHandle stateNew,
     StateHandle stateCurr,
@@ -3163,7 +3508,7 @@ MOCHI_API void diffsim::GetStepJacobian(
 
 #undef MOCHI_RETURN_IF_NOT_DIFFERENTIABLE
 
-MOCHI_API experimental::DebugStats experimental::GetDebugStats(Scene const* scene, Error& error) {
+experimental::DebugStats experimental::GetDebugStats(Scene const* scene, Error& error) {
   MOCHI_ERROR_IF(scene == nullptr, error, "Invalid scene pointer");
   MOCHI_ERROR_RETURN(error, {});
   return assert_cast<SceneImpl const*>(scene)->GetDebugStats();

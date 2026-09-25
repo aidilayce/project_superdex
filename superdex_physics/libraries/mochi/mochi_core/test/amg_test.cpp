@@ -161,6 +161,101 @@ template <typename MatrixType>
   return real(4.0 / 3.0) / (options.spectralRadiusSafetyFactor * estimate);
 }
 
+class ZeroAfterFirstSolvePrec {
+ public:
+  template <typename Input, typename Output>
+  void Solve(Input const& r, Output&& z) const {
+    if (_numSolves++ == 0) {
+      z = r;
+    } else {
+      z.SetZero();
+    }
+  }
+
+ private:
+  mutable int _numSolves = 0;
+};
+
+class OverflowingBetaPrec {
+ public:
+  template <typename Input, typename Output>
+  void Solve(Input const& r, Output&& z) const {
+    real target = 1_r / 64_r;
+    if (_numSolves++ > 0) {
+      target = std::numeric_limits<real>::max() / 16_r;
+    }
+    int maxIndex = 0;
+    for (int i = 1; i < r.Rows(); ++i) {
+      if (Abs(r(i)) > Abs(r(maxIndex))) {
+        maxIndex = i;
+      }
+    }
+    z.SetZero();
+    z(maxIndex) = target / r(maxIndex);
+  }
+
+ private:
+  mutable int _numSolves = 0;
+};
+
+class RitzOverflowOp {
+ public:
+  using NonConstScalar = real;
+
+  explicit RitzOverflowOp(int numRows) : _numRows(numRows) {}
+
+  int Rows() const {
+    return _numRows;
+  }
+
+  bool IsFirstApply() const {
+    return _numApplies++ == 0;
+  }
+
+ private:
+  int _numRows;
+  mutable int _numApplies = 0;
+};
+
+template <typename Input, typename Output>
+void Apply(RitzOverflowOp const& A, Input const& p, Output&& Ap) {
+  if (!A.IsFirstApply()) {
+    Ap = p;
+    return;
+  }
+  int maxIndex = 0;
+  for (int i = 1; i < p.Rows(); ++i) {
+    if (Abs(p(i)) > Abs(p(maxIndex))) {
+      maxIndex = i;
+    }
+  }
+  Ap.SetZero();
+  Ap(maxIndex) = (std::numeric_limits<real>::max() / 4_r) / p(maxIndex);
+}
+
+class RitzOverflowPrec {
+ public:
+  template <typename Input, typename Output>
+  void Solve(Input const& r, Output&& z) const {
+    int maxIndex = 0;
+    for (int i = 1; i < r.Rows(); ++i) {
+      if (Abs(r(i)) > Abs(r(maxIndex))) {
+        maxIndex = i;
+      }
+    }
+    z.SetZero();
+    if (_numSolves++ == 0) {
+      z(maxIndex) = 1_r / r(maxIndex);
+      return;
+    }
+    real const rNormSqr = r.Dot(r);
+    z = r * (8_r / rNormSqr);
+  }
+
+ private:
+  mutable int _numSolves = 0;
+};
+
 class AMG1Access : public krylov::AMGPrec<real, 1> {
  public:
   using krylov::AMGPrec<real, 1>::AMGPrec;
@@ -174,6 +269,67 @@ class AMG1Access : public krylov::AMGPrec<real, 1> {
   friend class AMG1Test;
   FRIEND_TEST(AMG1Test, Example1);
 };
+
+TEST(AMG, ConcurrentSolveBarriersReflectOptions) {
+  auto A = MakeWeightedTridiagonalBlockSparseMatrix(15, 0.5_r);
+  auto numBarriers = [&](krylov::AMGOptions<real> const& options) {
+    auto suppressWarnings = mochi::test::SuppressLogWarning();
+    return krylov::AMGPrec<real, 1>(A, options).NumConcurrentSolveBarriers();
+  };
+
+  krylov::AMGOptions<real> options;
+  EXPECT_EQ(4, numBarriers(options));
+
+  options.numPostSmoothingSteps = 2;
+  EXPECT_EQ(8, numBarriers(options));
+
+  options.numPreSmoothingSteps = 2;
+  options.numPostSmoothingSteps = 1;
+  EXPECT_EQ(8, numBarriers(options));
+
+  options.numPreSmoothingSteps = 0;
+  options.numPostSmoothingSteps = 0;
+  EXPECT_EQ(3, numBarriers(options));
+
+  options = {};
+  options.smoother = krylov::Smoother::ApproximateJacobi;
+  options.numPostSmoothingSteps = 7;
+  EXPECT_EQ(5, numBarriers(options));
+
+  options = {};
+  options.smoother = krylov::Smoother::SSOR;
+  krylov::ColoredSSORPrec<decltype(A)> finestSmoother(A);
+  EXPECT_EQ(6 + 2 * finestSmoother.NumConcurrentSolveBarriers(), numBarriers(options));
+}
+
+template <typename MatrixType>
+static void ExpectFusedFineCycleMatchesGenericVCycle(MatrixType const& A) {
+  krylov::AMGPrec<real, MatrixType::kBlockSize> prec(A);
+  ColumnVector<real> b(A.Rows()), fused(A.Rows()), generic(A.Rows());
+  b.SetRandom(1);
+  prec(b, fused);
+  generic.SetZero();
+  prec.template VCycle<false>(b, generic, 0);
+  EXPECT_TRUE(mochi::test::NearEqualMatrices(generic, fused));
+}
+
+TEST(AMG, FusedFineCycleMatchesGenericVCycle) {
+  ExpectFusedFineCycleMatchesGenericVCycle(MakeWeightedTridiagonalBlockSparseMatrix(15, 0.5_r));
+  ExpectFusedFineCycleMatchesGenericVCycle(mochi::test::MakeBlockSparseMatrix<real, 3>(4, 4, 4));
+}
+
+TEST(AMG, ConcurrentSolveForEachCycle) {
+  auto const A = mochi::test::MakeBlockSparseMatrix<real, 3>(4, 4, 4);
+  auto suppressWarnings = mochi::test::SuppressLogWarning();
+  // The defaults run FusedFineCycle; the others run the generic VCycle.
+  krylov::AMGOptions<real> defaults, twoPostSteps, ssor, approximateJacobi;
+  twoPostSteps.numPostSmoothingSteps = 2;
+  ssor.smoother = krylov::Smoother::SSOR;
+  approximateJacobi.smoother = krylov::Smoother::ApproximateJacobi;
+  for (auto const& options : {defaults, twoPostSteps, ssor, approximateJacobi}) {
+    TestConcurrentSolve(krylov::AMGPrec<real, 3>(A, options), A.Rows(), 3);
+  }
+}
 
 /// @brief Class to test the AMG preconditioner with 1D Laplace equation
 class AMG1Test : public testing::Test {
@@ -701,6 +857,39 @@ TEST(AMG, EstimateSpectralRadiusPowerMethod1D) {
   }
 }
 
+TEST(AMG, EstimateSpectralRadiusPCGExactResidualZero) {
+  Matrix<real> A(4, 4);
+  A.SetIdentity();
+  krylov::IdentityPrec<real> invDiag(A);
+  EXPECT_EQ(krylov::details::EstimateSpectralRadius(A, invDiag, 8), 1_r);
+}
+
+TEST(AMG, EstimateSpectralRadiusPCGRejectsZeroQuadraticWithNonzeroResidual) {
+  Matrix<real> A = Matrix<real>::Zero(2, 2);
+  A(0, 0) = 1_r;
+  A(1, 1) = 2_r;
+  ZeroAfterFirstSolvePrec invDiag;
+  auto suppressWarnings = mochi::test::SuppressLogWarning();
+  EXPECT_EQ(krylov::details::EstimateSpectralRadius(A, invDiag, 2), 0_r);
+}
+
+TEST(AMG, EstimateSpectralRadiusPCGRejectsNonFiniteBeta) {
+  constexpr int n = 64;
+  Matrix<real> A(n, n);
+  A.SetIdentity();
+  OverflowingBetaPrec invDiag;
+  auto suppressWarnings = mochi::test::SuppressLogWarning();
+  EXPECT_EQ(krylov::details::EstimateSpectralRadius(A, invDiag, 2), 0_r);
+}
+
+TEST(AMG, EstimateSpectralRadiusPCGRejectsInvalidRitzMatrix) {
+  constexpr int n = 64;
+  RitzOverflowOp A(n);
+  RitzOverflowPrec invDiag;
+  auto suppressWarnings = mochi::test::SuppressLogWarning();
+  EXPECT_EQ(krylov::details::EstimateSpectralRadius(A, invDiag, 2), 0_r);
+}
+
 TEST(AMG, EstimateSpectralRadiusPCG1D) {
   krylov::AMGOptions<real> const options = {};
   for (int n : {15, 31, 63}) {
@@ -823,11 +1012,17 @@ TEST(AMG, ConstructorOptionsSpectralRadiusMaxItersAffectInitialRelaxationFactor)
   AMG1Access precFew(Af, optionsFew);
   real const relaxationFactorFew = precFew.GetRelaxationFactor(0);
 
+  krylov::AMGOptions<real> optionsAtDimension;
+  optionsAtDimension.spectralRadiusMaxIters = n;
+  AMG1Access precAtDimension(Af, optionsAtDimension);
+  real const relaxationFactorAtDimension = precAtDimension.GetRelaxationFactor(0);
+
   krylov::AMGOptions<real> optionsMany;
   optionsMany.spectralRadiusMaxIters = 32;
   AMG1Access precMany(Af, optionsMany);
   real const relaxationFactorMany = precMany.GetRelaxationFactor(0);
 
+  EXPECT_EQ(relaxationFactorMany, relaxationFactorAtDimension);
   EXPECT_GT(relaxationFactorFew, 0.0_r);
   EXPECT_LT(relaxationFactorFew, AMG1Access::kDefaultRelaxationFactor);
   EXPECT_GT(relaxationFactorMany, 0.0_r);
@@ -876,7 +1071,7 @@ TEST(AMG, UpdateRecomputesAutoRelaxationFactor) {
       1.0e-5_r);
 }
 
-TEST(AMG, AutoRelaxationFallbackKeepsCurrentFactor) {
+TEST(AMG, AutoRelaxationFallbackUsesDefaultFactor) {
   constexpr int n = 15;
   krylov::AMGOptions<real> const options = {};
   auto Af = MakeWeightedTridiagonalBlockSparseMatrix(n, 0.5_r);
@@ -894,16 +1089,16 @@ TEST(AMG, AutoRelaxationFallbackKeepsCurrentFactor) {
   }
 
   AMG1Access prec(Af, options);
-  real const level0RelaxationFactorBeforeUpdate = prec.GetRelaxationFactor(0);
-  real const level1RelaxationFactorBeforeUpdate = prec.GetRelaxationFactor(1);
+  ASSERT_NE(AMG1Access::kDefaultRelaxationFactor, prec.GetRelaxationFactor(0));
+  ASSERT_NE(AMG1Access::kDefaultRelaxationFactor, prec.GetRelaxationFactor(1));
 
   {
     auto suppressWarnings = mochi::test::SuppressLogWarning();
     prec.Update(AfEstimateFails);
   }
 
-  EXPECT_EQ(level0RelaxationFactorBeforeUpdate, prec.GetRelaxationFactor(0));
-  EXPECT_EQ(level1RelaxationFactorBeforeUpdate, prec.GetRelaxationFactor(1));
+  EXPECT_EQ(AMG1Access::kDefaultRelaxationFactor, prec.GetRelaxationFactor(0));
+  EXPECT_EQ(AMG1Access::kDefaultRelaxationFactor, prec.GetRelaxationFactor(1));
 }
 
 TEST(AMG, UpdatePreservesExplicitRelaxationFactor) {

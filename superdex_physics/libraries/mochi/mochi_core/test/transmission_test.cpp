@@ -25,6 +25,7 @@
 #include <mochi_core/utils/rigid_body_size.h>
 
 #include <cmath>
+#include <limits>
 
 using namespace mochi;
 using namespace mochi::articulated;
@@ -206,6 +207,72 @@ TEST(TransmissionActuator, DisplacementControlActuator_AllowCompressiveForce) {
 
   // Derivatives should still be consistent through the (formerly clamped) region.
   VerifyDerivatives(&actuator, displacement, prevDisplacement, timeStep);
+}
+
+TEST(TransmissionActuator, DisplacementControlActuator_InfiniteTimeStep) {
+  // Quasi-static solves (e.g. the IK solver) step with an infinite time step to drop the inertial
+  // terms, so every output must stay finite. The damping term is the one at risk: it is
+  // d*(dx/dt)^2*dt, which evaluates as 0*inf == NaN if written with a trailing multiply. A NaN
+  // energy silently defeats merit-based line searches, so assert finiteness explicitly.
+  real const targetDisplacement = 0.02_r;
+  real const stiffness = 1e5_r;
+  real const displacement = 0.05_r;
+  real const prevDisplacement = 0_r;
+  real const infiniteTimeStep = std::numeric_limits<real>::infinity();
+  // Couplings between joints are bidirectional, so they allow compressive force. That also keeps
+  // the actuator out of the clamped branch, which returns zeros and would hide a NaN.
+  bool const allowCompressiveForce = true;
+
+  real const dDisplacement = displacement - targetDisplacement;
+  real const expectedForce = stiffness * dDisplacement;
+  real const expectedEnergy = 0.5_r * stiffness * Sqr(dDisplacement);
+
+  // Sweep zero and non-zero damping: an infinite time step must stay finite for any damping value,
+  // including zero, since the damping term is what risks a 0*inf == NaN.
+  for (real const damping : {0_r, 1e3_r}) {
+    DisplacementControlActuator actuator(
+        targetDisplacement, stiffness, damping, allowCompressiveForce);
+
+    real energy{}, force{}, computedStiffness{};
+    actuator.EnergyGradientHessian(
+        displacement, prevDisplacement, infiniteTimeStep, &energy, &force, &computedStiffness);
+
+    EXPECT_TRUE(IsFinite(energy));
+    EXPECT_TRUE(IsFinite(force));
+    EXPECT_TRUE(IsFinite(computedStiffness));
+
+    // An infinite time step means zero velocity, so damping drops out of all three outputs and
+    // only the stiffness penalty remains.
+    EXPECT_NEAR_RTOL(energy, expectedEnergy, kRelativeTolerance);
+    EXPECT_NEAR_RTOL(force, expectedForce, kRelativeTolerance);
+    EXPECT_NEAR_RTOL(computedStiffness, stiffness, kRelativeTolerance);
+  }
+}
+
+TEST(TransmissionActuator, DisplacementControlActuator_FiniteTimeStepEnergyIncludesDamping) {
+  // Unlike the other DisplacementControl tests, which only check derivative consistency via
+  // VerifyDerivatives, this pins the absolute closed-form energy (including the damping term) for a
+  // finite time step, guarding the dt-safe damping energy against a scaling error.
+  real const targetDisplacement = 0.02_r;
+  real const stiffness = 1e5_r;
+  real const damping = 1e3_r;
+  bool const allowCompressiveForce = true;
+  DisplacementControlActuator actuator(
+      targetDisplacement, stiffness, damping, allowCompressiveForce);
+
+  real const displacement = 0.05_r;
+  real const prevDisplacement = 0.01_r;
+  real const timeStep = 0.01_r;
+
+  real energy{};
+  actuator.EnergyGradientHessian(
+      displacement, prevDisplacement, timeStep, &energy, nullptr, nullptr);
+
+  real const dDisplacement = displacement - targetDisplacement;
+  real const velocity = (displacement - prevDisplacement) / timeStep;
+  real const expectedEnergy =
+      0.5_r * (stiffness * Sqr(dDisplacement) + damping * Sqr(velocity) * timeStep);
+  EXPECT_NEAR_RTOL(energy, expectedEnergy, kRelativeTolerance);
 }
 
 /*************************************************************************************************/

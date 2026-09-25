@@ -39,23 +39,15 @@ class Simd<int64_t, 2> {
   template <int i>
   [[nodiscard]] static MOCHI_FORCE_INLINE Scalar Get(Simd v) {
     static_assert(i >= 0 && i < kSize, "Index out of range");
-    if constexpr (i == 0) {
-      return _mm_cvtsi128_si64(v.raw); // SSE2
-    } else if constexpr (i == 1) {
-      return _mm_cvtsi128_si64(_mm_unpackhi_epi64(v.raw, v.raw)); // SSE2, SSE2
-    }
+    return v[i];
   }
 
-  [[nodiscard]] static MOCHI_FORCE_INLINE Scalar Get(Simd v, int i) {
+  [[nodiscard]] MOCHI_FORCE_INLINE Scalar operator[](int i) const {
     MOCHI_ASSERT_VERBOSE(i >= 0 && i < kSize, "Index out of range");
 #if MOCHI_COMPILER_MSVC
-    return v.raw.m128i_i64[i];
+    return raw.m128i_i64[i];
 #else
-    switch (i) { // clang-format off
-                case 0: return Get<0>(v);
-                case 1: return Get<1>(v);
-                MOCHI_UNLIKELY default: return 0;
-            } // clang-format on
+    return static_cast<Scalar>(raw[i]);
 #endif
   }
 
@@ -124,11 +116,15 @@ class Simd<int64_t, 2> {
 
   [[nodiscard]] static MOCHI_FORCE_INLINE Simd Load(Scalar const* ptr, int n) {
     MOCHI_ASSERT_VERBOSE(n >= 0 && n <= kSize, "Invalid size parameter");
+#if MOCHI_ARCH_X64_AVX512
+    return _mm_maskz_loadu_epi64(x64_simd::kLaneMasksS8[n], ptr); // AVX512VL
+#else
     switch (n) { // clang-format off
       case 1: return Load<1>(ptr);
       case 2: return Load<2>(ptr);
       MOCHI_UNLIKELY default: return Zero();
     } // clang-format on
+#endif
   }
 
   template <int kTupleCount = kSize>
@@ -146,13 +142,19 @@ class Simd<int64_t, 2> {
   }
 
   [[nodiscard]] static MOCHI_FORCE_INLINE Simd Min(Simd a, Simd b) {
-    // TODO: Use _mm_min_epi64 for AVX512
+#if MOCHI_ARCH_X64_AVX512
+    return _mm_min_epi64(a.raw, b.raw); // AVX512VL
+#else
     return Simd{mochi::Min(Get<0>(a), Get<0>(b)), mochi::Min(Get<1>(a), Get<1>(b))};
+#endif
   }
 
   [[nodiscard]] static MOCHI_FORCE_INLINE Simd Max(Simd a, Simd b) {
-    // TODO: Use _mm_max_epi64 for AVX512
+#if MOCHI_ARCH_X64_AVX512
+    return _mm_max_epi64(a.raw, b.raw); // AVX512VL
+#else
     return Simd{mochi::Max(Get<0>(a), Get<0>(b)), mochi::Max(Get<1>(a), Get<1>(b))};
+#endif
   }
 
   [[nodiscard]] static MOCHI_FORCE_INLINE Simd Select(Simd mask, Simd a, Simd b) {
@@ -176,7 +178,7 @@ class Simd<int64_t, 2> {
     static_assert(N >= 0 && N <= kSize);
     if constexpr (N == 0) {
     } else if constexpr (N < kSize) {
-      // About 3X faster than a masked store on AMD. About the same on Intel.
+      // About 3X faster than a masked store on older AMD CPUs. About the same on others.
       memcpy(ptr, &v.raw, sizeof(Scalar) * N);
     } else {
       _mm_storeu_si128(reinterpret_cast<__m128i*>(ptr), v.raw); // SSE
@@ -185,16 +187,25 @@ class Simd<int64_t, 2> {
 
   static MOCHI_FORCE_INLINE void Store(Scalar* ptr, Simd v, int n) {
     MOCHI_ASSERT_VERBOSE(n >= 0 && n <= kSize, "Invalid size parameter");
-    // Faster than masked store on AMD.
-    // clang-format off
-            switch (n) {
-                case 1: Store<1>(ptr, v); break;
-                case 2: Store<2>(ptr, v); break;
-                MOCHI_UNLIKELY default: break;
-            } // clang-format on
+#if MOCHI_ARCH_X64_AVX512
+    _mm_mask_storeu_epi64(ptr, x64_simd::kLaneMasksS8[n], v.raw); // AVX512VL
+#else
+    // With AVX2, this is faster than masked store for a predictable value of n.
+    // It is much slower for a random value of n.
+    switch (n) { // clang-format off
+      case 1: Store<1>(ptr, v); break;
+      case 2: Store<2>(ptr, v); break;
+      MOCHI_UNLIKELY default: break;
+    } // clang-format on
+#endif
   }
 
   MOCHI_FORCE_INLINE static int StoreSelected(Scalar* ptr, Simd condition, Simd values) {
+#if MOCHI_ARCH_X64_AVX512
+    auto const mask = _mm_movepi64_mask(condition.raw);
+    _mm_mask_compressstoreu_epi64(ptr, mask, values.raw); // AVX512VL
+    return _mm_popcnt_u32(mask);
+#else
     auto mask = _mm_movemask_pd(_mm_castsi128_pd(condition.raw));
     auto swapped = _mm_castpd_si128(_mm_shuffle_pd(
         _mm_castsi128_pd(values.raw), _mm_castsi128_pd(values.raw), 1)); // swap halves
@@ -202,6 +213,7 @@ class Simd<int64_t, 2> {
     auto packed = _mm_blendv_epi8(values.raw, swapped, blendMask);
     _mm_storeu_si128(reinterpret_cast<__m128i*>(ptr), packed);
     return _mm_popcnt_u32(mask);
+#endif
   }
 
   template <int kTupleCount = kSize>
@@ -278,9 +290,11 @@ class Simd<int64_t, 2> {
   }
 
   [[nodiscard]] MOCHI_FORCE_INLINE Simd operator*(Simd rhs) const {
-    // Fallback
-    // Requires AVX512 _mm_mullo_epi64
+#if MOCHI_ARCH_X64_AVX512
+    return _mm_mullo_epi64(raw, rhs.raw); // AVX512VL
+#else
     return Simd{Get<0>(*this) * Get<0>(rhs), Get<1>(*this) * Get<1>(rhs)};
+#endif
   }
 
   [[nodiscard]] MOCHI_FORCE_INLINE Simd operator/(Simd rhs) const {
@@ -310,7 +324,19 @@ class Simd<int64_t, 2> {
 
   template <int kShift>
   [[nodiscard]] MOCHI_FORCE_INLINE static Simd ShiftRight(Simd a) {
-    return _mm_srli_epi64(a.raw, kShift); // SSE2
+    static_assert(kShift >= 0 && kShift < 64, "Shift amount out-of-range");
+    if constexpr (kShift == 0) {
+      return a;
+    } else {
+#if MOCHI_ARCH_X64_AVX512
+      return _mm_srai_epi64(a.raw, kShift); // AVX512VL
+#else
+      auto shifted = _mm_srli_epi64(a.raw, kShift); // SSE2
+      auto signMask = _mm_cmpgt_epi64(_mm_setzero_si128(), a.raw); // SSE4.2
+      auto signFill = _mm_slli_epi64(signMask, 64 - kShift); // SSE2
+      return _mm_or_si128(shifted, signFill); // SSE2
+#endif
+    }
   }
 
  private:

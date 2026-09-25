@@ -154,22 +154,88 @@ MOCHI_FORCE_INLINE void ComputeRodElementRotationLocal(
   } // if computing derivative
 }
 
-// Computes the Jacobian of an embedded point's position with respect to the contributing
-// element's DoFs. An embedded point is defined by local coordinates (xi) relative to the element's
-// deformed frame, expressed in a *unit-reference-tangent* basis (so xi[0] is in arc-length units).
-//
-// The current frame axis is taken as input, NOT computed from reference. The twist DoF is treated
-// as zero (it's recentered each time step).
+// Differential geometry of a deformed rod element frame with respect to its edge vector.
+// The frame is [tangent | frameAxis | binormal], where binormal = tangent x frameAxis.
+// The derivative matrices map a change in the deformed edge to the corresponding change in each
+// frame vector. Twist derivatives are not stored because they have the compact forms
+// d(frameAxis)/dtheta = binormal and d(binormal)/dtheta = tangent x binormal.
+struct RodElementFrameDifferential {
+  Vec4r tangent;
+  Vec4r binormal;
+  VMatrix3x3r dFrameAxisDEdge;
+  VMatrix3x3r dBinormalDEdge;
+};
+
+// Computes the frame and its edge derivatives. currentFrameAxis must be unit length and orthogonal
+// to the deformed element tangent.
+MOCHI_FORCE_INLINE RodElementFrameDifferential
+ComputeRodElementFrameDifferential(Vec4r const& deformedEdge, Vec4r const& currentFrameAxis) {
+  Vec4r const tangent = Normalize<3>(deformedEdge);
+  Vec4r const binormal = Cross3(tangent, currentFrameAxis);
+  VMatrix3x3r const dTangentDEdge = DNormalize3(deformedEdge);
+
+  // The frame axis follows changes in the tangent by infinitesimal parallel transport.
+  VMatrix3x3r const dFrameAxisDTangent =
+      Outer3(currentFrameAxis, tangent) - Outer3(tangent, currentFrameAxis);
+  VMatrix3x3r const dFrameAxisDEdge = Dot3x3(dFrameAxisDTangent, dTangentDEdge);
+
+  // Differentiate binormal = tangent x frameAxis, including both tangent and frame-axis motion.
+  VMatrix3x3r const dBinormalDEdge =
+      Dot3x3(Outer3(binormal, tangent) - Skew3(currentFrameAxis), dTangentDEdge);
+  return {tangent, binormal, dFrameAxisDEdge, dBinormalDEdge};
+}
+
+// Computes an embedded point's 3x8 position Jacobian from precomputed element differential
+// geometry. The embedded point uses local coordinates xi = [xi_t, xi_d, xi_b] in the deformed
+// element frame. xi_t is in arc-length units and is scaled by invReferenceLength; xi_d and xi_b
+// are offsets along the frame axis and binormal. The element DoFs are ordered
+// [ux0, uy0, uz0, theta0, ux1, uy1, uz1, theta1].
+inline void ComputeEmbeddedPointElementJacobian(
+    Real3 const& xi,
+    real invReferenceLength,
+    RodElementFrameDifferential const& differential,
+    NdArray<real, 3, 2 * kNumRodFields>& outJacobian) {
+  static_assert(kNumRodFields == 4, "This code assumes 4 DoFs per element");
+
+  // Forward map in unit-reference-tangent coordinates:
+  //   x_vis = mid + xi[0] * (edge * invReferenceLength) + xi[1] * frameAxis
+  //                 + xi[2] * binormal.
+  // Therefore d(x_vis)/d(edge) combines the scaled tangent term with changes in the frame axis
+  // and binormal. Since edge = x1 - x0, this contribution has opposite signs for the two nodes.
+  real const xiT = xi[0] * invReferenceLength;
+  VMatrix3x3r dFrameAndBinormalDEdge;
+  for (int i = 0; i < 3; ++i) {
+    dFrameAndBinormalDEdge[i] =
+        xi[1] * differential.dFrameAxisDEdge[i] + xi[2] * differential.dBinormalDEdge[i];
+  }
+  VMatrix3x3r const dxvis_dx0 = VDiagonalMatrix<3>(0.5_r - xiT) - dFrameAndBinormalDEdge;
+  VMatrix3x3r const dxvis_dx1 = VDiagonalMatrix<3>(0.5_r + xiT) + dFrameAndBinormalDEdge;
+
+  // Only the first node owns the element twist DoF. At zero incremental twist,
+  // d(frameAxis)/dtheta = binormal and d(binormal)/dtheta = tangent x binormal.
+  Vec4r const theta0Deriv =
+      xi[1] * differential.binormal + xi[2] * Cross3(differential.tangent, differential.binormal);
+
+  for (int i = 0; i < 3; ++i) {
+    Store(&(outJacobian[i][0]), dxvis_dx0[i]);
+    Store(&(outJacobian[i][kNumRodFields]), dxvis_dx1[i]);
+    outJacobian[i][kNumRodFields - 1] = theta0Deriv[i];
+    outJacobian[i][2 * kNumRodFields - 1] = 0_r;
+  }
+}
+
+// Convenience overload that computes the element differential geometry before evaluating the
+// embedded-point Jacobian.
 //
 // Parameters:
-//   X0, X1: Reference positions of element nodes
+//   X0, X1: Reference positions of the element nodes.
 //   xi: Local coordinates [xi_t, xi_d, xi_b]. xi_t is a signed arc-length offset along the
-//       (stretched) unit tangent; xi_d, xi_b are length-units offsets along frame axis & binormal.
-//   invReferenceLength: 1 / |X1 - X0|. Used to scale xi_t into the correct multiplier of
-//       (x1 - x0) for the deformed configuration.
-//   currentFrameAxis: Current deformed frame axis (unit vector, orthogonal to deformed tangent)
-//   elementDofs: [ux0, uy0, uz0, θ0, ux1, uy1, uz1, θ1] - twist DoF values are zero in practice
-//   outJacobian: 3x8 Jacobian of position w.r.t. element DoFs
+//       stretched tangent; xi_d and xi_b are length-unit offsets along frame axis and binormal.
+//   invReferenceLength: 1 / |X1 - X0|, used to scale xi_t for the deformed configuration.
+//   currentFrameAxis: Current unit frame axis, orthogonal to the deformed element tangent.
+//   elementDofs: [ux0, uy0, uz0, theta0, ux1, uy1, uz1, theta1]. The twist DoFs are zero in the
+//       stored pose because they are recentered each time step.
+//   outJacobian: 3x8 Jacobian of embedded-point position with respect to the element DoFs.
 inline void ComputeEmbeddedPointElementJacobian(
     Real3 const& X0,
     Real3 const& X1,
@@ -178,58 +244,17 @@ inline void ComputeEmbeddedPointElementJacobian(
     Real3 const& currentFrameAxis,
     Span<real const> elementDofs,
     NdArray<real, 3, 2 * kNumRodFields>& outJacobian) {
-  static_assert(kNumRodFields == 4, "This code assumes 4 DoFs per element");
   MOCHI_ASSERT_VERBOSE(
       elementDofs.size() == 2 * kNumRodFields,
       "Expected the displacement/twist DoFs for two nodes: [ux0, uy0, uz0, θ0, ux1, uy1, uz1, θ1]");
 
-  // Deformed positions and tangent
   Vec4r const x0 = ToSimd(X0) + Load<Vec4r>(&(elementDofs[0]));
   Vec4r const x1 = ToSimd(X1) + Load<Vec4r>(&(elementDofs[kNumRodFields]));
-  Vec4r const e = x1 - x0;
-  Vec4r const eHat = Normalize<3>(e);
-  Vec4r const currentFrameAxis4 = ToSimd(currentFrameAxis);
-  Vec4r const binormal = Cross3(eHat, currentFrameAxis4);
-
-  // Frame axis derivatives:
-  VMatrix3x3r const deHat_de = DNormalize3(e);
-  // Simplified using orthogonality of currentFrameAxis and eHat.
-  VMatrix3x3r const dframeAxis_deHat =
-      Outer3(currentFrameAxis4, eHat) - Outer3(eHat, currentFrameAxis4);
-  VMatrix3x3r const dframeAxis_de = Dot3x3(dframeAxis_deHat, deHat_de);
-  // d(d)/dθ at θ=0 = eHat × d = binormal (same vector, different interpretation)
-  Vec4r const& dframeAxis_dtheta = binormal;
-
-  // Binormal derivatives: d(eHat × d)/d(e) = skew(-d)·d(eHat)/d(e) + skew(eHat)·d(d)/d(e)
-  VMatrix3x3r const skewEHat = Skew3(eHat);
-  VMatrix3x3r const db_de_fromEHat = Dot3x3(-Skew3(currentFrameAxis4), deHat_de);
-  VMatrix3x3r const db_de_fromD = Dot3x3(skewEHat, dframeAxis_de);
-
-  // Displacement derivative matrices: d(x_vis)/d(x0) and d(x_vis)/d(x1).
-  // Forward map (in unit-reference-tangent parametrization):
-  //   x_vis = mid + xi[0] · (e · invReferenceLength) + xi[1] · d + xi[2] · b
-  // d(x_vis)/d(x) = d(mid)/d(x) + xi[0] · invReferenceLength · d(e)/d(x)
-  //               + xi[1] · d(d)/d(e) · d(e)/d(x) + xi[2] · d(b)/d(e) · d(e)/d(x)
-  real const xiT = xi[0] * invReferenceLength;
-  VMatrix3x3r dFrameAndBinormal_de;
-  for (int i = 0; i < 3; ++i) {
-    dFrameAndBinormal_de[i] =
-        xi[1] * dframeAxis_de[i] + xi[2] * (db_de_fromEHat[i] + db_de_fromD[i]);
-  }
-  VMatrix3x3r const dxvis_dx0 = VDiagonalMatrix<3>(0.5_r - xiT) - dFrameAndBinormal_de;
-  VMatrix3x3r const dxvis_dx1 = VDiagonalMatrix<3>(0.5_r + xiT) + dFrameAndBinormal_de;
-
-  // θ0 derivative: d(xi[1]·d + xi[2]·b)/dθ, where d(d)/dθ = binormal, d(b)/dθ = skew(eHat)·binormal
-  Vec4r const theta0Deriv =
-      xi[1] * dframeAxis_dtheta + xi[2] * DotMatVec3x3(skewEHat, dframeAxis_dtheta);
-
-  // Store Jacobian
-  for (int i = 0; i < 3; ++i) {
-    Store(&(outJacobian[i][0]), dxvis_dx0[i]);
-    Store(&(outJacobian[i][kNumRodFields]), dxvis_dx1[i]);
-    outJacobian[i][kNumRodFields - 1] = theta0Deriv[i];
-    outJacobian[i][2 * kNumRodFields - 1] = 0_r;
-  }
+  ComputeEmbeddedPointElementJacobian(
+      xi,
+      invReferenceLength,
+      ComputeRodElementFrameDifferential(x1 - x0, ToSimd(currentFrameAxis)),
+      outJacobian);
 }
 
 /// @brief Compile-time element tag for the 3-node rod assembly stencil.

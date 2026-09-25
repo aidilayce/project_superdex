@@ -21,13 +21,17 @@
 #include <mochi_core/test/mochi_test_helpers.h>
 #include <mochi_core/utils/dynamic_array.h>
 #include <mochi_core/utils/error.h>
-#include <mochi_core/utils/log.h>
+#include <mochi_core/utils/file_utils.h>
+#include <mochi_core/utils/group_rw.h>
 #include <mochi_core/utils/nd_array.h>
 #include <mochi_core/utils/time.h>
 #include <mochi_core/utils/vmatrix.h>
 
+#include <cstdint>
+#include <initializer_list>
 #include <memory>
 #include <string>
+#include <string_view>
 
 using namespace mochi;
 
@@ -38,11 +42,11 @@ int constexpr kNumDoFs = 24;
 #ifdef USE_REVISED
 static constexpr real kScale = 1.3309090553162923_r;
 static constexpr Real3 kShift = {0.49734753_r, 0.51221045_r, 0.49657665_r};
-static std::string const kModelPath = "cube/cube_minimal_flow_revised.pt";
+static std::string const kModelPath = "cube/cube_minimal_flow_revised.mochi.h5";
 #else
 constexpr real kScale = 1.3362546845910275_r;
 constexpr Real3 kShift = {0.47520887_r, 0.49131036_r, 0.4907711_r};
-std::string const kModelPath = "cube/cube_minimal_flow.pt";
+std::string const kModelPath = "cube/cube_minimal_flow.mochi.h5";
 #endif
 
 DynamicArray<Real3> points = {
@@ -246,24 +250,17 @@ DynamicArray<DynamicArray<DynamicArray<real>>> pyDdefDdofs_Def = {
       -6.9702e-02_r, 2.8168e-02_r,  3.1629e-01_r, 1.8949e-02_r,  2.7798e-03_r,  9.1529e-02_r,
       -6.0431e-05_r, -2.0525e-02_r, 1.5063e-02_r, -3.6675e-02_r, -4.9419e-03_r, 1.1367e-01_r,
       2.1327e-02_r,  -4.6284e-02_r, 2.6966e-01_r, 3.2371e-02_r,  -2.9821e-02_r, 8.9499e-02_r}}};
-}; // namespace
+} // namespace
 
 class DeepFlowMapTest : public testing::Test {
  public:
   DeepFlowMapTest() = default;
 
-  void Init(NeuralComputeType computeType) {
+  void Init() {
     // Create the mapping
     ErrorAssert error;
     std::string path = test::GetAssetPath(kModelPath);
-    _flow = LoadDeepFlow(
-        path.c_str(),
-        kScale,
-        kShift,
-        kNumDoFs,
-        computeType,
-        DeepFlow::kMochiSamplesPrealloc,
-        error);
+    _flow = LoadDeepFlow(path.c_str(), kScale, kShift, kNumDoFs, error);
     _flowMap = CreateDeepFlowMap(_flow, 1_r, error);
   }
 
@@ -311,6 +308,7 @@ class DeepFlowMapTest : public testing::Test {
 
     RunQuery();
     DynamicArray<Real3> outPointsRef(_outPoints);
+    DynamicArray<VMatrix3x3r> analyticDrefDdef(_outDDefDDef);
     Clear();
 
     for (int k = 0; k < 3; k++) {
@@ -332,25 +330,11 @@ class DeepFlowMapTest : public testing::Test {
 
     for (int i = 0; i < points.size(); i++) {
       for (int j = 0; j < 3; j++) {
-        EXPECT_NEAR(Get<0>(_outDDefDDef[i][j]), fdDrefDdef[i][j][0], tolDrefDdef);
-        EXPECT_NEAR(Get<1>(_outDDefDDef[i][j]), fdDrefDdef[i][j][1], tolDrefDdef);
-        EXPECT_NEAR(Get<2>(_outDDefDDef[i][j]), fdDrefDdef[i][j][2], tolDrefDdef);
+        EXPECT_NEAR(Get<0>(analyticDrefDdef[i][j]), fdDrefDdef[i][j][0], tolDrefDdef);
+        EXPECT_NEAR(Get<1>(analyticDrefDdef[i][j]), fdDrefDdef[i][j][1], tolDrefDdef);
+        EXPECT_NEAR(Get<2>(analyticDrefDdef[i][j]), fdDrefDdef[i][j][2], tolDrefDdef);
       }
     }
-  }
-
-  void SetUp() override {
-    // This test might log a warning if CUDA is not available. A warning would normally fail
-    // the test, but we need it to continue with the CPU implementation for build agents without
-    // GPUs. Therefore we temporarily replace the unit test logging function with the default one
-    // (just prints to stdout and the debugger).
-    _prevLogFn = GetLogCallback();
-    SetLogCallback(nullptr);
-  }
-
-  void TearDown() override {
-    // Restor previous logging hook
-    SetLogCallback(_prevLogFn);
   }
 
  protected:
@@ -360,13 +344,10 @@ class DeepFlowMapTest : public testing::Test {
   DynamicArray<VMatrix3x3r> _outDDefDDef;
   DynamicArray<ColliderJacDofs> _outDDefDDofs;
   DynamicArray<int> _outInds;
-  LogFn _prevLogFn = {};
 };
 
-// TODO[T152549129] Disabled in debug builds because torch::jit::load crashes or never returns.
-// Also disabled when real is type double, because the saved torch files only support floats.
 // The model data is not shipped externally.
-#if MOCHI_USE_TORCH && !MOCHI_DEBUG && !MOCHI_USE_DOUBLE_PRECISION && MOCHI_INTERNAL
+#if MOCHI_USE_HDF5 && MOCHI_INTERNAL
 #define MOCHI_CAN_TEST_DEEP_FLOW_MAP 1
 #else
 #define MOCHI_CAN_TEST_DEEP_FLOW_MAP 0
@@ -374,34 +355,95 @@ class DeepFlowMapTest : public testing::Test {
 
 // The python data for this test can be generated with the script run_flow_model.py
 TEST_IF_F(MOCHI_CAN_TEST_DEEP_FLOW_MAP, DeepFlowMapTest, DeepFlowMap) {
-  for (int iCompute = 0; iCompute < static_cast<int>(NeuralComputeType::Count); ++iCompute) {
-    Init(static_cast<NeuralComputeType>(iCompute));
+  Init();
 
-    // Compare result with values evaluated in Python for no deformation
-    RunQuery();
-    CompareWithPython(pyMap_Rest, pyDrefDdef_Rest, pyDdefDdofs_Rest, 3e-4_r, 8e-4_r, 3e-4_r);
-    Clear();
+  // Compare result with values evaluated in Python for no deformation
+  RunQuery();
+  CompareWithPython(pyMap_Rest, pyDrefDdef_Rest, pyDdefDdofs_Rest, 3e-4_r, 8e-4_r, 3e-4_r);
+  Clear();
 
-    // Compare result with values evaluated in Python for a deformed case
-    _flowMap->UpdateMap(dofs);
-    RunQuery();
-    CompareWithPython(pyMap_Def, pyDrefDdef_Def, pyDdefDdofs_Def, 4e-4_r, 7e-4_r, 3e-4_r);
-  }
+  // Compare result with values evaluated in Python for a deformed case
+  _flowMap->UpdateMap(dofs);
+  RunQuery();
+  CompareWithPython(pyMap_Def, pyDrefDdef_Def, pyDdefDdofs_Def, 4e-4_r, 7e-4_r, 3e-4_r);
 }
 
 TEST_IF_F(MOCHI_CAN_TEST_DEEP_FLOW_MAP, DeepFlowMapTest, DeepFlowMap_Consistency) {
-  for (int iCompute = 0; iCompute < static_cast<int>(NeuralComputeType::Count); ++iCompute) {
-    auto computeType = static_cast<NeuralComputeType>(iCompute);
-    if (computeType == NeuralComputeType::TorchGpu) {
-      continue; // The consistency test fails with TorchGpu
+  Init();
+
+  // Test dref_ddef through finite differences for no deformation
+  CompareWithFiniteDifferences(1.e-2_r);
+
+  // Test dref_ddef through finite differences for a deformed case
+  _flowMap->UpdateMap(dofs);
+  CompareWithFiniteDifferences(1e-2_r);
+}
+
+namespace {
+struct MlpLayerSpec {
+  int32_t index;
+  int outputDim;
+  int inputDim;
+  int biasDim;
+  bool hasActivation = true;
+};
+} // namespace
+
+static void WriteDeepFlowModel(
+    std::string const& path,
+    std::initializer_list<MlpLayerSpec> layers) {
+  auto writer = CreateGroupWriterHDF5(path, test::ExpectOK{});
+  auto deepFlowGroup = writer->EnterGroup("deep_flow", test::ExpectOK{});
+  int groupIndex = 0;
+  for (auto const& layerSpec : layers) {
+    auto layerGroup = writer->EnterGroup("layer_" + std::to_string(groupIndex), test::ExpectOK{});
+    writer->AddAttribute("name", std::string_view("Linear"), test::ExpectOK{});
+    writer->AddAttribute("index", layerSpec.index, test::ExpectOK{});
+
+    DynamicArray<float> weights(layerSpec.outputDim * layerSpec.inputDim, 0.0f);
+    size_t const weightDims[] = {
+        static_cast<size_t>(layerSpec.outputDim), static_cast<size_t>(layerSpec.inputDim)};
+    writer->AddDataSet(
+        "weight", MakeConstSpan(weights), MakeConstSpan(weightDims), test::ExpectOK{});
+    DynamicArray<float> biases(layerSpec.biasDim, 0.0f);
+    writer->AddDataSet("bias", MakeConstSpan(biases), test::ExpectOK{});
+
+    if (layerSpec.hasActivation) {
+      auto activationGroup = writer->EnterGroup("activation", test::ExpectOK{});
+      writer->AddAttribute("kind", std::string_view("identity"), test::ExpectOK{});
     }
-    Init(computeType);
-
-    // Test dref_ddef through finite differences for no deformation
-    CompareWithFiniteDifferences(1.e-2_r);
-
-    // Test dref_ddef through finite differences for a deformed case
-    _flowMap->UpdateMap(dofs);
-    CompareWithFiniteDifferences(1e-2_r);
+    ++groupIndex;
   }
+}
+
+static void ExpectInvalidDeepFlowModel(
+    std::initializer_list<MlpLayerSpec> layers,
+    int numDofs,
+    std::string_view expectedError) {
+  auto temp = CreateTempFile("invalid_deep_flow", ".h5", test::ExpectOK{});
+  WriteDeepFlowModel(temp.Path().string(), layers);
+
+  Error error;
+  auto const flow = LoadDeepFlow(temp.Path().string().c_str(), 1_r, {}, numDofs, error);
+  EXPECT_EQ(flow, nullptr);
+  EXPECT_NOT_OK(error);
+  EXPECT_NE(error.ToString().find(expectedError), std::string::npos) << error.ToString();
+}
+
+TEST_IF(MOCHI_CAN_TEST_DEEP_FLOW_MAP, DeepFlowModel, RejectsMalformedMlp) {
+  for (int const numDofs : {-1, ColliderJacDofs::kMaxDoFs + 1}) {
+    Error error;
+    auto const flow = LoadDeepFlow("unused", 1_r, {}, numDofs, error);
+    EXPECT_EQ(flow, nullptr);
+    EXPECT_NOT_OK(error);
+    EXPECT_NE(error.ToString().find("outside the supported range"), std::string::npos)
+        << error.ToString();
+  }
+  ExpectInvalidDeepFlowModel({{0, 4, 5, 4}, {0, 3, 4, 3}}, 2, "indices must be unique");
+  ExpectInvalidDeepFlowModel({{1, 3, 5, 3}}, 2, "indices must be contiguous");
+  ExpectInvalidDeepFlowModel({{0, 3, 5, 2}}, 2, "bias size must match");
+  ExpectInvalidDeepFlowModel({{0, 4, 5, 4}, {1, 3, 6, 3}}, 2, "layer dimensions are incompatible");
+  ExpectInvalidDeepFlowModel({{0, 3, 4, 3}}, 2, "input dimension must equal");
+  ExpectInvalidDeepFlowModel({{0, 4, 5, 4}}, 2, "output dimension must equal");
+  ExpectInvalidDeepFlowModel({{0, 3, 5, 3, false}}, 2, "activation group is required");
 }

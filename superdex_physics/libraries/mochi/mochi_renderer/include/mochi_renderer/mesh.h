@@ -261,9 +261,33 @@ class WireframeMesh : public SceneObject, public IInstanceable {
       bool isClosed = true,
       bool castShadows = false,
       bool isDynamic = false);
+
+  // Like CreateWireframeMesh, but GPU-skinned: the geometry is static (no Update/UpdateGeometry)
+  // and deformation is driven by bone matrices via SetBoneMatrices(). `boneIndices`/`boneWeights`
+  // are per-NODE skin data indexed like `positions` (numNodes * weightsPerVertex entries each).
+  // `weightsPerVertex` must be 1..4 -- 4 influences are what the GPU vertex attributes hold, and
+  // fewer are zero-padded. `boneCount` is the number of bones referenced (<= 255). At
+  // construction the bones are identity, so the mesh shows its rest surface until SetBoneMatrices()
+  // is called.
+  static std::unique_ptr<WireframeMesh> CreateSkinnedWireframeMesh(
+      filament::Engine* engine,
+      mochi::Span<float const> positions,
+      mochi::Span<float const> normals,
+      mochi::Span<int const> indices,
+      mochi::Span<int const> boneIndices,
+      mochi::Span<float const> boneWeights,
+      int weightsPerVertex,
+      int boneCount,
+      std::shared_ptr<MaterialInstance> wireframeMaterial,
+      std::shared_ptr<MaterialInstance> surfaceMaterial,
+      bool isClosed = true);
   ~WireframeMesh() override;
 
   void SetColor(filament::math::float4 color);
+  // Update the skinning bone matrices (renderable-local) for a skinned wireframe (created via
+  // CreateSkinnedWireframeMesh). No-op for a non-skinned mesh. Applies to the primary renderable
+  // and all live instances.
+  void SetBoneMatrices(mochi::Span<filament::math::mat4f const> bones);
   bool UpdateGeometry(
       mochi::Span<float const> positions,
       mochi::Span<float const> normals,
@@ -293,6 +317,21 @@ class WireframeMesh : public SceneObject, public IInstanceable {
       bool castShadows,
       bool isDynamic);
 
+  // Skinned constructor: static geometry with BONE_INDICES/BONE_WEIGHTS attributes and GPU
+  // skinning.
+  WireframeMesh(
+      filament::Engine* engine,
+      mochi::Span<float const> positions,
+      mochi::Span<float const> normals,
+      mochi::Span<int const> indices,
+      mochi::Span<int const> boneIndices,
+      mochi::Span<float const> boneWeights,
+      int weightsPerVertex,
+      int boneCount,
+      std::shared_ptr<MaterialInstance> wireframeMaterial,
+      std::shared_ptr<MaterialInstance> surfaceMaterial,
+      bool isClosed);
+
  private:
   friend class WireframeMeshInstance;
   size_t _vertexCount = 0;
@@ -309,6 +348,15 @@ class WireframeMesh : public SceneObject, public IInstanceable {
   bool _castShadows = false;
   // When dynamic, geometry can be replaced via UpdateGeometry and renderables use DYNAMIC type.
   bool _isDynamic = false;
+  // Non-zero for a GPU-skinned wireframe (created via CreateSkinnedWireframeMesh); number of bones
+  // allocated on the renderable via RenderableManager::Builder::skinning().
+  size_t _boneCount = 0;
+  // Per-bone rest-pose sub-AABB (object space): the bounds of only the vertices influenced by that
+  // bone. SetBoneMatrices unions each bone's transform of ITS sub-box (not the whole mesh box) to
+  // build a tight posed AABB. A whole-box-per-bone union over-bounds badly and drags the scene
+  // floor far below the mesh (the floor takes the lowest AABB point). An unused bone's box is
+  // marked invalid with halfExtent.x < 0 and is skipped. Empty for non-skinned wireframes.
+  std::vector<filament::Box> _boneRestBoxes;
   // Entities of all live instances, so UpdateGeometry can re-point them at new buffers.
   std::vector<utils::Entity> _instanceEntities;
 

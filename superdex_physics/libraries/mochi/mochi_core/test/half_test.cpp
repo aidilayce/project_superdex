@@ -43,7 +43,17 @@ static_assert(std::is_convertible_v<Half, double>);
 static_assert(!std::is_convertible_v<float, Half>);
 static_assert(!std::is_convertible_v<double, Half>);
 static_assert(!std::is_convertible_v<int, Half>);
+
+// Preserve the traits required by DynamicArray's fast paths.
 static_assert(std::is_trivially_copyable_v<Half>);
+static_assert(std::is_trivially_move_constructible_v<Half>);
+static_assert(std::is_trivially_move_assignable_v<Half>);
+static_assert(std::is_trivially_destructible_v<Half>);
+
+static_assert(std::is_assignable_v<Half&, Half const&>);
+static_assert(!std::is_assignable_v<Half, Half const&>);
+static_assert(std::is_assignable_v<Half&, Half&&>);
+static_assert(!std::is_assignable_v<Half, Half&&>);
 
 static uint16_t GetBits(Half h) {
   return ReinterpretCast<uint16_t>(h);

@@ -19,7 +19,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "superdex"
 version = "1.0.0"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.12"
 authors = [{name = "SuperDex Team"}]
 description = "Umbrella package for the public SuperDex Python distributions"
 readme = "README.md"
@@ -39,6 +39,8 @@ classifiers = [
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering",
 ]
 
@@ -49,12 +51,5 @@ Repository = "https://github.com/facebookresearch/project_superdex"
 [tool.setuptools]
 py-modules = []
 
-[tool.uv.sources]
-superdex-lab = {workspace = true}
-superdex-mesh-cli = {workspace = true}
-superdex-physics = {workspace = true}
-superdex-physics-debugger = {workspace = true}
-superdex-physics-fp64 = {workspace = true}
-superdex-robotics = {workspace = true}
-superdex-robotics-fp64 = {workspace = true}
-superdex-studio = {workspace = true}
+[tool.uv]
+managed = false

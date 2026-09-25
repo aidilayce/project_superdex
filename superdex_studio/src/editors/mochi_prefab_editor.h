@@ -268,6 +268,10 @@ class MochiPrefabEditor : public AssetEditor {
     std::vector<std::string> actorNames;
     std::vector<mochi::TransformRT> actorTransforms;
     std::vector<SoftMeshUpdate> softMeshUpdates;
+    // Per-step skin joint poses (one per skinned articulated actor), applied to each staged skin's
+    // GPU-skinned render model. Each carries the actor's per-link world transforms in nested-link
+    // (== GLB joint) order.
+    std::vector<SkinnedPoseUpdate> skinnedPoseUpdates;
   };
   mochi_renderer::ProducerConsumerBuffer<SimData> _simData;
   // UI state

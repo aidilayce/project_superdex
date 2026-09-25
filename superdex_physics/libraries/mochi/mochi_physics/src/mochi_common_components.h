@@ -59,11 +59,11 @@ struct TagRigidActor {};
 struct TagSoftActor {};
 struct TagShellActor {};
 struct TagRodActor {};
-struct TagDeformableActor {}; // Soft (including soft-skinned), Shell, and Rod actors
+struct TagDeformableActor {}; // Soft (including nested soft), Shell, and Rod actors
 struct TagRomActor {};
 struct TagArticulatedActor {};
 struct TagArticulatedLinkActor {};
-struct TagSoftSkinnedActor {};
+struct TagNestedSoftActor {};
 struct TagBlendedActor {};
 struct TagCompoundActor {};
 struct TagFullyInitialized {}; // Added last when initializing an actor (for reative systems)
@@ -72,15 +72,13 @@ struct TagHasDeepFlowCollider {};
 // Indicates that an actor participates in the point-cloud contact system.
 struct TagUsePointCloudContact {};
 
-// Indicates that a rod actor uses visual mesh contact instead of centerline contact.
-// When present, contact samples are placed on the visual mesh surface (CFemSurfaceDiscretization)
-// rather than along the rod centerline (CFemSegmentDiscretization).
-struct TagUseVisualMeshContact {};
+// Indicates that a deformable actor uses its separately authored embedded contact-skin mesh,
+// rather than its physics discretization, to generate colliding samples.
+struct TagUseDeformableContactSkin {};
 
-// Indicates that an actor's contact samples need a non-trivial Jacobian to back-propagate async
-// forces through skinning/embedding (i.e. the actor produces a CSkinnedContactSnle and is
-// dispatched to AssembleAsyncSkinnedContact). Currently emplaced for articulated actors with
-// skinned contact meshes, soft-skinned actors, and rod actors that use visual-mesh contact.
+// Selects async contact assembly through CSkinnedContactSnle when the sample Jacobian maps through
+// skinning or embedding. Used by skinned articulated, nested-soft, blended, and contact-skinned
+// deformable actors.
 struct TagSkinnedContact {};
 
 // Hides an actor from debug draw systems. Emplaced by DebugDraw::EnableActor.
@@ -189,32 +187,6 @@ struct CRigidBodyInertia : public NoCopy, RigidBodyInertia {
   using RigidBodyInertia::RigidBodyInertia;
 };
 
-// Bounding volume that contains the entire actor at a given time.
-template <TimeStep kStep>
-struct CBoundingVolume : public NoCopy {
-  CBoundingVolume() = default;
-
-  // Construct from AnyShape, Sphere, Obb, etc...
-  template <typename ShapeT>
-  explicit CBoundingVolume(ShapeT&& s)
-    requires(std::is_constructible_v<AnyShape, ShapeT>)
-      : localShape(std::forward<ShapeT>(s)) {}
-
-  // TODO(T225595100): Replace by AnyBoundingVolume.
-  AnyShape localShape; // actor space
-
-  MOCHI_TEMPLATE_BEGIN(mochi::CBoundingVolume, kStep);
-  // CBoundingVolume is captured for deformable actors because it is used to compute the
-  // CConservativeStepBounds for the next step, which in turn affects island formation, and thus
-  // determinism. We could avoid capturing the current bounds if it was recomputed before
-  // UpdateConservativeStepBounds.
-  MOCHI_ATTRIBUTE_IF(
-      kStep == TimeStep::Current || kStep == TimeStep::Previous,
-      CaptureState(ecs::RequiredTag<TagDeformableActor>{}));
-  MOCHI_FIELD(localShape);
-  MOCHI_TEMPLATE_END();
-};
-
 // Every dynamic actor has CConservativeStepBounds. It stores a conservative world-space bounding
 // volume which must be large enough to contain the actor's movement for the current time step,
 // assuming reasonable constraints on acceleration, etc... This information is used to sort actors
@@ -222,15 +194,19 @@ struct CBoundingVolume : public NoCopy {
 struct CConservativeStepBounds : NoCopy {
   Aabb worldAabb;
 
-  // True when the next conservative step-bounds update should apply a one-step relaxation. This is
-  // needed when previous-step history is unavailable or no longer trustworthy, e.g. immediately
-  // after actor creation or after external state changes. Defaults to true so a freshly-created
-  // actor is relaxed on its next step. Captured so save/restore is deterministic.
+  // Maximum Euclidean world-space speed [m/s] of any point represented by the actor's current
+  // bounding volume. This is derived at the beginning of each simulation step.
+  real maxGeometrySpeed = 0_r;
+
+  // True when the next conservative step-bounds update should apply a one-step relaxation, e.g.
+  // immediately after actor creation or an external state change. Defaults to true so a
+  // freshly-created actor gets the relaxation on its first step.
   bool needsNextStepRelaxation = true;
 
   MOCHI_STRUCT_BEGIN(mochi::CConservativeStepBounds);
   MOCHI_ATTRIBUTE(CaptureState);
-  // `worldAabb` is a per-step derived state and intentionally omitted from reflection.
+  // `worldAabb` and `maxGeometrySpeed` are per-step derived state and intentionally omitted from
+  // reflection.
   MOCHI_FIELD(needsNextStepRelaxation);
   MOCHI_STRUCT_END();
 };
@@ -386,10 +362,14 @@ struct IntegrationBundle {
     stages.reserve(kMaxIntegrationStages);
   }
 
-  // Constructor from numDofs only if T is constructible from int
-  explicit IntegrationBundle(int numDofs)
-    requires(std::is_constructible_v<T, int>)
-      : stepStart(numDofs) {
+  // Forward value-specific construction arguments to the step-start state.
+  template <typename... Args>
+  explicit IntegrationBundle(Args&&... args)
+    requires(
+        sizeof...(Args) > 0 && std::is_constructible_v<T, Args...> &&
+        !(sizeof...(Args) == 1 &&
+          (std::is_base_of_v<IntegrationBundle<T>, std::remove_cvref_t<Args>> && ...)))
+      : stepStart(std::forward<Args>(args)...) {
     prevSteps.reserve(kMaxIntegrationSteps);
     stages.reserve(kMaxIntegrationStages);
   }
@@ -407,6 +387,29 @@ struct IntegrationBundle {
   MOCHI_TEMPLATE_END();
 };
 
+// Macros for defining ECS components of numerically-integrated positions/velocities. Invoke them
+// directly in namespace mochi. ValueType must not contain a top-level comma; use a type alias for
+// multi-argument template types.
+#define MOCHI_DEFINE_INTEGRATION_COMPONENT(Component, ValueType)   \
+  struct Component : public IntegrationBundle<ValueType>, NoCopy { \
+    using IntegrationBundle<ValueType>::IntegrationBundle;         \
+                                                                   \
+    MOCHI_STRUCT_BEGIN(mochi::Component);                          \
+    MOCHI_ATTRIBUTE(CaptureState);                                 \
+    MOCHI_BASE_CLASS(IntegrationBundle<ValueType>);                \
+    MOCHI_STRUCT_END();                                            \
+  }
+
+#define MOCHI_DEFINE_INTEGRATION_COMPONENT_TEMPLATE(Component, ValueType, ...) \
+  struct Component : public IntegrationBundle<ValueType>, NoCopy {             \
+    using IntegrationBundle<ValueType>::IntegrationBundle;                     \
+                                                                               \
+    MOCHI_TEMPLATE_BEGIN(mochi::Component, __VA_ARGS__);                       \
+    MOCHI_ATTRIBUTE(CaptureState);                                             \
+    MOCHI_BASE_CLASS(IntegrationBundle<ValueType>);                            \
+    MOCHI_TEMPLATE_END();                                                      \
+  }
+
 // Rigid body state at a given time.
 struct TransformRTContainer {
   TransformRTContainer() = default;
@@ -419,21 +422,20 @@ struct TransformRTContainer {
   MOCHI_STRUCT_END();
 };
 
+/// @brief Component for time integration of rigid body pose.
+MOCHI_DEFINE_INTEGRATION_COMPONENT(CIntegrationRigidStates, TransformRTContainer);
+
 template <TimeStep kStep>
 struct CRigidState : public TransformRTContainer {
   using TransformRTContainer::TransformRTContainer;
   MOCHI_TEMPLATE_BEGIN(mochi::CRigidState, kStep);
-  MOCHI_ATTRIBUTE_IF(kStep == TimeStep::Current, CaptureState);
+  // This component is captured only when it represents true state, which is signaled by the
+  // existence of a corresponding integration component.
+  MOCHI_ATTRIBUTE_IF(
+      kStep == TimeStep::Current,
+      CaptureState(ecs::Included<CIntegrationRigidStates>{}));
   MOCHI_BASE_CLASS(mochi::TransformRTContainer);
   MOCHI_TEMPLATE_END();
-};
-
-/// @brief Component for time integration of rigid body pose.
-struct CIntegrationRigidStates : public IntegrationBundle<TransformRTContainer>, NoCopy {
-  MOCHI_STRUCT_BEGIN(mochi::CIntegrationRigidStates);
-  MOCHI_ATTRIBUTE(CaptureState);
-  MOCHI_BASE_CLASS(IntegrationBundle<TransformRTContainer>);
-  MOCHI_STRUCT_END();
 };
 
 // Traits that define metadata for different vector types that might be part of an
@@ -637,13 +639,9 @@ using CDenseTimeSliceVector = CDenseTimeSlice<
 template <typename Scalar, typename MetadataType, TimeStep kRelTime>
 struct CTimeSlice : public CVectorComponent<Scalar, MetadataType> {
   using BaseType = CVectorComponent<Scalar, MetadataType>;
-  CTimeSlice() = default;
-  explicit CTimeSlice(int numDofs) : BaseType(numDofs) {}
-  explicit CTimeSlice(ColumnVector<Scalar> const& value) : BaseType(value) {}
-  explicit CTimeSlice(ColumnVector<Scalar>&& value) : BaseType(std::move(value)) {}
+  using BaseType::BaseType;
 
   MOCHI_TEMPLATE_BEGIN(mochi::CTimeSlice, Scalar, MetadataType, kRelTime);
-  MOCHI_ATTRIBUTE_IF(kRelTime == TimeStep::Current, CaptureState);
   MOCHI_BASE_CLASS(BaseType);
   MOCHI_TEMPLATE_END()
 };
@@ -669,8 +667,20 @@ struct DisplacementVectorMetadata : public MatrixMetadata<MatrixSemantics::Displ
   MOCHI_BASE_CLASS(BaseType);
   MOCHI_TEMPLATE_END();
 };
+
 template <typename Scalar, TimeStep kRelTime, DisplacementLayer kLayer = DisplacementLayer::Default>
-using CDisplacementSlice = CTimeSlice<Scalar, DisplacementVectorMetadata<kLayer>, kRelTime>;
+struct CDisplacementSlice
+    : public CTimeSlice<Scalar, DisplacementVectorMetadata<kLayer>, kRelTime> {
+  using BaseType = CTimeSlice<Scalar, DisplacementVectorMetadata<kLayer>, kRelTime>;
+  using BaseType::BaseType;
+
+  MOCHI_TEMPLATE_BEGIN(mochi::CDisplacementSlice, Scalar, kRelTime, kLayer);
+  MOCHI_ATTRIBUTE_IF(
+      kRelTime == TimeStep::Current && kLayer == DisplacementLayer::Default,
+      CaptureState);
+  MOCHI_BASE_CLASS(BaseType);
+  MOCHI_TEMPLATE_END()
+};
 
 template <DisplacementLayer kLayer>
 struct VelocityVectorMetadata : public MatrixMetadata<MatrixSemantics::TangentSpaceVector> {
@@ -679,34 +689,36 @@ struct VelocityVectorMetadata : public MatrixMetadata<MatrixSemantics::TangentSp
   MOCHI_BASE_CLASS(BaseType);
   MOCHI_TEMPLATE_END();
 };
-template <typename Scalar, TimeStep kRelTime, DisplacementLayer kLayer = DisplacementLayer::Default>
-using CVelocitySlice = CTimeSlice<Scalar, VelocityVectorMetadata<kLayer>, kRelTime>;
 
-/// @brief Component for time integration of displacement slices.
-using DefaultDisplacementSlice =
-    VectorComponent<real, DisplacementVectorMetadata<DisplacementLayer::Default>>;
-struct CIntegrationDisplacementSlices : public IntegrationBundle<DefaultDisplacementSlice>, NoCopy {
-  using IntegrationBundle<DefaultDisplacementSlice>::IntegrationBundle;
-
-  MOCHI_STRUCT_BEGIN(mochi::CIntegrationDisplacementSlices);
-  MOCHI_ATTRIBUTE(CaptureState);
-  MOCHI_BASE_CLASS(IntegrationBundle<DefaultDisplacementSlice>);
-  MOCHI_STRUCT_END();
-};
-
+template <DisplacementLayer kLayer>
+using VelocityIntegrationValue = VectorComponent<real, VelocityVectorMetadata<kLayer>>;
 /// @brief Component for time integration of velocity slices.
 template <DisplacementLayer kLayer = DisplacementLayer::Default>
-struct CIntegrationVelocitySlices
-    : public IntegrationBundle<VectorComponent<real, VelocityVectorMetadata<kLayer>>>,
-      NoCopy {
-  using BaseClass = IntegrationBundle<VectorComponent<real, VelocityVectorMetadata<kLayer>>>;
-  using BaseClass::BaseClass;
+MOCHI_DEFINE_INTEGRATION_COMPONENT_TEMPLATE(
+    CIntegrationVelocitySlices,
+    VelocityIntegrationValue<kLayer>,
+    kLayer);
 
-  MOCHI_TEMPLATE_BEGIN(mochi::CIntegrationVelocitySlices, kLayer);
-  MOCHI_ATTRIBUTE(CaptureState);
-  MOCHI_BASE_CLASS(BaseClass);
-  MOCHI_TEMPLATE_END();
+template <typename Scalar, TimeStep kRelTime, DisplacementLayer kLayer = DisplacementLayer::Default>
+struct CVelocitySlice : public CTimeSlice<Scalar, VelocityVectorMetadata<kLayer>, kRelTime> {
+  using BaseType = CTimeSlice<Scalar, VelocityVectorMetadata<kLayer>, kRelTime>;
+  using BaseType::BaseType;
+
+  MOCHI_TEMPLATE_BEGIN(mochi::CVelocitySlice, Scalar, kRelTime, kLayer);
+  MOCHI_ATTRIBUTE_IF(
+      kRelTime == TimeStep::Current && kLayer == DisplacementLayer::Default,
+      CaptureState);
+  MOCHI_ATTRIBUTE_IF(
+      kRelTime == TimeStep::Current && kLayer == DisplacementLayer::Skinned,
+      CaptureState(ecs::Included<CIntegrationVelocitySlices<kLayer>>{}));
+  MOCHI_BASE_CLASS(BaseType);
+  MOCHI_TEMPLATE_END()
 };
+
+using DefaultDisplacementSlice =
+    VectorComponent<real, DisplacementVectorMetadata<DisplacementLayer::Default>>;
+/// @brief Component for time integration of displacement slices.
+MOCHI_DEFINE_INTEGRATION_COMPONENT(CIntegrationDisplacementSlices, DefaultDisplacementSlice);
 
 template <typename... Ts>
 struct CVariant {
@@ -778,6 +790,28 @@ struct VectorComponentRef {
 template <TimeStep kStep>
 struct CFinalDisplacementRef : public VectorComponentRef {
   using VectorComponentRef::VectorComponentRef;
+};
+
+// Bounding volume that contains the entire actor. For actors with a deforming surface, this
+// component is scratch state overwritten with bounds for the state being evaluated. For actors with
+// a rigid surface, the actor-local bounds are immutable.
+struct CBoundingVolume : public NoCopy {
+  CBoundingVolume() = default;
+
+  // Construct from AnyShape, Sphere, Obb, etc...
+  template <typename ShapeT>
+  explicit CBoundingVolume(ShapeT&& s)
+    requires(std::is_constructible_v<AnyShape, ShapeT>)
+      : localShape(std::forward<ShapeT>(s)) {}
+
+  // TODO(T225595100): Replace by AnyBoundingVolume.
+  AnyShape localShape; // actor space
+
+  MOCHI_STRUCT_BEGIN(mochi::CBoundingVolume);
+  // Bounds for deforming geometry are captured because they are not recomputed during restore.
+  MOCHI_ATTRIBUTE(CaptureState(ecs::Included<CFinalDisplacementRef<TimeStep::Current>>{}));
+  MOCHI_FIELD(localShape);
+  MOCHI_STRUCT_END();
 };
 
 /// @brief Optional component to store the color used in the debug draw.

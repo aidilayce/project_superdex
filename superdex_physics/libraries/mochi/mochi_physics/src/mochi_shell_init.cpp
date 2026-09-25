@@ -127,7 +127,11 @@ static void EmplaceShellActorDiscretization(
   reg.emplace<CShape>(e, shape);
   reg.emplace<CTriangularMesh>(e, shape->GetMesh());
   reg.emplace<CSimplicialMesh>(e, shape->GetMesh());
-  reg.emplace<CSurfaceMesh>(e, shape->GetMesh());
+  if (shape->GetContactSkin() && shape->GetContactSkinEmbedding()) {
+    reg.emplace<CSurfaceMesh>(e, shape->GetContactSkin(), shape->GetContactSkinEmbedding());
+  } else {
+    reg.emplace<CSurfaceMesh>(e, shape->GetMesh());
+  }
 
   if (shape->GetVisualMesh() && shape->GetVisualEmbedding()) {
     reg.emplace<CVisualMesh>(e, shape->GetVisualMesh(), shape->GetVisualEmbedding());
@@ -144,8 +148,7 @@ static void EmplaceShellActorContact(
     std::shared_ptr<TriangularMeshShape const> shape,
     int numCollidingSamples,
     Error& error) {
-  reg.emplace<CBoundingVolume<TimeStep::Current>>(e, shape->GetMesh()->GetObb());
-  reg.emplace<CBoundingVolume<TimeStep::Previous>>(e, shape->GetMesh()->GetObb());
+  reg.emplace<CBoundingVolume>(e, shape->GetMesh()->GetObb());
 
   ColliderType colliderType = params.colliderType;
   if (colliderType == ColliderType::Auto) {
@@ -191,7 +194,7 @@ static void EmplaceShellShellContact(
   reg.emplace<CCollJacs<CollRole::Collider>>(e);
 
   // Emplace point-cloud collider properties.
-  ValidatePointCloudColliderParams(params.pointCloudCollider, error);
+  ValidatePointCloudColliderParams(params.pointCloudCollider, params.contact, error);
   MOCHI_ERROR_RETURN(error);
   auto& pcComponent = reg.emplace<CPointCloudColliderParams>(e, params.pointCloudCollider);
   pcComponent.integralDim = 2;
@@ -232,6 +235,14 @@ void mochi::InitShellActor(
     Error& error) {
   ValidateContactParams(params.contact, error);
   shell::ValidateShellMaterialParams(params.material, error);
+  MOCHI_ERROR_RETURN(error);
+  auto const& shapeContactSkinMesh = shapePtr->GetContactSkin();
+  auto const& shapeContactSkinEmbedding = shapePtr->GetContactSkinEmbedding();
+  bool const hasUsableContactSkin = shapeContactSkinMesh && shapeContactSkinEmbedding;
+  MOCHI_ERROR_IF(
+      params.useContactSkin && !hasUsableContactSkin,
+      error,
+      "useContactSkin requires a shell shape with triangular contact skin and linear embedding data.");
   MOCHI_ERROR_RETURN(error);
 
   // Identification
@@ -345,23 +356,40 @@ void mochi::InitShellActor(
       femHighSurfDisc->femElements.emplace_back(i, meshCoords, meshConnec);
     }
   }
+  TriangularMesh const& contactMesh = params.useContactSkin ? *shapeContactSkinMesh : actorTriMesh;
   auto const& contactDisc = reg.emplace<CFemSurfaceDiscretization>(
-      e, CFemSurfaceDiscretization::Create(params.contactElementType, actorTriMesh));
+      e, CFemSurfaceDiscretization::Create(params.contactElementType, contactMesh));
   // FIXME: This is a workaround to accommodate the fact that some queries use only the "lite"
   // surface discretization designed for rigid actors. These should be unified behind a single
   // interface, so only one component is added.
   reg.emplace<CFemSurfaceDiscretizationLite>(
-      e, CFemSurfaceDiscretizationLite::Create(params.contactElementType, actorTriMesh));
+      e, CFemSurfaceDiscretizationLite::Create(params.contactElementType, contactMesh));
 
-  // Codimensional contact assembly uses the shell surface triangles as the assembly elements:
-  // L2G has fixed 3-node x 3-DoF stride, matching CFemSurfaceDiscretization. The NBS uses the same
-  // triangle element order, while sparse indices are computed against the actor's full
-  // bending-stencil sparsity.
-  auto const& triConnectivity = actorTriMesh.GetElementConnectivity();
-  auto& contactL2g = reg.emplace<CContactLocal2GlobalMap>(e);
-  contactL2g.InitializeFromElementNodeConnectivity(triConnectivity, kSpaceDim3);
-  reg.emplace<CContactNodalBasedStructure>(
-      e, NodalBasedStructure(GraphFromRangeOfRanges<int, int>(triConnectivity), nbs.GetNToN()));
+  if (params.useContactSkin) {
+    auto& skinningData = reg.emplace<CContactSkinningData>(e);
+    InitializeLinearContactSkinningJacobian(
+        *shapeContactSkinEmbedding,
+        actorTriMesh.GetNumNodes(),
+        shapeContactSkinMesh->GetActiveNodes(),
+        skinningData);
+    auto& deformedNodes = reg.emplace<CDeformedContactSkinNodes>(e);
+    deformedNodes.referencePositions.resize_noinit(
+        kSpaceDim3 * shapeContactSkinMesh->GetNumNodes());
+    shapeContactSkinEmbedding->Update(
+        actorTriMesh.GetNodeCoordinates(),
+        Unflatten<Real3>(MakeSpan(deformedNodes.referencePositions)));
+    deformedNodes.positions.resize(kSpaceDim3 * shapeContactSkinMesh->GetNumActiveNodes());
+    reg.emplace<TagUseDeformableContactSkin>(e);
+    reg.emplace<CSkinnedContactSnle>(e);
+    reg.emplace<TagSkinnedContact>(e);
+  } else {
+    // Direct contact assembles shell triangles into the actor's body matrix.
+    auto const& triConnectivity = actorTriMesh.GetElementConnectivity();
+    auto& contactL2g = reg.emplace<CContactLocal2GlobalMap>(e);
+    contactL2g.InitializeFromElementNodeConnectivity(triConnectivity, kSpaceDim3);
+    reg.emplace<CContactNodalBasedStructure>(
+        e, NodalBasedStructure(GraphFromRangeOfRanges<int, int>(triConnectivity), nbs.GetNToN()));
+  }
 
   int const numCollidingSamples = contactDisc.GetNumQuadPoints();
   EmplaceShellActorContact(reg, e, params, shapePtr, numCollidingSamples, error);
@@ -369,6 +397,8 @@ void mochi::InitShellActor(
 
   EmplaceShellShellContact(reg, e, params, actorTriMesh, error);
   MOCHI_ERROR_RETURN(error);
+
+  ecs::InvokeOnEntity(shell::UpdateBounds<TimeStep::Current>, reg, e);
 
   // Bounds used for collision detection.
   reg.emplace<CConservativeStepBounds>(e);

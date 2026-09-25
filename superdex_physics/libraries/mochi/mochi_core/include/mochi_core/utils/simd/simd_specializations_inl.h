@@ -33,31 +33,28 @@ namespace mochi {
 /***********************************************************************************************
   Boilerplate code shared by all Simd<T, N> specializations
 */
-#define MOCHI_NATIVE_SIMD_IMPL_BOILERPLATE(T, N, NativeT)           \
-  NativeT raw;                                                      \
-  static constexpr int kSize = N;                                   \
-  static constexpr bool kIsSupported = true;                        \
-  static constexpr bool kIsComposite = false;                       \
-  static constexpr bool kIsEmulated = false;                        \
-  using NativeType = NativeT;                                       \
-  using Scalar = T;                                                 \
-  MOCHI_FORCE_INLINE Simd() = default;                              \
-  MOCHI_FORCE_INLINE ~Simd() = default;                             \
-  MOCHI_FORCE_INLINE Simd(Simd const& rhs) = default;               \
-  MOCHI_FORCE_INLINE Simd(Simd&& rhs) = default;                    \
-  MOCHI_FORCE_INLINE Simd(NativeType rhs) : raw(rhs) {};            \
-  MOCHI_FORCE_INLINE static constexpr size_t size() {               \
-    return kSize;                                                   \
-  }                                                                 \
-  MOCHI_FORCE_INLINE Simd& operator=(Simd const& rhs) = default;    \
-  MOCHI_FORCE_INLINE Simd& operator=(Simd&& rhs) = default;         \
-  template <class U, MOCHI_REQUIRES_NON_BOOL_SCALAR(U, Scalar)>     \
-  MOCHI_FORCE_INLINE Simd& operator=(U rhs) {                       \
-    raw = Simd{rhs}.raw;                                            \
-    return *this;                                                   \
-  }                                                                 \
-  [[nodiscard]] MOCHI_FORCE_INLINE Scalar operator[](int i) const { \
-    return Get(*this, i); /* return by value */                     \
+#define MOCHI_NATIVE_SIMD_IMPL_BOILERPLATE(T, N, NativeT)        \
+  NativeT raw;                                                   \
+  static constexpr int kSize = N;                                \
+  static constexpr bool kIsSupported = true;                     \
+  static constexpr bool kIsComposite = false;                    \
+  static constexpr bool kIsEmulated = false;                     \
+  using NativeType = NativeT;                                    \
+  using Scalar = T;                                              \
+  MOCHI_FORCE_INLINE Simd() = default;                           \
+  MOCHI_FORCE_INLINE ~Simd() = default;                          \
+  MOCHI_FORCE_INLINE Simd(Simd const& rhs) = default;            \
+  MOCHI_FORCE_INLINE Simd(Simd&& rhs) = default;                 \
+  MOCHI_FORCE_INLINE Simd(NativeType rhs) : raw(rhs) {};         \
+  MOCHI_FORCE_INLINE static constexpr size_t size() {            \
+    return kSize;                                                \
+  }                                                              \
+  MOCHI_FORCE_INLINE Simd& operator=(Simd const& rhs) = default; \
+  MOCHI_FORCE_INLINE Simd& operator=(Simd&& rhs) = default;      \
+  template <class U, MOCHI_REQUIRES_NON_BOOL_SCALAR(U, Scalar)>  \
+  MOCHI_FORCE_INLINE Simd& operator=(U rhs) {                    \
+    raw = Simd{rhs}.raw;                                         \
+    return *this;                                                \
   }
 
 } // namespace mochi

@@ -97,12 +97,20 @@ class PhysicsDragController {
 
  private:
   // Fills _nameToHandle with every grabbable actor (dynamic rigid bodies and articulated links) by
-  // name. Runs once on the sim thread at construction.
+  // name, and _skinNameToArticulated with each skinned articulated actor by its skin staged name
+  // (skins are not links, so they resolve to the nearest link at grab time). Runs once on the sim
+  // thread at construction.
   void BuildActorMap(mochi::Scene* scene);
 
-  // Maps a picked object to a grabbable actor (object -> stage name -> handle), or nullopt. UI
+  // Maps a picked object to its staged actor name (object -> StagedActor.name), or nullopt. UI
   // thread.
-  std::optional<mochi::ActorHandle> ResolveActor(mochi_renderer::SceneObject* object) const;
+  std::optional<std::string> ResolveStagedName(mochi_renderer::SceneObject* object) const;
+
+  // Returns the nested link of @p articulated whose world AABB is closest to @p point (the grab
+  // point), or a null handle if none. Used to resolve a skin pick to a concrete draggable link. Sim
+  // thread (reads live link AABBs).
+  static mochi::ActorHandle
+  NearestLinkToPoint(mochi::Scene* scene, mochi::ActorHandle articulated, mochi::Real3 point);
 
   // Per-step reconciliation of the UI-requested drag state with the live constraint. Sim thread.
   void OnPreStep(mochi::StepInfo const& info);
@@ -120,6 +128,10 @@ class PhysicsDragController {
   mochi::CoordinateSpaceConverter _rendererToEditor;
   // name -> grabbable ActorHandle; built once at construction, read-only (and UI-readable) after.
   std::unordered_map<std::string, mochi::ActorHandle> _nameToHandle;
+  // skin staged name -> owning articulated ActorHandle, for skinned articulated actors. The skin is
+  // folded into the compound entity (not a link), so a skin pick resolves to this articulated actor
+  // and then to its nearest link at grab time. Built once at construction, read-only after.
+  std::unordered_map<std::string, mochi::ActorHandle> _skinNameToArticulated;
 
   // --- UI-thread-only state ---
   bool _dragging = false;
@@ -134,6 +146,11 @@ class PhysicsDragController {
   bool _active = false;
   mochi::ActorHandle _actor = {};
   mochi::Real3 _targetMochi = {};
+  // Set when _actor is a skinned articulated actor picked via its skin: OnPreStep resolves it to
+  // the nearest nested link (using _skinGrabPoint) on the first step of the grab, rewrites _actor
+  // to that link, and clears this flag so the normal rigid path takes over.
+  bool _pendingSkinResolve = false;
+  mochi::Real3 _skinGrabPoint = {};
   // Bumped on every BeginDrag, and on a settings change that invalidates a live grab, so the sim
   // side rebuilds the constraint.
   uint64_t _generation = 0;

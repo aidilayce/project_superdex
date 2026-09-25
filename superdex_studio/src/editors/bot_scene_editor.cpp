@@ -22,6 +22,7 @@
 #include "assets/bot_asset.h"
 #include "assets/bot_scene_asset.h"
 #include "assets/mochi_prefab_asset.h"
+#include "rendering/measure_tool.h"
 #include "ui/imgui_widgets.h"
 
 #include <superdex_robotics/utils/bot_utils.h>
@@ -139,6 +140,12 @@ void BotSceneEditor::Initialize() {
   BindSceneObjectDragHooks(*_viewport, _dragController);
   // Bind the stage to the viewport's render scene and stage the bot scene.
   _stage.BindRenderScene(_viewport->GetRenderScene());
+  // Measure tool (Ctrl+M): pick vertices/faces on the staged actors' render and collision meshes.
+  BindSceneStageMeasureTargets(
+      *_viewport,
+      _stage,
+      [this] { return _mochiScene.IsSimulating(); },
+      [this] { return _mochiScene.IsPaused(); });
   RestageBotScene();
   _viewport->FocusCameraOnScene();
 }
@@ -219,6 +226,7 @@ std::vector<AssetEditor::WindowDeclaration> BotSceneEditor::GetDefaultWindows() 
   return {
       {"Bot Scene Info", true, Dock::SidePanelTop},
       {"Physics Settings", false, Dock::SidePanelBottom},
+      MeasureWindowDeclaration(),
       {"Scene Stage Debug", false, Dock::SidePanelTop, true}};
 }
 
@@ -240,6 +248,7 @@ void BotSceneEditor::ShowAuxiliaryWindows() {
   if (bool& open = _studio->GetWindowVisible("Physics Settings")) {
     _mochiScene.ShowPhysicsSettingsWindow("Physics Settings", &open, GetAssetSceneOverrides());
   }
+  ShowMeasureWindow();
   if (bool& open = _studio->GetWindowVisible("Scene Stage Debug")) {
     auto* simNames = _mochiScene.IsSimulating() ? &_simData.GetConsumerData().actorNames : nullptr;
     _stage.ShowSceneStageWindow("Scene Stage Debug", &open, simNames);
@@ -248,6 +257,13 @@ void BotSceneEditor::ShowAuxiliaryWindows() {
 
 bool BotSceneEditor::CanUndoRedo() const {
   return !_mochiScene.IsSimulating();
+}
+
+void BotSceneEditor::ShowMainMenuItems() {
+  if (ImGui::BeginMenu("Bot Scene")) {
+    _mochiScene.ShowExportSimulationPrefabMenuItem(_sceneAsset->GetName());
+    ImGui::EndMenu();
+  }
 }
 
 void BotSceneEditor::ApplySceneViewSettings(mochi_renderer::SceneViewSettings const& viewSettings) {

@@ -54,6 +54,7 @@ class BotSceneEditor : public AssetEditor {
   static std::vector<WindowDeclaration> GetDefaultWindows();
   std::vector<WindowDeclaration> GetAuxiliaryWindows() const override;
   void ShowAuxiliaryWindows() override;
+  void ShowMainMenuItems() override;
   bool CanUndoRedo() const override;
   void ApplySceneViewSettings(mochi_renderer::SceneViewSettings const& viewSettings) override;
   void OnAppSettingsChanged(AppSettings const& settings) override;

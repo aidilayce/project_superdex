@@ -144,7 +144,7 @@ MOCHI_FORCE_INLINE Real3 InterpolateColliderPointPosition(
 // Wrapper for the colliding-side discretization in a point-cloud collision pair. For shell this
 // is CFemSurfaceDiscretization; for rods it is CFemSegmentDiscretization. Both types share a
 // duck-typed Visit() interface, so we dispatch through std::variant of pointers. Currently
-// consumed only on the self-contact path of @ref ComputePointsToColliderPoints.
+// consumed only on the self-contact path of @ref ComputePointCloudContactIndices.
 struct CollidingPointCloudDiscretization {
   std::variant<CFemSurfaceDiscretization const*, CFemSegmentDiscretization const*> value;
 
@@ -161,9 +161,10 @@ struct CollidingPointCloudDiscretization {
         value);
   }
 };
-/// Validates shared @ref experimental::PointCloudColliderParams fields.
+/// Validates point-cloud collider parameters and their combined contact range.
 void ValidatePointCloudColliderParams(
     experimental::PointCloudColliderParams const& params,
+    ContactParams const& contactParams,
     Error& error);
 
 SpatialHashTable CreateSpatialHashTable(
@@ -171,7 +172,11 @@ SpatialHashTable CreateSpatialHashTable(
     CColliderPointCloudDiscretization const& colliderDiscretization,
     real contactThreshold);
 
-DynamicArray<DynamicArray<int>> ComputePointsToColliderPoints(
+// Finds point pairs within the contact range. Corresponding output entries identify each pair, and
+// outPointIndices is nondecreasing. For self-contact, collidingPointSampleIndices maps input points
+// to reference samples; an empty span denotes identity. Pairs within the self-contact exclusion
+// distance in the reference configuration are omitted.
+void ComputePointCloudContactIndices(
     experimental::PointCloudColliderParams const& pointCloudColliderParams,
     CColliderPointCloudDiscretization const& colliderDiscretization,
     ColumnVectorView<real const> colliderDisplacements,
@@ -182,17 +187,11 @@ DynamicArray<DynamicArray<int>> ComputePointsToColliderPoints(
     Span<int const> collidingPointSampleIndices,
     TransformRT const& worldFromColliding,
     SpatialHashTable const& colliderHashTable,
-    real contactThreshold);
-
-// Allocates and populates pointIndices and colliderPointIndices based on the secondary culling
-// done by ComputePointsToColliderPoints.
-void ComputePointCloudContactIndices(
-    DynamicArray<DynamicArray<int>> const& pointsToColliderPoints,
+    real contactThreshold,
     DynamicArray<int>& outPointIndices,
     DynamicArray<int>& outColliderPointIndices);
 
-// Populates the remaining ContactDetectionResult fields using point indices of the form provided
-// by ComputePointCloudContactIndices.
+// Computes contact fields for corresponding entries in pointIndices and colliderPointIndices.
 void ComputePointCloudContactDetectionFields(
     CColliderPointCloudDiscretization const& colliderDiscretization,
     ColumnVectorView<real const> colliderDisplacements,

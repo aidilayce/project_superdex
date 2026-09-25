@@ -34,6 +34,8 @@
 #include "mochi_soft_rom_systems.h"
 #include "mochi_soft_skinned.h"
 
+#include <mochi_core/contact/dmap.h>
+#include <mochi_core/geometry/batch_sphere.h>
 #include <mochi_core/geometry/geometry_utils.h>
 #include <mochi_core/geometry/grid_sdf.h>
 #include <mochi_core/memory/filo_allocator.h>
@@ -58,6 +60,99 @@ using namespace mochi;
 using namespace mochi::experimental;
 
 /*************************************************************************************************/
+
+void mochi::InitializeLinearContactSkinningJacobian(
+    LinearMeshEmbedding const& embedding,
+    int numPhysicsNodes,
+    Span<int const> skinNodeIndices,
+    CContactSkinningData& outSkinning) {
+  int const weightsPerNode = static_cast<int>(embedding.GetNumSkinningWeightsPerEntry());
+  Span<int const> const indices = embedding.GetIndices();
+  Span<real const> const weights = embedding.GetWeights();
+  int const numEmbeddedNodes = isize(indices) / weightsPerNode;
+  int const numSkinNodes = skinNodeIndices.empty() ? numEmbeddedNodes : isize(skinNodeIndices);
+
+  DynamicArray<int> rowPointers(numSkinNodes + 1, 0);
+  DynamicArray<int> columnIndices;
+  DynamicArray<Real3> values;
+  columnIndices.reserve(indices.size() * kSpaceDim3);
+  values.reserve(indices.size() * kSpaceDim3);
+
+  DynamicArray<std::pair<int, real>> influences;
+  influences.reserve(weightsPerNode);
+  for (int skinNode = 0; skinNode < numSkinNodes; ++skinNode) {
+    int const embeddedNode = skinNodeIndices.empty() ? skinNode : skinNodeIndices[skinNode];
+    MOCHI_ASSERT_VERBOSE(embeddedNode >= 0 && embeddedNode < numEmbeddedNodes);
+    influences.clear();
+    for (int influence = 0; influence < weightsPerNode; ++influence) {
+      int const embeddingIndex = embeddedNode * weightsPerNode + influence;
+      int const physicsNode = indices[embeddingIndex];
+      MOCHI_ASSERT_VERBOSE(
+          physicsNode >= 0 && physicsNode < numPhysicsNodes,
+          "Contact-skin embedding index is outside the physics mesh.");
+      influences.emplace_back(physicsNode, weights[embeddingIndex]);
+    }
+    std::sort(influences.begin(), influences.end());
+
+    for (int influence = 0; influence < isize(influences);) {
+      int const physicsNode = influences[influence].first;
+      real combinedWeight = 0_r;
+      do {
+        combinedWeight += influences[influence].second;
+        ++influence;
+      } while (influence < isize(influences) && influences[influence].first == physicsNode);
+
+      for (int component = 0; component < kSpaceDim3; ++component) {
+        columnIndices.push_back(kSpaceDim3 * physicsNode + component);
+        Real3 derivative{};
+        derivative[component] = combinedWeight;
+        values.push_back(derivative);
+      }
+    }
+    rowPointers[skinNode + 1] = isize(columnIndices);
+  }
+
+  outSkinning.jacobian = SparseMatrix<Real3>(
+      numPhysicsNodes * kSpaceDim3,
+      std::move(rowPointers),
+      std::move(columnIndices),
+      std::move(values));
+}
+
+void mochi::SetupContactSkinCollidingJacobians(
+    ecs::RequiredTag<TagUseDeformableContactSkin>,
+    CFemSurfaceDiscretization const& surfaceDisc,
+    CRootTransform const& transform,
+    CDofOffset const& dofOffset,
+    CContactSkinningData const& skinningData,
+    CCollJacs<CollRole::Colliding>& outJacobians) {
+  MOCHI_PROFILE_SCOPE();
+
+  MOCHI_FILO_STACK_ALLOCATOR(tempAlloc, 256 * sizeof(JacData*));
+  auto const allJacs = outJacobians.GetPtrsNonEmpty(&tempAlloc);
+  if (allJacs.empty()) {
+    return;
+  }
+
+  auto const skinJacView = AsConstView(skinningData.jacobian);
+  dmap::DMapSparseSkinning sparseSkinning(0, dofOffset.dofsOffset, skinJacView);
+  dmap::DMapRTConst dtransform(transform.worldFromLocal);
+
+  surfaceDisc.Visit([&](auto const& discImpl) {
+    using DiscT = std::decay_t<decltype(discImpl)>;
+    using DQuad = dmap::DMapQuad<typename DiscT::ElementT>;
+
+    ParallelForEach("SetupContactSkinCollidingJacobians Range", allJacs, 1, [&](JacData* jac) {
+      DQuad dquad(discImpl.femElements, jac->query->jacColliderFromWorld);
+      dmap::DMap<DQuad, dmap::DMapRTConst, dmap::DMapSparseSkinning> dmap(
+          &dquad, &dtransform, &sparseSkinning);
+
+      auto& jacs = *jac->jacs;
+      dmap.GetJac(jac->query->sampleIndices, jacs);
+      jacs[0].CompressIndices();
+    });
+  });
+}
 
 // Maximum number of consecutive sample points to process together by ContactDResXYZ utilities if
 // they all affect the same DoFs. Processing them together reduces the number of write operations
@@ -84,7 +179,7 @@ template <ContactType kContactType, TimeStep kTimeStep, bool kAllowFarSdfQuery =
 static void UpdatePotentialColliders(
     entt::registry const& reg,
     entt::entity colliding,
-    CBoundingVolume<TimeStep::Current> const& boundsColliding,
+    CBoundingVolume const& boundsColliding,
     CConservativePotentialColliders<kContactType> const& conservativeColliders,
     CContactLayer const& layerColliding,
     CIslandMemberInfo const& islandColliding,
@@ -116,7 +211,7 @@ static void UpdatePotentialColliders(
            CColliderInfo const,
            CContactLayer const,
            CIslandMemberInfo const*,
-           CBoundingVolumeFor<kContactType, kTimeStep> const,
+           CBoundingVolume const,
            CContactParams const>()
         .each([&](entt::entity collider,
                   auto const& colliderInfo,
@@ -172,11 +267,7 @@ static void UpdatePotentialColliders(
       auto collider = potentialColliderData.entity;
 
       MOCHI_ASSERT_VERBOSE(
-          (reg.all_of<
-              CBoundingVolumeFor<kContactType, kTimeStep>,
-              CColliderInfo,
-              CContactParams,
-              CRootTransform>(collider)),
+          (reg.all_of<CBoundingVolume, CColliderInfo, CContactParams, CRootTransform>(collider)),
           "Entities listed by CConservativePotentialColliders should have all of these components.");
 
       // Colliders must not have type "none".
@@ -189,8 +280,7 @@ static void UpdatePotentialColliders(
 
       // Get the world-space bounds of the collider and pad it by the penalty threshold distance
       // We use the penalty threshold of the collider, which is the one used for contact
-      auto const& boundsCollider =
-          reg.get<CBoundingVolumeFor<kContactType, kTimeStep> const>(collider);
+      auto const& boundsCollider = reg.get<CBoundingVolume const>(collider);
 
       auto const& paramsCollider = reg.get<CContactParams const>(collider);
       AnyShape worldBoundsCollider = TransformShape(
@@ -411,9 +501,8 @@ static void QueryPointCloud(
       return CollidingPointCloudDiscretization{segDisc};
     }();
 
-    // Compute sample-to-collider-point connectivity (query collider hash table at colliding sample
-    // positions)
-    DynamicArray<DynamicArray<int>> samplesToColliderPoints = ComputePointsToColliderPoints(
+    // Find colliding-point/collider-point pairs within the contact range.
+    ComputePointCloudContactIndices(
         params,
         colliderDiscretization,
         colliderDisplacements,
@@ -424,11 +513,9 @@ static void QueryPointCloud(
         indicesToQuery,
         worldFromColliding,
         colliderSpatialHashTable,
-        contactParams.GetPenaltyThresholdDist(true));
-
-    // Compute sampleIndices and colliderFeatureIndices from the collision detection output.
-    ComputePointCloudContactIndices(
-        samplesToColliderPoints, outIndices, *outColliderFeatureIndices);
+        contactParams.GetPenaltyThresholdDist(true),
+        outIndices,
+        *outColliderFeatureIndices);
   } else {
     // Skip the secondary culling based on the spatial hash table, fill in outIndices with an
     // identity mapping, and use colliderFeatureIndices as input (computed in a previous pass).
@@ -439,12 +526,11 @@ static void QueryPointCloud(
     std::iota(outIndices.begin(), outIndices.end(), 0);
   }
 
-  // Populate the remaining ContactDetectionResult fields using the computed indices.
-  // Pass the appropriate colliderFeatureIndices: if output was computed, use it; otherwise use
-  // input.
   Span<int const> colliderPointIndicesToUse = outColliderFeatureIndices != nullptr
       ? MakeConstSpan(*outColliderFeatureIndices)
       : colliderFeatureIndices;
+
+  // Compute contact fields for the selected point pairs.
   ComputePointCloudContactDetectionFields(
       colliderDiscretization,
       colliderDisplacements,
@@ -795,8 +881,8 @@ template <TimeStep kTimeStep, bool kAllowFarSdfQuery>
   // introduced in the future.
   if (contactSamples.bsh && IsFinite(farSdfDistance)) {
     MOCHI_ASSERT(
-        outPositionsToQuery.size() == contactSamples.bsh->NumSamplePoints(),
-        "Inconsistent number of sample points. Is the BVH tree up-to-date with the number of active sample points?");
+        outPositionsToQuery.size() == contactSamples.bsh->GetNumSamples(),
+        "Inconsistent number of sample points. Is the SphereTree tree up-to-date with the number of active sample points?");
 
     AnyBoundingVolume colliderBvForCulling;
     bool shouldCull = true;
@@ -854,7 +940,12 @@ template <TimeStep kTimeStep, bool kAllowFarSdfQuery>
     // Perform culling.
     if (shouldCull) {
       culledIndicesBuffer.reserve(outPositionsToQuery.size());
-      contactSamples.bsh->FindIntersectingSamples(colliderBvForCulling, culledIndicesBuffer);
+
+      std::visit(
+          [&](auto const& bv) {
+            contactSamples.bsh->FindIntersectingSamples(bv, culledIndicesBuffer);
+          },
+          colliderBvForCulling);
 
       // Store culled positions and make 'outPositionsToQuery' point to them.
       culledPositionsBuffer.reserve(culledIndicesBuffer.size());
@@ -881,7 +972,7 @@ template <TimeStep kTimeStep, bool kAllowFarSdfQuery>
 /**
  * @brief Performs collision detection between a colliding entity (collidee) and a collider entity.
  *
- * @tparam kTimeStepCollider   Time slice for collider data (Current, StageStart or Previous)
+ * @tparam kTimeStep           Time slice for collider data (Current or StageStart)
  * @tparam kAllowFarSdfQuery   Allow SDF queries beyond the normal contact culling distance
  * @param reg                  Registry
  * @param colliding            Colliding entity (collidee)
@@ -895,7 +986,7 @@ template <TimeStep kTimeStep, bool kAllowFarSdfQuery>
  * @note If collision partitions are specified, the results are distributed across the partitions
  * based on which partition each sample point belongs to.
  */
-template <ContactType kContactType, TimeStep kTimeStep, bool kAllowFarSdfQuery>
+template <TimeStep kTimeStep, bool kAllowFarSdfQuery>
 static void DetectCollisionsWithSingleCollider(
     entt::registry const& reg,
     entt::entity colliding,
@@ -908,15 +999,9 @@ static void DetectCollisionsWithSingleCollider(
 
   entt::entity collider = colliderData.entity;
 
-  // Contact must be sync for dynamic colliders and async for static colliders
-  [[maybe_unused]] bool constexpr kIsSync = kContactType == ContactType::Sync;
-  MOCHI_ASSERT_VERBOSE(
-      kIsSync != reg.all_of<TagStaticActor>(collider), "Wrong contact type for this collider");
-
   auto const& colliderContactParams = reg.get<CContactParams const>(collider);
   auto const& worldFromCollider = GetRootTransform<kTimeStep>(reg, collider);
-  auto const& colliderBounds =
-      reg.get<CBoundingVolumeFor<kContactType, kTimeStep> const>(collider).localShape;
+  auto const& colliderBounds = reg.get<CBoundingVolume const>(collider).localShape;
   AnyShape expandedColliderBounds =
       ExpandColliderBoundsForContact(colliderBounds, colliderContactParams);
   auto collidingFromCollider = Invert(worldFromColliding) * worldFromCollider;
@@ -1144,7 +1229,7 @@ template <ContactType kContactType, TimeStep kTimeStep, bool kAllowFarSdfQuery =
 static void DetectCollisionsWithPotentialColliders(
     entt::registry const& reg,
     entt::entity colliding,
-    CBoundingVolume<TimeStep::Current> const& boundingVolume,
+    CBoundingVolume const& boundingVolume,
     CContactSamples<TimeStep::Current> const& samplesCurrent,
     CContactSamples<TimeStep::StageStart> const* samplesStageStartDeformable,
     CContactPartitions const* collisionPartitions,
@@ -1172,6 +1257,12 @@ static void DetectCollisionsWithPotentialColliders(
   resultPerCollider.reserve(numPotentialColliders);
 
   for (int c = 0; c < numPotentialColliders; ++c) {
+    // Contact must be sync for dynamic colliders and async for static colliders.
+    MOCHI_ASSERT_VERBOSE(
+        (kContactType == ContactType::Sync) !=
+            reg.all_of<TagStaticActor>(potentialColliders[c].entity),
+        "Wrong contact type for this collider");
+
     // Find active collisions corresponding to this potential collider.
     int idx = 0;
     for (; idx < isize(outActiveCollisions); idx += numPartitions) {
@@ -1223,7 +1314,7 @@ static void DetectCollisionsWithPotentialColliders(
   ParallelForN("DetectCollisionsWithSingleCollider", numPotentialColliders, 1, [&](int c) {
     // Perform collision detection with this collider. Even if there are multiple partitions, write
     // the full result on the container for the first partition.
-    DetectCollisionsWithSingleCollider<kContactType, kTimeStep, kAllowFarSdfQuery>(
+    DetectCollisionsWithSingleCollider<kTimeStep, kAllowFarSdfQuery>(
         reg,
         colliding,
         samplesTimeStep,
@@ -1235,9 +1326,8 @@ static void DetectCollisionsWithPotentialColliders(
       // For queries in TimeStep::Current and not kAllowFarSdfQuery, complete with data from
       // TimeStep::StageStart. Again, write the full result on the container for the first
       // partition.
-      // WARNING: This code path cannot access CBoundingVolume<TimeStep::Current> or
-      // CSpatialHashTable, because they are currently updated with TimeStep::Current, not
-      // TimeStep::StageStart.
+      // WARNING: Do not use CBoundingVolume or CSpatialHashTable here. They contain
+      // TimeStep::Current data, while this path evaluates TimeStep::StageStart.
       if (!resultPerCollider[c][0]->sampleIndices.empty()) {
         EvalStageStartContactWithSingleCollider(
             reg,
@@ -1302,20 +1392,23 @@ static void InitCollidingJacobians(
       &deformable::SetupCollidingJacobians<TagShellActor, CFemSurfaceDiscretization>,
       reg,
       descendants.shellActors);
-  // Centerline Jacobians for rods without visual mesh contact.
+  // Centerline Jacobians for rods without surface contact.
   ecs::ScheduleInvokeForEach(
       sem,
       "deformable::SetupCollidingJacobians<TagRodActor, CFemSegmentDiscretization>",
       &deformable::SetupCollidingJacobians<TagRodActor, CFemSegmentDiscretization>,
       reg,
       descendants.rodActors);
-  // Jacobians for rods with visual mesh contact.
-  ecs::ScheduleInvokeForEach(
-      sem,
-      "rod::SetupRodVisualMeshCollidingJacobians",
-      &rod::SetupRodVisualMeshCollidingJacobians,
-      reg,
-      descendants.rodActors);
+  std::array<Span<entt::entity const>, 2> contactSkinActors = {
+      descendants.shellActors, descendants.rodActors};
+  for (auto actors : contactSkinActors) {
+    ecs::ScheduleInvokeForEach(
+        sem,
+        "SetupContactSkinCollidingJacobians",
+        &SetupContactSkinCollidingJacobians,
+        reg,
+        actors);
+  }
   ecs::ScheduleInvokeForEach(
       sem,
       "rom::SetupCollidingJacobians",
@@ -1339,7 +1432,7 @@ static void InitCollidingJacobians(
       "skinned::SetupCollidingJacobians",
       &skinned::SetupCollidingJacobians,
       reg,
-      descendants.skinnedActors);
+      descendants.nestedSoftActors);
   ecs::ScheduleInvokeForEach(
       sem,
       "blended::SetupCollidingJacobians<CFemBoundaryDiscretization>",
@@ -1370,7 +1463,7 @@ static void InitCollidingJacobians(
 }
 
 // This system is only used for far SDF queries.
-MOCHI_API void mochi::FarSdfCollisionDetection(
+void mochi::FarSdfCollisionDetection(
     ecs::Included<TagUseContact, CRequiresFarSdfEvaluation>,
     entt::registry& reg,
     entt::entity e) {
@@ -2309,7 +2402,7 @@ static void AssembleCollisionResponseRange(
   }
 }
 
-MOCHI_API void mochi::AssembleCollisionResponse(
+void mochi::AssembleCollisionResponse(
     ContactAssemblyReg reg,
     entt::entity colliding,
     entt::entity collider,
@@ -2339,9 +2432,13 @@ MOCHI_API void mochi::AssembleCollisionResponse(
       isSyncRigid);
 }
 
-template <bool kUpdateOnlyActiveFaces, typename DiscretizationType, int kNumFields>
-void mochi::UpdateCollisionSamplePositionsImpl(
-    ColumnVectorView<real const> currSol,
+template <
+    bool kUpdateOnlyActiveFaces,
+    bool kNodeValuesArePositions,
+    typename DiscretizationType,
+    int kNumFields>
+static void UpdateCollisionSamplePositionsImplInternal(
+    ColumnVectorView<real const> nodeValues,
     DiscretizationType const& boundaryDiscrVariant,
     CActiveBoundaryFaces const* activeBoundaryFaces,
     ContactSamples& outSamples) {
@@ -2386,10 +2483,9 @@ void mochi::UpdateCollisionSamplePositionsImpl(
       auto const dofIndices = kNumFields * element.Nodes();
       auto const localNodes = element.LocalNodes();
 
-      // Load the displacements for each node
-      NdArray<Vec4r, kNumNodesPerFace> nodeDisplacements;
+      NdArray<Vec4r, kNumNodesPerFace> elementNodeValues;
       for (int i = 0; i < kNumNodesPerFace; ++i) {
-        nodeDisplacements[i] = Load<3, Vec4r>(&currSol[dofIndices[i]]);
+        elementNodeValues[i] = Load<3, Vec4r>(&nodeValues[dofIndices[i]]);
       }
 
       // Store the element quad weights scaled (if applicable) by the boundary face weight.
@@ -2398,14 +2494,13 @@ void mochi::UpdateCollisionSamplePositionsImpl(
           kUpdateOnlyActiveFaces ? activeBoundaryFaces->ViewWeights()[boundaryFaceIdx] : 1_r;
       auto const quadWeights = element.quadWeights * thisFaceWeight;
 
-      // Interpolate displacement field at quadrature points.
+      // Interpolate the node values at quadrature points.
       for (int q = 0; q < kNumQuadsPerFace; ++q) {
         int const sampleIndex = boundaryFaceOffset + q;
 
-        // Compute local position
-        Vec4r samplePos = ToSimd(element.mapEvaluated[q]);
+        Vec4r samplePos = kNodeValuesArePositions ? Vec4r{} : ToSimd(element.mapEvaluated[q]);
         for (int i = 0; i < kNumNodesPerFace; ++i) {
-          samplePos += nodeDisplacements[i] * element.basisEvaluated[q][localNodes[i]];
+          samplePos += elementNodeValues[i] * element.basisEvaluated[q][localNodes[i]];
         }
         outSamples.positions[sampleIndex] = ToReal3(samplePos);
 
@@ -2420,28 +2515,56 @@ void mochi::UpdateCollisionSamplePositionsImpl(
     });
   });
 
-  if (outSamples.bsh) {
-    outSamples.bsh->Refit();
-  }
+  MOCHI_ASSERT(
+      !outSamples.bsh.has_value(),
+      "SphereOctTree does not currently support refitting. You could rebuild the tree from scratch, "
+      "or add a Refit method, but the best solution probably involves a different data structure "
+      "(e.g. an AABB tree).");
 }
 
-#define MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES_IMPL(activeFaces, discretization, numFields)     \
-  template void mochi::UpdateCollisionSamplePositionsImpl<activeFaces, discretization, numFields>( \
-      ColumnVectorView<real const>,                                                                \
-      discretization const&,                                                                       \
-      CActiveBoundaryFaces const*,                                                                 \
-      ContactSamples&);
-MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES_IMPL(false, CFemBoundaryDiscretization, 3);
-MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES_IMPL(true, CFemBoundaryDiscretization, 3);
-MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES_IMPL(false, CFemSurfaceDiscretization, 3);
-MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES_IMPL(true, CFemSurfaceDiscretization, 3);
-MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES_IMPL(false, CFemSegmentDiscretization, 4);
-MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES_IMPL(true, CFemSegmentDiscretization, 4);
-#undef MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES_IMPL
+template <bool kUpdateOnlyActiveFaces, typename DiscretizationType, int kNumFields>
+void mochi::UpdateCollisionSamplePositionsFromNodeDisplacements(
+    ColumnVectorView<real const> currSol,
+    DiscretizationType const& boundaryDiscrVariant,
+    CActiveBoundaryFaces const* activeBoundaryFaces,
+    ContactSamples& outSamples) {
+  UpdateCollisionSamplePositionsImplInternal<
+      kUpdateOnlyActiveFaces,
+      /*kNodeValuesArePositions=*/false,
+      DiscretizationType,
+      kNumFields>(currSol, boundaryDiscrVariant, activeBoundaryFaces, outSamples);
+}
+
+#define MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES(activeFaces, discretization, numFields)          \
+  template void mochi::                                                                            \
+      UpdateCollisionSamplePositionsFromNodeDisplacements<activeFaces, discretization, numFields>( \
+          ColumnVectorView<real const>,                                                            \
+          discretization const&,                                                                   \
+          CActiveBoundaryFaces const*,                                                             \
+          ContactSamples&);
+MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES(false, CFemBoundaryDiscretization, 3);
+MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES(true, CFemBoundaryDiscretization, 3);
+MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES(false, CFemSurfaceDiscretization, 3);
+MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES(true, CFemSurfaceDiscretization, 3);
+MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES(false, CFemSegmentDiscretization, 4);
+MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES(true, CFemSegmentDiscretization, 4);
+#undef MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES
+
+void mochi::UpdateCollisionSamplePositionsFromNodePositions(
+    Span<Real3 const> nodePositions,
+    CFemSurfaceDiscretization const& surfaceDiscretization,
+    ContactSamples& outSamples) {
+  UpdateCollisionSamplePositionsImplInternal<
+      /*kUpdateOnlyActiveFaces=*/false,
+      /*kNodeValuesArePositions=*/true,
+      CFemSurfaceDiscretization,
+      kSpaceDim3>(AsConstView(Flatten(nodePositions)), surfaceDiscretization, nullptr, outSamples);
+}
 
 template <typename DiscretizationType, TimeStep kTimeStep, int kNumFields>
-MOCHI_API void mochi::UpdateCollisionSamplePositions(
+void mochi::UpdateCollisionSamplePositions(
     ecs::RequiredTag<TagUseContact>,
+    ecs::Excluded<TagUseDeformableContactSkin>,
     CFinalDisplacementRef<kTimeStep> const& currSol,
     DiscretizationType const& discretization,
     CActiveBoundaryFaces const* activeBoundaryFaces,
@@ -2449,25 +2572,25 @@ MOCHI_API void mochi::UpdateCollisionSamplePositions(
   MOCHI_PROFILE_SCOPE();
 
   if (!activeBoundaryFaces) {
-    UpdateCollisionSamplePositionsImpl</*kUpdateOnlyActiveFaces*/ false,
-                                       DiscretizationType,
-                                       kNumFields>(
-        currSol.value, discretization, activeBoundaryFaces, outSamples);
+    UpdateCollisionSamplePositionsFromNodeDisplacements<
+        /*kUpdateOnlyActiveFaces*/ false,
+        DiscretizationType,
+        kNumFields>(currSol.value, discretization, activeBoundaryFaces, outSamples);
   } else {
-    UpdateCollisionSamplePositionsImpl</*kUpdateOnlyActiveFaces*/ true,
-                                       DiscretizationType,
-                                       kNumFields>(
-        currSol.value, discretization, activeBoundaryFaces, outSamples);
+    UpdateCollisionSamplePositionsFromNodeDisplacements<
+        /*kUpdateOnlyActiveFaces*/ true,
+        DiscretizationType,
+        kNumFields>(currSol.value, discretization, activeBoundaryFaces, outSamples);
   }
 }
 
-#define MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES(dicretization, timeStep, numFields) \
-  template MOCHI_API void                                                             \
-  mochi::UpdateCollisionSamplePositions<dicretization, timeStep, numFields>(          \
-      ecs::RequiredTag<TagUseContact>,                                                \
-      CFinalDisplacementRef<timeStep> const&,                                         \
-      dicretization const&,                                                           \
-      CActiveBoundaryFaces const*,                                                    \
+#define MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES(dicretization, timeStep, numFields)      \
+  template void mochi::UpdateCollisionSamplePositions<dicretization, timeStep, numFields>( \
+      ecs::RequiredTag<TagUseContact>,                                                     \
+      ecs::Excluded<TagUseDeformableContactSkin>,                                          \
+      CFinalDisplacementRef<timeStep> const&,                                              \
+      dicretization const&,                                                                \
+      CActiveBoundaryFaces const*,                                                         \
       CContactSamples<timeStep>&);
 MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES(CFemBoundaryDiscretization, TimeStep::Current, 3);
 MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES(CFemBoundaryDiscretization, TimeStep::StageStart, 3);
@@ -2479,7 +2602,7 @@ MOCHI_SPECIALIZE_UPDATE_COLLISION_SAMPLES(CFemSegmentDiscretization, TimeStep::S
 
 void mochi::UpdateQuerySdfSurface(
     CSdfCollider const& collider,
-    CBoundingVolume<TimeStep::Current> const& bounds,
+    CBoundingVolume const& bounds,
     CQuerySdfSurface& outQuery) {
   MOCHI_PROFILE_SCOPE();
 
@@ -3057,7 +3180,7 @@ static void AppendBlockIndices(DynamicArray<int>& outBlockIndices, Span<int cons
   } else {
     int outIdx = isize(outBlockIndices);
     int prevIdx = -1;
-    outBlockIndices.resize(outBlockIndices.size() + fullIndices.size()); // worst case
+    outBlockIndices.resize_noinit(outBlockIndices.size() + fullIndices.size()); // worst case
     for (int i : fullIndices) {
       int bi = i / kBlockSize;
       if (bi != prevIdx) {
@@ -3197,6 +3320,7 @@ static void AssembleAllSyncContactPairs(
   bool const assemObj = (outObj != nullptr);
   bool const assemRes = !outRes.empty();
   bool const assemDRes = (GetNumValues(outDRes) > 0);
+  bool const needJacs = assemRes || assemDRes;
 
   // This function can be VERY expensive. The interaction matrix can have many thousands of non-zero
   // values, even for a single object contacting the hands. Most of the cost comes from from adding
@@ -3221,18 +3345,34 @@ static void AssembleAllSyncContactPairs(
     double costPerPoint = 0;
   };
 
-  // Start by enumerating the contacting pairs and their ContactJacs
+  // Count contact pairs before reserving storage for them and their ContactJacs.
+  int numContactPairs = 0;
+  for (auto entity0 : actors) {
+    if (auto const* activeCollisions =
+            regActiveColls.try_get<CActiveCollisions<ContactType::Sync, TimeStep::Current>>(
+                entity0)) {
+      numContactPairs += isize(*activeCollisions);
+    }
+  }
+  if (numContactPairs == 0) {
+    return; // No contact
+  }
+
   DynamicArray<ContactJac const*> allJacs;
   DynamicArray<ContactPair> allPairs(filoAllocator);
-  allJacs.reserve(2 * JacData::kMaxJacs * isize(actors) * isize(actors)); // worst case
-  allPairs.reserve(isize(actors) * isize(actors)); // worst case
+  if (needJacs) {
+    allJacs.reserve(2 * JacData::kMaxJacs * numContactPairs);
+  }
+  allPairs.reserve(numContactPairs);
+
+  // Enumerate the contacting pairs and their ContactJacs.
   for (auto entity0 : actors) {
     if (auto* activeCollisions =
             regActiveColls.try_get<CActiveCollisions<ContactType::Sync, TimeStep::Current>>(
                 entity0)) {
       for (auto& coll : *activeCollisions) {
         int firstJac = isize(allJacs);
-        if (assemRes || assemDRes) {
+        if (needJacs) {
           // For each contact pair, colliding Jacobian(s) must go before collider Jacobian(s).
           entt::entity entity1 = coll.colliderEntity;
           reg.get<CCollJacs<CollRole::Colliding> const>(entity0)[coll.collidingJacId].GetJacs(
@@ -3247,9 +3387,6 @@ static void AssembleAllSyncContactPairs(
         allPairs.emplace_back(pair);
       }
     }
-  }
-  if (allPairs.empty()) {
-    return; // No contact
   }
 
   // Estimate the cost of each pair.
@@ -3318,6 +3455,13 @@ static void AssembleAllSyncContactPairs(
   for (auto& cp : allPairs) {
     Interval<int> pointsRemaining{0, isize(cp.collision->collisionResult.sampleIndices)};
     while (pointsRemaining.Size() > 0) {
+      if (isize(taskWork) == kMaxTasks) {
+        // Floating-point rounding can leave work after kMaxTasks. Do not grow taskWork:
+        // DynamicArray::GrowCapacity allocates a new FILO block, then tries to free the previous
+        // block. FiloAllocator only permits freeing the most recently allocated block.
+        taskWork.back().pairWork.emplace_back(&cp, pointsRemaining);
+        break;
+      }
       if (taskWork.empty() || taskWork.back().cost >= targetCostPerTask) {
         taskWork.push_back({});
       }
@@ -3625,57 +3769,64 @@ void mochi::AssembleAsyncSkinnedContact(
 
   // Skip if there are no contacts at all
   bool hasContact = false;
+  bool hasContactWithDofs = false;
   for (auto const& coll : activeCollisions) {
     if (!coll.collisionResult.Empty()) {
       hasContact = true;
-      break;
+      hasContactWithDofs |= collJacs[coll.collidingJacId].HasSolverDoFs();
     }
   }
-  if (!hasContact) {
-    outContactSnle.useInSolver = false;
+  outContactSnle.useInSolver = hasContactWithDofs;
+  bool const needForces = params.assemRes && queryActiveContacts;
+  if (!hasContact || (!hasContactWithDofs && !needForces)) {
     return;
   }
 
-  // Set up the output SNLE
-  outContactSnle.residuals.resize(1);
-  outContactSnle.dresiduals.resize(1);
-  auto& outContactResidual = outContactSnle.residuals[0].second;
-  auto& outContactDResidual = outContactSnle.dresiduals[0].matrix;
+  // Set up the output SNLE if needed
+  if (hasContactWithDofs) {
+    outContactSnle.residuals.resize(1);
+    outContactSnle.dresiduals.resize(1);
+    auto& outContactResidual = outContactSnle.residuals[0].second;
+    auto& outContactDResidual = outContactSnle.dresiduals[0].matrix;
 
-  if (params.assemRes) {
-    // TODO: Skinned contact should assemble directly into this entity's reduced CActorSnle, or to
-    // another residual/dresidual of the same size. For now, it produces an interactionResidual
-    // and interactionMatrix for the island's SNLE problem, so they need to be the size of the
-    // island.
-    auto const& islandDofInfo = reg.get<CIslandDofInfo>(islandMember.island);
+    if (params.assemRes) {
+      // TODO: Skinned contact should assemble directly into this entity's reduced CActorSnle, or
+      // to another residual/dresidual of the same size. For now, it produces an
+      // interactionResidual and interactionMatrix for the island's SNLE problem, so they need to
+      // be the size of the island.
+      auto const& islandDofInfo = reg.get<CIslandDofInfo>(islandMember.island);
 
-    // Resize the contact residual if necessary
-    if (outContactResidual.size() != islandDofInfo.dofsSize) {
-      outContactResidual.Reset(islandDofInfo.dofsSize);
+      // Resize the contact residual if necessary
+      if (outContactResidual.size() != islandDofInfo.dofsSize) {
+        outContactResidual.Reset(islandDofInfo.dofsSize);
+      }
     }
-  }
 
-  if (params.assemDRes) {
-    // Compute sparsity based on the DOFs that are actually affected by explicit contact.
-    if (useBlockSparse3x3) {
-      outContactDResidual = BlockSparseMatrix<real, 3>{
-          MakeContactGraph<3, ContactType::Async>(reg, MakeSingletonConstSpan(e))};
-    } else {
-      outContactDResidual = SparseMatrix<real>{
-          MakeContactGraph<1, ContactType::Async>(reg, MakeSingletonConstSpan(e))};
+    if (params.assemDRes) {
+      // Compute sparsity based on the DOFs that are actually affected by explicit contact.
+      if (useBlockSparse3x3) {
+        outContactDResidual = BlockSparseMatrix<real, 3>{
+            MakeContactGraph<3, ContactType::Async>(reg, MakeSingletonConstSpan(e))};
+      } else {
+        outContactDResidual = SparseMatrix<real>{
+            MakeContactGraph<1, ContactType::Async>(reg, MakeSingletonConstSpan(e))};
+      }
+      MOCHI_ASSERT(
+          GetNumValues(outContactDResidual) > 0,
+          "If there was no async contact with this actor, then we shouldn't have gotten this far.");
     }
-    MOCHI_ASSERT(
-        GetNumValues(outContactDResidual) > 0,
-        "If there was no async contact with this actor, then we shouldn't have gotten this far.");
-  }
 
-  outContactSnle.SetZero(params);
-  outContactSnle.useInSolver = true;
+    outContactSnle.SetZero(params);
+  }
 
   // Configure common containers for all colliders
   MOCHI_FILO_STACK_ALLOCATOR(filoAllocator, 64 * 1024);
   CollisionResponseResult response(&filoAllocator);
-  response.Reserve(activeCollisions, params.assemObj, params.assemRes, params.assemDRes);
+  response.Reserve(
+      activeCollisions,
+      params.assemObj && hasContactWithDofs,
+      params.assemRes,
+      params.assemDRes && hasContactWithDofs);
   DynamicArray<ContactJac const*> jacs(&filoAllocator);
   jacs.reserve(JacData::kMaxJacs);
   ContactEvalConfig config{
@@ -3691,39 +3842,58 @@ void mochi::AssembleAsyncSkinnedContact(
 
   // Traverse colliding entities and assemble to outContactSnle
   for (auto& coll : activeCollisions) {
+    if (coll.collisionResult.Empty()) {
+      continue;
+    }
+
+    auto const& jacData = collJacs[coll.collidingJacId];
+    bool const collisionHasStateDofs = jacData.HasSolverDoFs();
+    bool const evaluateRes = params.assemRes && (collisionHasStateDofs || queryActiveContacts);
+    if (!collisionHasStateDofs && !evaluateRes) {
+      continue;
+    }
+
     // Compute collision response
     auto const& query = coll.collisionResult;
     int const numPoints = isize(query.sampleIndices);
-    response.ResizeNoInit(numPoints, params.assemObj, params.assemRes, params.assemDRes);
+    response.ResizeNoInit(
+        numPoints,
+        params.assemObj && collisionHasStateDofs,
+        evaluateRes,
+        params.assemDRes && collisionHasStateDofs);
     auto contactParams = GetContactPairParams(reg, e, coll.colliderEntity);
     ComputeCollisionResponse<GradTarget::Current>(
         query,
         contactParams,
         config,
         intState.dtStage,
-        params.assemObj,
-        params.assemRes,
-        params.assemDRes,
+        params.assemObj && collisionHasStateDofs,
+        evaluateRes,
+        params.assemDRes && collisionHasStateDofs,
         response);
 
-    // Get contact Jacobians
-    jacs.clear();
-    collJacs[coll.collidingJacId].GetJacs(jacs);
+    if (collisionHasStateDofs) {
+      // Get contact Jacobians
+      jacs.clear();
+      jacData.GetJacs(jacs);
 
-    // Perform assembly.
-    AssembleCollisionResponse(
-        reg,
-        e,
-        coll.colliderEntity,
-        query,
-        response,
-        samples.weights,
-        jacs,
-        &filoAllocator,
-        params.assemObj ? &outContactSnle.objective : nullptr,
-        params.assemRes ? AsView(outContactResidual) : ColumnVectorView<real>{},
-        params.assemDRes ? AsView(outContactDResidual) : AnyMatrixView<real>{},
-        /*isSyncRigid*/ false);
+      // Perform assembly.
+      auto& outContactResidual = outContactSnle.residuals[0].second;
+      auto& outContactDResidual = outContactSnle.dresiduals[0].matrix;
+      AssembleCollisionResponse(
+          reg,
+          e,
+          coll.colliderEntity,
+          query,
+          response,
+          samples.weights,
+          jacs,
+          &filoAllocator,
+          params.assemObj ? &outContactSnle.objective : nullptr,
+          params.assemRes ? AsView(outContactResidual) : ColumnVectorView<real>{},
+          params.assemDRes ? AsView(outContactDResidual) : AnyMatrixView<real>{},
+          /*isSyncRigid*/ false);
+    }
 
     // Store the forces in case they are needed for a later contact point query
     if (params.assemRes && queryActiveContacts) {
@@ -3734,22 +3904,14 @@ void mochi::AssembleAsyncSkinnedContact(
 
 Aabb mochi::ExpandConservativeBoundsWithContactPadding(
     Aabb bounds,
-    ecs::PartialRegistry<
-        CContactParams const,
-        CRequiresFarSdfEvaluation const,
-        CPointCloudColliderParams const> reg,
+    ecs::PartialRegistry<CContactParams const, CRequiresFarSdfEvaluation const> reg,
     entt::entity e) {
   auto const* contactParams = reg.try_get<CContactParams const>(e);
   real farSdfDistance = GetFarSdfEvaluationDistance<true>(reg, e);
 
-  // Pad with: (1) contact params (for colliders), (2) point-cloud collider radius (for
-  // point-cloud colliders such as shell/rods), and (3) far-SDF distance (for collidees).
+  // Point-cloud collider radii are already included in the actors' local bounding volumes.
   if (contactParams) {
     bounds = ExpandColliderBoundsForContact(bounds, *contactParams);
-  }
-
-  if (auto const* pcParams = reg.try_get<CPointCloudColliderParams const>(e)) {
-    bounds = ExpandShape(bounds, pcParams->radius);
   }
 
   return ExpandShape(bounds, farSdfDistance);
@@ -3775,7 +3937,7 @@ void mochi::CheckConservativeStepBounds(entt::registry const& reg, entt::entity 
   if (csb) {
     // Any actor with CConservativeStepBounds should also have these:
     auto const& root = reg.get<CRootTransform const>(e);
-    auto const& bounds = reg.get<CBoundingVolume<TimeStep::Current>>(e);
+    auto const& bounds = reg.get<CBoundingVolume>(e);
 
     // Compute the current world bounds
     Aabb worldAabb = GetAabb(TransformShape(root.worldFromLocal, bounds.localShape));
@@ -3877,9 +4039,12 @@ void InitializeOnce(entt::registry& reg) {
   ecs::RegisterComponent<CColliderInfo>(reg);
   ecs::RegisterComponent<CCollJacs<CollRole::Collider>>(reg);
   ecs::RegisterComponent<CCollJacs<CollRole::Colliding>>(reg);
+  ecs::RegisterComponent<CContactPairParamsOverrideTable>(reg);
   ecs::RegisterComponent<CContactPartitions>(reg);
   ecs::RegisterComponent<CContactSamples<TimeStep::Current>>(reg);
   ecs::RegisterComponent<CContactSamples<TimeStep::StageStart>>(reg);
+  ecs::RegisterComponent<CContactSkinningData>(reg);
+  ecs::RegisterComponent<CDeformedContactSkinNodes>(reg);
   ecs::RegisterComponent<CContactCorrespondence<ContactType::Async>>(reg);
   ecs::RegisterComponent<CContactCorrespondence<ContactType::Sync>>(reg);
   ecs::RegisterComponent<CMeshCollider>(reg);
@@ -3899,6 +4064,7 @@ void InitializeOnce(entt::registry& reg) {
 
   // Global Context
   reg.set<CContactFilterTable>();
+  reg.set<CContactPairParamsOverrideTable>();
   auto& data = reg.set<CTempPotentialColliderData>();
   int constexpr kReserveSize = 128; // Reserve memory for a modest number of actors up front
   data.staticColliders.reserve(kReserveSize);
@@ -3936,14 +4102,13 @@ void mochi::contact::UpdateConservativePotentialColliders(entt::registry& reg) {
 
   // Find all static colliders
   // TODO: These rarely change. We could cache this information and update it incrementally.
-  for (auto&& [e, colliderInfo, root, bounds, contactParams] :
-       reg.view<
-              TagStaticActor,
-              CColliderInfo const,
-              CRootTransform const,
-              CBoundingVolume<TimeStep::Previous> const,
-              CContactParams const>()
-           .each()) {
+  for (auto&& [e, colliderInfo, root, bounds, contactParams] : reg.view<
+                                                                      TagStaticActor,
+                                                                      CColliderInfo const,
+                                                                      CRootTransform const,
+                                                                      CBoundingVolume const,
+                                                                      CContactParams const>()
+                                                                   .each()) {
     if (colliderInfo.type != ColliderType::None) {
       staticColliders.push_back(e);
       staticBounds.push_back(ExpandColliderBoundsForContact(
@@ -4036,15 +4201,17 @@ void mochi::contact::UpdateConservativePotentialColliders(entt::registry& reg) {
         // with each other (including themselves)
         reg.view<TagUsePointCloudContact const, CConservativeStepBounds const>().each(
             [&](entt::entity colliderEntity, CConservativeStepBounds const& colliderStepBounds) {
-              auto const& colliderLayer = reg.get<CContactLayer>(colliderEntity);
               // Skip self-collisions if indicated by the point-cloud collider parameters.
               bool const isSelfContact = (colliderEntity == collidingEntity);
               if (isSelfContact && !collidingPointCloudColliderParams.selfContact) {
                 return;
               }
+              if (!HasOverlap(collidingStepBounds.worldAabb, colliderStepBounds.worldAabb)) {
+                return;
+              }
+              auto const& colliderLayer = reg.get<CContactLayer>(colliderEntity);
               if (contactTable.IsContactEnabled(
-                      collidingEntity, colliderEntity, collidingLayer.id, colliderLayer.id) &&
-                  HasOverlap(collidingStepBounds.worldAabb, colliderStepBounds.worldAabb)) {
+                      collidingEntity, colliderEntity, collidingLayer.id, colliderLayer.id)) {
                 potentialColliders.emplace_back(colliderEntity);
               }
             });
@@ -4078,10 +4245,16 @@ void mochi::UpdateStageStartDataPipeline(
   }
   ecs::ScheduleInvokeForEach(
       sem,
-      "rod::UpdateRodVisualMeshContactPositions<TimeStep::StageStart>",
-      rod::UpdateRodVisualMeshContactPositions<TimeStep::StageStart>,
+      "rod::UpdateSurfaceContactPositions<TimeStep::StageStart>",
+      rod::UpdateSurfaceContactPositions<TimeStep::StageStart>,
       reg,
       descendants.rodActors);
+  ecs::ScheduleInvokeForEach(
+      sem,
+      "shell::UpdateContactSkinPositions<TimeStep::StageStart>",
+      shell::UpdateContactSkinPositions<TimeStep::StageStart>,
+      reg,
+      descendants.shellActors);
   // Update stage-start contact samples of shell and compound actors (with a tri-mesh skin).
   std::array<Span<entt::entity const>, 2> shellAndCompoundActors = {
       descendants.shellActors, descendants.compoundActors};
@@ -4106,9 +4279,7 @@ void mochi::UpdateStageStartDataPipeline(
 }
 
 template <TimeStep kTimeStep>
-MOCHI_API void mochi::CollisionDetectionPipeline(
-    entt::registry& reg,
-    CIslandDescendants const& descendants) {
+void mochi::CollisionDetectionPipeline(entt::registry& reg, CIslandDescendants const& descendants) {
   MOCHI_PROFILE_SCOPE();
   TaskSemaphore sem;
 
@@ -4135,13 +4306,13 @@ MOCHI_API void mochi::CollisionDetectionPipeline(
         descendants.compoundActors);
     ecs::ScheduleInvokeForEach(
         sem, "shell::UpdateBounds", &shell::UpdateBounds<kTimeStep>, reg, descendants.shellActors);
-    // Schedule visual mesh bounds first, then centerline bounds.
-    // ECS component matching ensures rod actors with TagUseVisualMeshContact match
-    // UpdateBoundsVisualMesh; those without match UpdateBounds.
+    // Schedule contact-skin bounds first, then centerline bounds.
+    // ECS component matching ensures rod actors with TagUseDeformableContactSkin match
+    // UpdateSurfaceContactBounds; those without match UpdateBounds.
     ecs::ScheduleInvokeForEach(
         sem,
-        "rod::UpdateBoundsVisualMesh",
-        &rod::UpdateBoundsVisualMesh<kTimeStep>,
+        "rod::UpdateSurfaceContactBounds",
+        &rod::UpdateSurfaceContactBounds<kTimeStep>,
         reg,
         descendants.rodActors);
     ecs::ScheduleInvokeForEach(
@@ -4224,10 +4395,15 @@ MOCHI_API void mochi::CollisionDetectionPipeline(
           Schedule(sem, "AsyncCollisionAndResponse", [&, e]() { asyncCollisionAndResponse(e); });
           syncCollisionAndResponse(e); // Do the work on this thread
         });
-      } else if (ecs::CanInvokeOnEntity(
-                     rod::UpdateRodVisualMeshContactPositions<kTimeStep>, reg, e)) {
-        Schedule(sem, "rod::UpdateRodVisualMeshContactPositions", [&, e, sem]() {
-          ecs::InvokeOnEntity(rod::UpdateRodVisualMeshContactPositions<kTimeStep>, reg, e);
+      } else if (ecs::CanInvokeOnEntity(rod::UpdateSurfaceContactPositions<kTimeStep>, reg, e)) {
+        Schedule(sem, "rod::UpdateSurfaceContactPositions", [&, e, sem]() {
+          ecs::InvokeOnEntity(rod::UpdateSurfaceContactPositions<kTimeStep>, reg, e);
+          Schedule(sem, "AsyncCollisionAndResponse", [&, e]() { asyncCollisionAndResponse(e); });
+          syncCollisionAndResponse(e);
+        });
+      } else if (ecs::CanInvokeOnEntity(shell::UpdateContactSkinSamples<kTimeStep>, reg, e)) {
+        Schedule(sem, "shell::UpdateContactSkinSamples", [&, e, sem]() {
+          ecs::InvokeOnEntity(shell::UpdateContactSkinSamples<kTimeStep>, reg, e);
           Schedule(sem, "AsyncCollisionAndResponse", [&, e]() { asyncCollisionAndResponse(e); });
           syncCollisionAndResponse(e);
         });
@@ -4276,7 +4452,7 @@ MOCHI_API void mochi::CollisionDetectionPipeline(
   sem.Wait();
 }
 
-MOCHI_API void mochi::ContactJacobiansPipeline(
+void mochi::ContactJacobiansPipeline(
     entt::registry& reg,
     GradTarget gradTarget,
     CIslandDescendants const& descendants,
@@ -4311,11 +4487,11 @@ MOCHI_API void mochi::ContactJacobiansPipeline(
 }
 
 // Explicit instantiations for CollisionDetectionPipeline
-template MOCHI_API void mochi::CollisionDetectionPipeline<TimeStep::Current>(
+template void mochi::CollisionDetectionPipeline<TimeStep::Current>(
     entt::registry& reg,
     CIslandDescendants const& descendants);
 
-template MOCHI_API void mochi::CollisionDetectionPipeline<TimeStep::StageStart>(
+template void mochi::CollisionDetectionPipeline<TimeStep::StageStart>(
     entt::registry& reg,
     CIslandDescendants const& descendants);
 

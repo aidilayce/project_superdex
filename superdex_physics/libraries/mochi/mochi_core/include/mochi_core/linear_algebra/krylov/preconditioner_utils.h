@@ -120,6 +120,17 @@ std::function<void(CudaVectorView<T> const& x, CudaVectorView<T> Px)> CreateCuda
   }
 }
 
+/// @brief Whether the matrix dimension is compatible with the block size of the preconditioner
+/// type.
+template <int kPrecBlockSize, typename MatrixType>
+[[nodiscard]] bool PreconditionerBlockSizeIsCompatible(
+    MatrixType const& A,
+    PreconditionerType const& preconType) {
+  bool const isBlockPreconditioner = (preconType == PreconditionerType::BlockJacobi) ||
+      (preconType == PreconditionerType::BlockSSOR) || (preconType == PreconditionerType::AMG);
+  return !isBlockPreconditioner || (GetNumRows(A) % kPrecBlockSize == 0);
+}
+
 template <typename T, int kPrecBlockSize, typename MatrixType>
 std::unique_ptr<Preconditioner<T>> CreatePreconditioner(
     MatrixType const& A,
@@ -129,9 +140,7 @@ std::unique_ptr<Preconditioner<T>> CreatePreconditioner(
     return std::make_unique<krylov::IdentityPrec<T>>(A);
   }
 
-  if (((preconType == PreconditionerType::BlockJacobi) ||
-       (preconType == PreconditionerType::BlockSSOR) || (preconType == PreconditionerType::AMG)) &&
-      (GetNumRows(A) % kPrecBlockSize != 0)) {
+  if (!PreconditionerBlockSizeIsCompatible<kPrecBlockSize>(A, preconType)) {
     MOCHI_LOG_WARNING_ONCE(
         "The requested preconditioner block size (%i) is incompatible with the matrix dimension (%i). No preconditioner will be used.",
         kPrecBlockSize,
@@ -174,7 +183,7 @@ std::unique_ptr<Preconditioner<T>> CreatePreconditioner(
     }
   } else if constexpr (IsIslandOperators<MatrixType>) {
     if (preconType == PreconditionerType::PerActor) {
-      return std::make_unique<PerActorPrec<T>>(std::move(A.MakePerActorPrec()));
+      return std::make_unique<PerActorPrec<T>>(A.MakePerActorPreconditionerEntries());
     } else {
       MOCHI_ASSERT(
           !PreconditionerStoresInputView(preconType),
@@ -214,7 +223,9 @@ template <typename T, int kPrecBlockSize, typename MatrixType>
     }
   };
 
-  if (!outPrec) {
+  // An incompatible block size must go through 'CreatePreconditioner', which falls back to no
+  // preconditioner.
+  if (!outPrec || !PreconditionerBlockSizeIsCompatible<kPrecBlockSize>(A, preconType)) {
     return false;
   } else if (preconType == PreconditionerType::None) {
     // Early exit to avoid expensive work, e.g. condensing to full global matrix.

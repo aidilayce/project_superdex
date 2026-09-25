@@ -27,6 +27,7 @@
 #include <mochi_core/utils/transform_rt.h>
 #include <mochi_renderer/path.h>
 
+#include <math/mat4.h>
 #include <math/vec3.h>
 
 #include <memory>
@@ -48,6 +49,7 @@ class Scene;
 class SceneObject;
 class Mesh;
 class WireframeMesh;
+class SkinnedModelInstance;
 } // namespace mochi_renderer
 
 namespace superdex::studio {
@@ -102,7 +104,8 @@ struct StagedActor {
   // Name of the staged physics actor. Used for name-based lookup and reuse matching.
   std::string name;
   // Both representations are staged (one hidden); switching StageType toggles their visibility
-  // instead of rebuilding, and the hidden one still contributes to the scene AABB / ground plane.
+  // instead of rebuilding. Only the visible one contributes to the scene AABB / ground plane, so
+  // framing follows what is actually drawn.
   Instance render;
   Instance shape;
   // The currently-visible (selectable) representation's object -- aliases `render.sceneObject` or
@@ -135,10 +138,45 @@ struct StagedActor {
   // to force a rebuild when the topology changes).
   mochi_renderer::Mesh* dynamicSolidMesh = nullptr;
   mochi_renderer::WireframeMesh* dynamicWireframeMesh = nullptr;
+  // Skinned articulated skin only: the shape slot has two interchangeable surfaces. A GPU-skinned
+  // wireframe previews the skin while editing (linear blend skinning off the link transforms);
+  // during simulation Mochi reports the skin's true deformed surface per vertex, which blend
+  // skinning can only approximate, so a dynamic wireframe (`dynamicWireframeMesh`) stands in.
+  // Exactly one is installed in `shape.sceneObject` at a time -- see SetSimSurfaceActive -- so
+  // picking, highlighting, visibility and transforms all keep working through the existing slot,
+  // and only the installed one is ever visible. Both are baked from the same surface by the same
+  // asset, so their vertex ordering matches and a drag grabbed on one hits the same nodes on the
+  // other. `shapeSkinnedSurface` is null for everything except a skinned articulated skin.
+  //
+  // `shapeSimSurface` exists only while simulating: it is built on the first per-vertex update and
+  // torn down on reset. It holds the surface Mochi last reported, which outside a run means the
+  // undeformed rest surface sitting at the skin's bind pose -- and since a hidden object still
+  // contributes to the scene AABB, keeping one around at edit time would drag the ground plane,
+  // the camera framing and the asset thumbnail toward wherever the bind pose happens to be.
+  mochi_renderer::SceneObject* shapeSkinnedSurface = nullptr;
+  mochi_renderer::SceneObject* shapeSimSurface = nullptr;
   MochiModelAsset* softAsset = nullptr;
   int softMeshVertexCount = 0;
   mochi::Real3 softBakeScale = {mochi::real(1), mochi::real(1), mochi::real(1)};
   mochi::TransformRT softShapeTransform = {};
+  // Skinned articulated skin only: the GPU-skinned render model in `render.sceneObject`, kept as a
+  // typed non-owning back-pointer so its skin can be posed each frame (SetBoneMatrices). Null
+  // unless the skin has a skinned render GLB; when set, the render slot is the GLB and the
+  // deforming collision mesh (dynamicSolidMesh) occupies the shape slot instead of the render slot.
+  mochi_renderer::SkinnedModelInstance* skinnedRenderObject = nullptr;
+  // Skinned skin only: the GPU-skinned collision wireframe in `shape.sceneObject` (Collision view),
+  // driven by the same articulation link transforms as the render GLB via SetBoneMatrices.
+  // Non-owning back-pointer; null unless the skin has a skinned render GLB. Replaces the
+  // CPU-updated dynamicWireframeMesh for skinned skins.
+  mochi_renderer::WireframeMesh* skinnedCollisionMesh = nullptr;
+  // Skinned skin only: the rest/default-pose per-link world transforms (Mochi space, GLB joint
+  // order) captured at stage time. Used to restore the skin's joint pose when simulation stops
+  // (ResetWorldTransforms), mirroring how the collision mesh and world transforms are reset.
+  std::vector<mochi::TransformRT> skinRestLinkWorldTransforms;
+  // Skinned skin only: per-link inverse of the rest root-relative transform in renderer space
+  // (the inverse-bind matrix for the collision wireframe), cached at stage time so bone matrices
+  // can be computed as boneMatrix_j = ToFilament(rootRelCurrent_j) * skinRestBoneInverse[j].
+  std::vector<filament::math::mat4f> skinRestBoneInverse;
 };
 
 using StagedActors = std::vector<StagedActor>;
@@ -153,6 +191,24 @@ struct SoftMeshUpdate {
   std::vector<float> normals;
   mochi::TransformRT worldTransform = {};
 };
+
+// A per-frame pose update for one skinned articulated skin's render model: produced by the editor
+// (rest FK) and the simulation post-step callback, consumed by SceneStage::ApplySkinnedPose.
+// `linkWorldTransforms` are per-link WORLD transforms (Mochi space) in the GLB's joint order
+// (== nested link order); SceneStage makes them root-relative against the staged actor's current
+// world transform and converts them to renderer space before driving the GPU bones. Matched to a
+// staged actor by `name` (the SkinStagedName of the articulated actor).
+struct SkinnedPoseUpdate {
+  std::string name;
+  std::vector<mochi::TransformRT> linkWorldTransforms;
+};
+
+// The staged/render name for an articulated actor's skin. The skin is folded into the articulated
+// compound entity (it shares the actor's handle and is not a nested link), so it is identified by
+// the top-level actor's name plus a " (Skin)" suffix. This is the single source of truth that skin
+// staging (SceneStage), the per-step surface query (editors), and force-drag resolution
+// (PhysicsDragController) must all agree on.
+[[nodiscard]] std::string SkinStagedName(std::string_view articulatedActorName);
 
 // A single resolved staging instruction produced by traversing a prefab tree. Carries both the
 // render and shape representations (either file may be empty) plus which is visible for the
@@ -182,6 +238,19 @@ struct StageRequest {
   mochi::Real3 softBakeScale = {mochi::real(1), mochi::real(1), mochi::real(1)};
   mochi::TransformRT softShapeTransform = {};
   int softVertexCount = 0;
+  // Skinned skin only: per-link WORLD transforms (Mochi space) in the GLB's joint order (== nested
+  // link / link-declaration order), captured at build time. Populated for ANY articulated skin
+  // (independent of whether a render GLB is present) so the collision skin can be posed. SceneStage
+  // converts them to renderer space and makes them root-relative against `worldTransform` to drive
+  // both the render model's joints and the collision wireframe's bones. Simulation supplies fresh
+  // transforms via ApplySkinnedPose.
+  std::vector<mochi::TransformRT> skinLinkWorldTransforms;
+  // Skinned skin only: per-link WORLD transforms at the articulation's ZERO/rest (bind) joint
+  // configuration, in the SAME order/frame as skinLinkWorldTransforms. This is the pose the skin
+  // surface (.mochi.h5 / GLB) was authored at, so it is the bind reference used to build the
+  // collision bones (bone_i = current_i * inverse(bind_i)). It is pose-independent (does NOT latch
+  // to the current editor pose), mirroring the GLB's baked inverse-bind matrices.
+  std::vector<mochi::TransformRT> skinBindLinkWorldTransforms;
 };
 
 // Stages render objects for physics actors into a target render Scene and provides mechanisms to
@@ -260,12 +329,29 @@ struct SceneStage {
       mochi::Span<SoftMeshUpdate const> updates,
       mochi::CoordinateSpaceConverter const& converter);
 
+  // Apply per-skin joint poses (from simulation or editor FK), matched by name. For each update the
+  // named skinned actor's render model has its joints posed (making the link world transforms
+  // root-relative against the actor's current world transform, then converting to renderer space).
+  // Unknown names and actors without a skinned render model are ignored. Call after
+  // ApplyWorldTransforms / ApplySoftMeshUpdates so the actor's world transform (the skin root) is
+  // current.
+  void ApplySkinnedPose(
+      mochi::Span<SkinnedPoseUpdate const> updates,
+      mochi::CoordinateSpaceConverter const& converter);
+
   // Get the ordered list of staged actors.
   StagedActors const& GetActors() const;
 
   // The number of staged actors.
   int GetNumActors() const;
 
+  // Install either the simulation-driven or the GPU-skinned surface in a skinned skin's shape
+  // slot, keeping the other hidden. No-op for actors that do not have both.
+  void SetSimSurfaceActive(StagedActor& actor, bool simActive);
+  // Build a skinned skin's simulation surface if it does not have one yet. No-op for other actors.
+  void EnsureSimSurface(StagedActor& actor, mochi::CoordinateSpaceConverter const& converter);
+  // Reinstall the GPU-skinned surface and tear the simulation one down. No-op for other actors.
+  void DestroySimSurface(StagedActor& actor);
   // Get a staged actor's index by name. Returns -1 if not found.
   int FindIndexByName(std::string_view name) const;
 

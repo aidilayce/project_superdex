@@ -94,10 +94,6 @@ struct CSoftExportParams : NoCopy {
   Soft Actor Utils
 */
 
-// Set the displacements to zero. Note this is the local displacement thus does not zero out
-// recentering transform.
-void SetZeroDisplacements(entt::registry& reg, entt::entity e, Error& error);
-
 // Set the position of all nodes by replacing the contents of the solution vector.
 // Size of inPositionsLocal == numNodes * kSpaceDim.
 void SetNodePositionsLocal(
@@ -105,9 +101,6 @@ void SetNodePositionsLocal(
     entt::entity e,
     Span<real const> inPositionsLocal,
     Error& error);
-
-// Zero out the velocities.
-void SetZeroVelocities(entt::registry& reg, entt::entity e, Error& error);
 
 // Set the velocity of all nodes in the CGlobalKinematics component.
 // Size of inVelocitiesLocal == numNodes * kSpaceDim.
@@ -161,7 +154,7 @@ void UpdateQueryQuadraturePointsPosition(
     CQueryQuadraturePointsPosition& outQuery);
 
 // Compute the TransformRT at the eval point.
-MOCHI_API void ComputeTransformAtEvalPoint(
+void ComputeTransformAtEvalPoint(
     ColumnVectorView<real const> displ,
     CLocal2GlobalMap const& l2g,
     CRigidTransformEvalPoint const& evalPoint,
@@ -177,7 +170,7 @@ inline void UpdateRigidTransformEval(
 }
 
 // Use the information in CRigidTransformEval to perform a recentering of data.
-MOCHI_API void RecenterSolutionUsingRigidTransformEval(
+void RecenterSolutionUsingRigidTransformEval(
     ecs::RequiredTag<TagSoftActor>,
     ecs::Excluded<TagRomActor>,
     CRecenteringParams const& params,
@@ -191,8 +184,7 @@ MOCHI_API void RecenterSolutionUsingRigidTransformEval(
     CVelocitySlice<real, TimeStep::Previous>& prevVel,
     CIntegrationVelocitySlices<DisplacementLayer::Default>& intVels,
     CRigidTransformEval& pivotEval,
-    CBoundingVolume<TimeStep::Current>* currBounds,
-    CBoundingVolume<TimeStep::Previous>* prevBounds);
+    CBoundingVolume* bounds);
 
 // Get SoftMaterialParams from CSoftMaterialParams
 void GetMaterialParams(CSoftMaterialParams const& material, SoftMaterialParams& outParams);
@@ -659,7 +651,7 @@ void EntityPostLastStage(
     CIntegrationVelocitySlices<DisplacementLayer::Default>& intVels);
 
 // Assemble just the volume term into CActorSnle.
-MOCHI_API void AssembleBody(
+void AssembleBody(
     AssemblyParams const& params, // external parameter
     ecs::Included<TagSoftActor>,
     ecs::CtxGlobal<CSceneGravity const> sceneGravity,
@@ -667,7 +659,7 @@ MOCHI_API void AssembleBody(
     ecs::OptionalTag<TagUseInertia> hasInertiaTag,
     ecs::OptionalTag<TagUseStress> hasStressTag,
     ecs::OptionalTag<TagRomActor> isRom,
-    ecs::OptionalTag<TagSoftSkinnedActor> isSkinned,
+    ecs::OptionalTag<TagNestedSoftActor> isNestedSoft,
     CSkinnedEnergy const& skinnedEnergy,
     CLocal2GlobalMap const& l2g,
     CNodalBasedStructure const& nbs,
@@ -682,7 +674,7 @@ MOCHI_API void AssembleBody(
     CMassMatrix const& massMatrix,
     CRomProjectionStrategy const* romProjectionStrategy,
     CActorSnle& outActorSnle,
-    CActiveVolumeElements const* activeVolumeElems = nullptr);
+    CActiveVolumeElements const* activeVolElems = nullptr);
 
 // Implementation of AssembleBody, which admits different components for the result Snle.
 void AssembleBodyImpl(
@@ -710,7 +702,7 @@ void AssembleAsyncContact(
     entt::entity e,
     ecs::Included<TagSoftActor, TagUseContact>,
     ecs::OptionalTag<TagRomActor> isRom,
-    ecs::Excluded<TagSoftSkinnedActor>,
+    ecs::Excluded<TagNestedSoftActor>,
     ecs::OptionalTag<TagQueryActiveContacts> queryActiveContacts,
     ecs::CtxGlobal<CSimulationParams const> simParams,
     CTimeIntegratorState const& intState,
@@ -750,32 +742,30 @@ void EntitySetSolution(
     CDisplacementSlice<real, TimeStep::Current>& currSol);
 
 // Update CRigidVelocityLocal by approximating the movement of the center-of-mass
-MOCHI_API void UpdateRigidVelocity(
+void UpdateRigidVelocity(
     ecs::Included<TagSoftActor>,
     ecs::Excluded<TagRomActor>,
     ecs::CtxGlobal<CSceneTime const> time,
     CRootTransform const& root,
-    CBoundingVolume<TimeStep::Current> const& bounds,
+    CBoundingVolume const& bounds,
     CPrevRigidVelocity& outRigidVelWorld);
 
-// Update CBoundingVolume<TimeStep::Current>.localShape based on the deformation of the mesh. kStep
-// defines the data to be used in the update, not the component storing the result. There's no
-// CBoundingVolume<TimeStep::StageStart>, as it's not needed. We do bound checks in stage-start
-// collision detection, but we can use CBoundingVolume<TimeStep::Current> for this.
+// Update CBoundingVolume.localShape based on the deformation of the mesh. kStep selects the
+// displacement state used to compute the bounds.
 template <TimeStep kStep>
 void UpdateBounds(
     CColliderInfo const& /*collider*/, // TODO: Is this actually required for the ECS system?
     CTetrahedralMesh const& meshSolver,
     CFinalDisplacementRef<kStep> const& solSolver,
-    CBoundingVolume<TimeStep::Current>& outBounds) {
+    CBoundingVolume& outBounds) {
   static_assert(kStep == TimeStep::Current || kStep == TimeStep::StageStart);
   MOCHI_PROFILE_SCOPE();
   auto const& sol = solSolver.value;
   auto boundaryIndices = meshSolver.mesh->GetBoundaryNodes();
   auto nodeCoordinates = meshSolver.mesh->GetNodeCoordinates();
   auto nodeDisplacements = Unflatten<Real3 const>(sol.GetConstSpan());
-  outBounds.localShape =
-      GetObb(CalcAabbWithSortedIndices(nodeCoordinates, nodeDisplacements, boundaryIndices));
+  outBounds.localShape = GetObb(CalcAabbWithDisplacementsAndSortedIndices(
+      nodeCoordinates, nodeDisplacements, boundaryIndices));
 }
 
 // Call once on startup

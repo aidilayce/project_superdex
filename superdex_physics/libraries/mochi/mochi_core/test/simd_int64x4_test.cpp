@@ -17,6 +17,7 @@
 #include "simd_test.h"
 
 #include <array>
+#include <limits>
 #include <type_traits>
 #include <vector>
 
@@ -217,13 +218,7 @@ TEST(Vec4l, Get) {
   EXPECT_EQ(3, Get<2>(a));
   EXPECT_EQ(-4, Get<3>(a));
 
-  // Slower runtime version
-  EXPECT_EQ(1, Get(a, 0));
-  EXPECT_EQ(2, Get(a, 1));
-  EXPECT_EQ(3, Get(a, 2));
-  EXPECT_EQ(-4, Get(a, 3));
-
-  // Same but with operator[] (read only)
+  // Runtime version
   EXPECT_EQ(1, a[0]);
   EXPECT_EQ(2, a[1]);
   EXPECT_EQ(3, a[2]);
@@ -484,10 +479,15 @@ TEST(Vec4l, Store) {
   EXPECT_SPAN_EQ((std::array<int64_t, 4>{1, 2, 3, 0}), Span(&result[1], 4));
   Store<4>(&result[1], v);
   EXPECT_SPAN_EQ((std::array<int64_t, 4>{1, 2, 3, 4}), Span(&result[1], 4));
-  result.clear();
-  result.resize(5);
-  Store(&result[1], v, 0);
-  EXPECT_SPAN_EQ((std::array<int64_t, 4>{0, 0, 0, 0}), Span(&result[1], 4));
+  for (int n = 0; n <= Vec4l::kSize; ++n) {
+    result.assign(6, 911);
+    auto expected = result;
+    for (int i = 0; i < n; ++i) {
+      expected[i + 1] = i + 1;
+    }
+    Store(&result[1], v, n);
+    EXPECT_EQ(expected, result);
+  }
   Store(&result[1], v);
   EXPECT_SPAN_EQ((std::array<int64_t, 4>{1, 2, 3, 4}), Span(&result[1], 4));
 }
@@ -548,7 +548,19 @@ TEST(Vec4l, ShiftLeft) {
 }
 
 TEST(Vec4l, ShiftRight) {
+  static constexpr int kSingleBitShift = 1;
+  static constexpr int kHalfWidthShift = 8 * sizeof(Vec4l::Scalar) / 2;
+  static constexpr int64_t kHalfWidthScale = int64_t{1} << kHalfWidthShift;
+  static constexpr int64_t kInt64Min = std::numeric_limits<int64_t>::min();
+  static constexpr int64_t kNegativeSample = -100;
+  static constexpr int64_t kPositiveSample = 100;
+
   Vec4l v(8, 40, 56, 88);
   EXPECT_VEC4L(1, 5, 7, 11, ShiftRight<3>(v));
   EXPECT_EQ(v, ShiftRight<0>(v));
+  // Shift by one catches logical shifts; half-width catches multi-bit sign fill.
+  // clang-format off
+  EXPECT_VEC4L(-1, -2, 2, 0, ShiftRight<kSingleBitShift>(Vec4l{-1, -3, 4, 1}));
+  EXPECT_VEC4L(-1, kInt64Min / kHalfWidthScale, -1, 0, ShiftRight<kHalfWidthShift>(Vec4l{-1, kInt64Min, kNegativeSample, kPositiveSample}));
+  // clang-format on
 }

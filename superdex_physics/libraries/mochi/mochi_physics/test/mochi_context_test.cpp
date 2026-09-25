@@ -460,6 +460,28 @@ TEST_IF_P(MOCHI_INTERNAL, MochiContextTest, ClearFileFromCache) {
   EXPECT_EQ(shapePtr2a, shapePtr2d); // Same path and scale. Same address (from cache)
 }
 
+// The cache test meshes are not shipped externally.
+TEST_IF_P(MOCHI_INTERNAL, MochiContextTest, ClearFileFromCacheNormalizesPathSpelling) {
+  _mochiContext->EnableFileCache(true);
+
+  // Paths reach the cache through several composition helpers (prefab resolution, asset managers),
+  // so the spelling passed to ClearFileFromCache rarely matches the spelling used at load time byte
+  // for byte. Cache keys are lexically normalized so that equivalent spellings agree.
+  auto const path = test::GetAssetPath("cube/cube_minimal.mochi.json");
+  auto const equivalentPath = test::GetAssetPath("cube/../cube/cube_minimal.mochi.json");
+  ASSERT_NE(path, equivalentPath);
+
+  auto const* contextImpl = assert_cast<ContextImpl const*>(_mochiContext);
+  auto const handleA = _mochiContext->LoadShapeFromFile(path, test::ExpectOK{});
+  auto const handleB = _mochiContext->LoadShapeFromFile(equivalentPath, test::ExpectOK{});
+  EXPECT_EQ(contextImpl->GetShapeSharedPtr(handleA), contextImpl->GetShapeSharedPtr(handleB));
+
+  // Clearing under either spelling evicts the shared entry.
+  _mochiContext->ClearFileFromCache(equivalentPath);
+  auto const handleC = _mochiContext->LoadShapeFromFile(path, test::ExpectOK{});
+  EXPECT_NE(contextImpl->GetShapeSharedPtr(handleA), contextImpl->GetShapeSharedPtr(handleC));
+}
+
 void MochiContextTest::TestFileCacheConcurrency(std::initializer_list<std::string_view> paths) {
   // Multiple threads can attempt to load shapes while the cache is enabled. Threads should be able
   // to load different files concurrently, but if they request the same file, then only one of the
@@ -1101,8 +1123,7 @@ TEST_IF_P(MOCHI_DEEP_FLOW_DISABLED, MochiContextTest, CreateDeepFlowShape_Featur
   experimental::DeepModelParams params;
   params.deepModelPath = "unused_model_path";
 
-  ShapeHandle const shape = experimental::CreateDeepFlowShape(
-      _mochiContext, params, NeuralComputeType::MochiCpu, 0, ExpectNotOK{});
+  ShapeHandle const shape = experimental::CreateDeepFlowShape(_mochiContext, params, ExpectNotOK{});
   EXPECT_FALSE(shape.IsValid());
   ExpectShapeDoesNotExist(_mochiContext, shape);
 }
@@ -1422,6 +1443,70 @@ TEST_P(MochiContextTest, CreateSceneMultithreaded) {
   RepeatMultithreaded(_mochiContext, fn, 2);
 }
 
+TEST_P(MochiContextTest, CreateIKSolver_InvalidActorPreservesScene) {
+  ShapeHandle shape = test::CreateUnitCubeTetMeshShape(_mochiContext);
+  Scene* scene = _mochiContext->CreateScene("IK Scene");
+  MOCHI_DEFER(if (_mochiContext->IsValidScene(scene)) { _mochiContext->DestroyScene(scene); });
+
+  SoftActorParams params;
+  params.shape = shape;
+  Actor* actor = scene->CreateSoftActor(params, ExpectOK{});
+  ASSERT_NE(nullptr, actor);
+  ActorHandle const actorHandle = actor->GetHandle();
+
+  EXPECT_EQ(nullptr, experimental::CreateIKSolver(scene, _mochiContext, ExpectNotOK{}));
+  ASSERT_TRUE(_mochiContext->IsValidScene(scene));
+  EXPECT_EQ(actor, scene->GetActor(actorHandle));
+}
+
+TEST_P(MochiContextTest, CreateIKSolver_SceneAlreadyOwnedReturnsError) {
+  Scene* scene = _mochiContext->CreateScene("IK Scene");
+  auto* solver = experimental::CreateIKSolver(scene, _mochiContext, ExpectOK{});
+  ASSERT_NE(nullptr, solver);
+  MOCHI_DEFER(experimental::DestroyIKSolver(solver, _mochiContext, ErrorAssert{}));
+
+  EXPECT_EQ(nullptr, experimental::CreateIKSolver(scene, _mochiContext, ExpectNotOK{}));
+  EXPECT_TRUE(experimental::IsValidIKSolver(solver, _mochiContext, ExpectOK{}));
+  EXPECT_TRUE(_mochiContext->IsValidScene(scene));
+}
+
+TEST_P(MochiContextTest, CreateIKTargets_ReplacesOnlyAfterSuccessfulCreation) {
+  Scene* scene = _mochiContext->CreateScene("IK Scene");
+  RigidActorParams actorParams;
+  actorParams.shape = test::CreateUnitCubeTetMeshShape(_mochiContext);
+  actorParams.colliderType = ColliderType::None;
+  Actor* actor = scene->CreateRigidActor(actorParams, ExpectOK{});
+  ASSERT_NE(nullptr, actor);
+
+  auto* solver = experimental::CreateIKSolver(scene, _mochiContext, ExpectOK{});
+  ASSERT_NE(nullptr, solver);
+  MOCHI_DEFER(experimental::DestroyIKSolver(solver, _mochiContext, ErrorAssert{}));
+
+  Constraint* positionTarget =
+      solver->CreatePositionTarget(actor->GetHandle(), {}, {}, 1_r, ExpectOK{});
+  Constraint* rotationTarget =
+      solver->CreateRotationTarget(actor->GetHandle(), {}, {}, 1_r, ExpectOK{});
+  ASSERT_NE(nullptr, positionTarget);
+  ASSERT_NE(nullptr, rotationTarget);
+  ConstraintHandle const positionHandle = positionTarget->GetHandle();
+  ConstraintHandle const rotationHandle = rotationTarget->GetHandle();
+  real const nan = std::numeric_limits<real>::quiet_NaN();
+
+  EXPECT_EQ(nullptr, solver->CreatePositionTarget(actor->GetHandle(), {}, {}, nan, ExpectNotOK{}));
+  EXPECT_EQ(nullptr, solver->CreateRotationTarget(actor->GetHandle(), {}, {}, nan, ExpectNotOK{}));
+
+  EXPECT_EQ(2, scene->GetNumConstraints());
+  EXPECT_EQ(positionTarget, scene->GetConstraint(positionHandle));
+  EXPECT_EQ(rotationTarget, scene->GetConstraint(rotationHandle));
+
+  EXPECT_NE(nullptr, solver->CreatePositionTarget(actor->GetHandle(), {}, {}, 2_r, ExpectOK{}));
+  EXPECT_NE(nullptr, solver->CreateRotationTarget(actor->GetHandle(), {}, {}, 2_r, ExpectOK{}));
+
+  EXPECT_EQ(2, scene->GetNumConstraints());
+  EXPECT_EQ(nullptr, scene->GetConstraint(positionHandle));
+  EXPECT_EQ(nullptr, scene->GetConstraint(rotationHandle));
+}
+
 TEST_P(MochiContextTest, CreateAsyncScene) {
   if (_mochiContext->GetNumThreads() == 0) {
     // If there are no worker threads, then CreateAsyncScene should fail gracefully.
@@ -1525,6 +1610,41 @@ static void ExpectCreateAsyncSceneFromMochiWorkerFails(bool startPaused) {
 TEST(MochiAsyncScene, CreateAsyncSceneExpectedFailures) {
   ExpectCreateAsyncSceneFromMochiWorkerFails(/*startPaused*/ false);
   ExpectCreateAsyncSceneFromMochiWorkerFails(/*startPaused*/ true);
+}
+
+TEST(MochiAsyncScene, CreateIKSolver_AsyncSceneOwnedSceneReturnsError) {
+  auto* context = CreateContext(2);
+  ASSERT_NE(nullptr, context);
+  MOCHI_DEFER(DestroyContext(context));
+
+  auto* asyncScene = context->CreateAsyncScenePaused("Async IK Scene", ExpectOK{});
+  ASSERT_NE(nullptr, asyncScene);
+  MOCHI_DEFER(context->DestroyAsyncScene(asyncScene));
+
+  experimental::IKSolver* solver = nullptr;
+  bool errorWasSet = false;
+  bool sceneWasValid = false;
+  Real3 const gravity{1_r, 2_r, 3_r};
+  Real3 observedGravity{};
+
+  asyncScene->QueueCommand([&](Scene* scene) {
+    scene->SetGravity(gravity);
+    Error error;
+    solver = experimental::CreateIKSolver(scene, context, error);
+    errorWasSet = !error.IsOK();
+    sceneWasValid = context->IsValidScene(scene);
+    if (sceneWasValid) {
+      observedGravity = scene->GetGravity();
+    }
+  });
+  asyncScene->WaitForQueuedCommands();
+
+  EXPECT_EQ(nullptr, solver);
+  EXPECT_TRUE(errorWasSet);
+  EXPECT_TRUE(sceneWasValid);
+  EXPECT_EQ(gravity, observedGravity);
+
+  experimental::DestroyIKSolver(solver, context, ErrorAssert{});
 }
 
 namespace {
@@ -1777,8 +1897,7 @@ TEST_F(ActorTest, GetVelocitySoft) {
   auto* actor = CreateSoftUnitCube();
   auto entity = mochi::GetEntity(reg, actor->GetHandle(), ExpectOK{});
   ecs::InvokeOnEntity(&soft::UpdateBounds<TimeStep::Current>, reg, entity);
-  auto pivotLocal =
-      GetAabb(reg.get<CBoundingVolume<TimeStep::Current> const>(entity).localShape).GetCenter();
+  auto pivotLocal = GetAabb(reg.get<CBoundingVolume const>(entity).localShape).GetCenter();
 
   // Set rigid velocity
   Real3 linVel{-1_r, 2_r, 1_r};
@@ -2369,6 +2488,101 @@ TEST_P(MochiContextTest, GetShapeSurfaceMesh_TetMesh) {
   EXPECT_FALSE(surfaceView.skinning.has_value());
 }
 
+// A shape's skinning is indexed per full-mesh node, but its surface mesh covers only the boundary
+// nodes, in its own order. Verify GetShapeSurfaceMesh re-gathers the skinning so it is aligned 1:1
+// with the surface coordinates. Uses a 3x3x3 node grid, whose centre node is interior, so the
+// surface is a strict subset of the volume mesh and a pass-through would be caught.
+TEST_P(MochiContextTest, GetShapeSurfaceMesh_TetMeshSkinningIsSurfaceAligned) {
+  auto const grid = CreateMinimalTetMeshUnitGrid(Real3{1_r, 1_r, 1_r}, Int3{2, 2, 2});
+  int const numNodes = isize(grid.first);
+
+  // One bone per node, each node bound wholly to the bone with its own index. A gathered row
+  // therefore names the full-mesh node it came from, which is what the assertions below check.
+  ModelData model;
+  model.mesh.emplace();
+  model.mesh->nodesPerElement = 4;
+  model.mesh->coordinates = Flatten(MakeConstSpan(grid.first));
+  model.mesh->connectivity = Flatten(MakeConstSpan(grid.second));
+  model.mesh->skinning.emplace();
+  model.mesh->skinning->weightsPerNode = 1;
+  DynamicArray<int> boneIndices(numNodes);
+  DynamicArray<real> boneWeights(numNodes);
+  for (int i = 0; i < numNodes; ++i) {
+    boneIndices[i] = i;
+    boneWeights[i] = 1_r;
+  }
+  model.mesh->skinning->indices = std::move(boneIndices);
+  model.mesh->skinning->weights = std::move(boneWeights);
+
+  ShapeHandle shape = _mochiContext->CreateModelShape(model, ExpectOK{});
+  ASSERT_TRUE(shape.IsValid());
+
+  MeshDataView const surfaceView = _mochiContext->GetShapeSurfaceMesh(shape, ExpectOK{});
+  ASSERT_TRUE(surfaceView.skinning.has_value());
+  EXPECT_EQ(1, surfaceView.skinning->weightsPerNode);
+
+  // One row per surface coordinate, and fewer than the volume mesh because the centre node is
+  // interior.
+  int const numSurfaceNodes = surfaceView.GetNumNodes();
+  EXPECT_LT(numSurfaceNodes, numNodes);
+  EXPECT_EQ(numSurfaceNodes, isize(surfaceView.skinning->indices));
+  EXPECT_EQ(numSurfaceNodes, isize(surfaceView.skinning->weights));
+
+  // Each surface node kept its source node's row: the bone index names a full-mesh node, whose
+  // coordinate must be the one stored for this surface node.
+  for (int i = 0; i < numSurfaceNodes; ++i) {
+    int const sourceNode = surfaceView.skinning->indices[i];
+    ASSERT_GE(sourceNode, 0);
+    ASSERT_LT(sourceNode, numNodes);
+    Real3 const expected = grid.first[sourceNode];
+    Real3 const actual{
+        surfaceView.coordinates[i * 3],
+        surfaceView.coordinates[i * 3 + 1],
+        surfaceView.coordinates[i * 3 + 2]};
+    EXPECT_NEAR_EQ(expected[0], actual[0]);
+    EXPECT_NEAR_EQ(expected[1], actual[1]);
+    EXPECT_NEAR_EQ(expected[2], actual[2]);
+    EXPECT_NEAR_EQ(1_r, surfaceView.skinning->weights[i]);
+  }
+}
+
+// A tri mesh is its own surface, so its skinning passes through unchanged, one row per node.
+TEST_P(MochiContextTest, GetShapeSurfaceMesh_TriMeshSkinningIsSurfaceAligned) {
+  auto const triCube = CreateMinimalTriMeshUnitCube();
+  int const numNodes = isize(triCube.first);
+
+  ModelData model;
+  model.mesh.emplace();
+  model.mesh->nodesPerElement = 3;
+  model.mesh->coordinates = Flatten(MakeConstSpan(triCube.first));
+  model.mesh->connectivity = Flatten(MakeConstSpan(triCube.second));
+  model.mesh->skinning.emplace();
+  model.mesh->skinning->weightsPerNode = 1;
+  DynamicArray<int> boneIndices(numNodes);
+  DynamicArray<real> boneWeights(numNodes);
+  for (int i = 0; i < numNodes; ++i) {
+    boneIndices[i] = i;
+    boneWeights[i] = 1_r;
+  }
+  model.mesh->skinning->indices = std::move(boneIndices);
+  model.mesh->skinning->weights = std::move(boneWeights);
+
+  ShapeHandle shape = _mochiContext->CreateModelShape(model, ExpectOK{});
+  ASSERT_TRUE(shape.IsValid());
+
+  MeshDataView const meshView = _mochiContext->GetShapeMesh(shape, ExpectOK{});
+  MeshDataView const surfaceView = _mochiContext->GetShapeSurfaceMesh(shape, ExpectOK{});
+  ASSERT_TRUE(meshView.skinning.has_value());
+  ASSERT_TRUE(surfaceView.skinning.has_value());
+  EXPECT_EQ(numNodes, surfaceView.GetNumNodes());
+  EXPECT_EQ(numNodes, isize(surfaceView.skinning->indices));
+  EXPECT_EQ(meshView.skinning->indices.data(), surfaceView.skinning->indices.data());
+  EXPECT_EQ(meshView.skinning->weights.data(), surfaceView.skinning->weights.data());
+  for (int i = 0; i < numNodes; ++i) {
+    EXPECT_EQ(i, surfaceView.skinning->indices[i]);
+  }
+}
+
 // Verify GetShapeSurfaceMesh for a tri mesh returns equivalent data to GetShapeMesh.
 TEST_P(MochiContextTest, GetShapeSurfaceMesh_TriMeshSameAsMainMesh) {
   auto triCube = CreateMinimalTriMeshUnitCube();
@@ -2389,18 +2603,70 @@ TEST_P(MochiContextTest, GetShapeSurfaceMesh_TriMeshOmitsUnreferencedNodes) {
   constexpr std::array kCoordinates = {
       Real3{10_r, 10_r, 10_r}, Real3{0_r, 0_r, 0_r}, Real3{1_r, 0_r, 0_r}, Real3{0_r, 1_r, 0_r}};
   constexpr std::array kConnectivity = {Int3{1, 2, 3}};
-  ShapeHandle shape = _mochiContext->CreateTriMeshShape(
-      Flatten(MakeConstSpan(kCoordinates)), Flatten(MakeConstSpan(kConnectivity)), ExpectOK{});
+
+  ModelData model;
+  model.mesh.emplace();
+  model.mesh->nodesPerElement = 3;
+  model.mesh->coordinates = Flatten(MakeConstSpan(kCoordinates));
+  model.mesh->connectivity = Flatten(MakeConstSpan(kConnectivity));
+  model.mesh->skinning.emplace();
+  model.mesh->skinning->weightsPerNode = 2;
+  model.mesh->skinning->indices = {0, 0, 1, 1, 2, 2, 3, 3};
+  model.mesh->skinning->weights = {0.1_r, 0.9_r, 0.2_r, 0.8_r, 0.3_r, 0.7_r, 0.4_r, 0.6_r};
+
+  ShapeHandle const shape = _mochiContext->CreateModelShape(model, ExpectOK{});
   EXPECT_TRUE(shape.IsValid());
 
-  MeshDataView meshView = _mochiContext->GetShapeMesh(shape, ExpectOK{});
-  MeshDataView surfaceView = _mochiContext->GetShapeSurfaceMesh(shape, ExpectOK{});
+  MeshDataView const meshView = _mochiContext->GetShapeMesh(shape, ExpectOK{});
+  MeshDataView const surfaceView = _mochiContext->GetShapeSurfaceMesh(shape, ExpectOK{});
   EXPECT_EQ(4, meshView.GetNumNodes());
   EXPECT_EQ(3, surfaceView.GetNumNodes());
   constexpr std::array kExpectedCoordinates = {kCoordinates[1], kCoordinates[2], kCoordinates[3]};
   constexpr std::array kExpectedConnectivity = {0, 1, 2};
+  constexpr std::array kExpectedSkinningIndices = {1, 1, 2, 2, 3, 3};
+  constexpr std::array kExpectedSkinningWeights = {0.2_r, 0.8_r, 0.3_r, 0.7_r, 0.4_r, 0.6_r};
   EXPECT_SPAN_EQ(Flatten(MakeConstSpan(kExpectedCoordinates)), surfaceView.coordinates);
   EXPECT_SPAN_EQ(MakeConstSpan(kExpectedConnectivity), surfaceView.connectivity);
+  ASSERT_TRUE(surfaceView.skinning.has_value());
+  EXPECT_EQ(2, surfaceView.skinning->weightsPerNode);
+  EXPECT_SPAN_EQ(MakeConstSpan(kExpectedSkinningIndices), surfaceView.skinning->indices);
+  EXPECT_SPAN_EQ(MakeConstSpan(kExpectedSkinningWeights), surfaceView.skinning->weights);
+}
+
+TEST_P(MochiContextTest, GetShapeSurfaceMesh_PolylineReturnsContactSkin) {
+  ModelData model;
+  model.mesh.emplace();
+  model.mesh->nodesPerElement = 2;
+  model.mesh->coordinates = {0_r, 0_r, 0_r, 1_r, 0_r, 0_r};
+  model.mesh->connectivity = {0, 1};
+  model.elementFrameAxes = DynamicArray<real>{0_r, 1_r, 0_r};
+  model.contactSkinMesh.emplace();
+  model.contactSkinMesh->nodesPerElement = 3;
+  model.contactSkinMesh->coordinates = {
+      10_r, 10_r, 10_r, 0.5_r, 0_r, 0_r, 0.5_r, 0.1_r, 0_r, 0.5_r, 0_r, 0.1_r};
+  model.contactSkinMesh->connectivity = {1, 2, 3};
+  model.contactSkinMesh->skinning.emplace();
+  model.contactSkinMesh->skinning->weightsPerNode = 1;
+  model.contactSkinMesh->skinning->indices = {0, 0, 0, 0};
+  model.contactSkinMesh->skinning->weights = {1_r, 1_r, 1_r, 1_r};
+
+  ShapeHandle const shape = _mochiContext->CreateModelShape(model, ExpectOK{});
+  MeshDataView const meshView = _mochiContext->GetShapeMesh(shape, ExpectOK{});
+  MeshDataView const surfaceView = _mochiContext->GetShapeSurfaceMesh(shape, ExpectOK{});
+  MeshDataView const contactSkin = _mochiContext->GetShapeContactSkinMesh(shape, ExpectOK{});
+
+  EXPECT_EQ(2, meshView.nodesPerElement);
+  EXPECT_EQ(2, meshView.GetNumNodes());
+  EXPECT_EQ(3, surfaceView.nodesPerElement);
+  EXPECT_EQ(3, surfaceView.GetNumNodes());
+  EXPECT_SPAN_EQ(
+      MakeConstSpan(model.contactSkinMesh->coordinates).subspan(3), surfaceView.coordinates);
+  constexpr std::array kExpectedConnectivity = {0, 1, 2};
+  EXPECT_SPAN_EQ(MakeConstSpan(kExpectedConnectivity), surfaceView.connectivity);
+
+  EXPECT_SPAN_EQ(MakeConstSpan(model.contactSkinMesh->coordinates), contactSkin.coordinates);
+  EXPECT_SPAN_EQ(MakeConstSpan(model.contactSkinMesh->connectivity), contactSkin.connectivity);
+  EXPECT_FALSE(contactSkin.skinning.has_value());
 }
 
 // Verify GetShapeSurfaceMesh reports an error for a default-constructed (invalid) handle.
@@ -2438,6 +2704,91 @@ static ModelData CreateModelWithVisualMesh() {
   model.visualMesh->coordinates = Flatten(MakeSpan(triMesh.first));
   model.visualMesh->connectivity = Flatten(MakeSpan(triMesh.second));
   return model;
+}
+static void AddContactSkin(ModelData& model) {
+  MOCHI_ASSERT(model.mesh && model.visualMesh);
+  model.contactSkinMesh = *model.visualMesh;
+  model.contactSkinMesh->coordinates[0] += 0.125_r;
+  int const maxSkinningIndex = model.mesh->nodesPerElement == 2 ? model.mesh->GetNumNodes() - 2
+                                                                : model.mesh->GetNumNodes() - 1;
+  int const numContactNodes = model.contactSkinMesh->GetNumNodes();
+  model.contactSkinMesh->skinning.emplace();
+  model.contactSkinMesh->skinning->weightsPerNode = 1;
+  model.contactSkinMesh->skinning->indices.resize_noinit(numContactNodes);
+  model.contactSkinMesh->skinning->weights.resize(numContactNodes, 1_r);
+  for (int i = 0; i < numContactNodes; ++i) {
+    model.contactSkinMesh->skinning->indices[i] = Min(i, maxSkinningIndex);
+  }
+}
+
+static void ExpectAuxiliaryMeshesRoundTrip(Context* context, ModelData const& expected) {
+  ShapeHandle shape = context->CreateModelShape(expected, ExpectOK{});
+  auto const shapePtr = assert_cast<ContextImpl*>(context)->GetShapeSharedPtr(shape);
+  ASSERT_NE(shapePtr, nullptr);
+  ModelData const actual = shapePtr->GetModelData(ExpectOK{});
+
+  EXPECT_EQ(expected.visualMesh, actual.visualMesh);
+  EXPECT_EQ(expected.contactSkinMesh, actual.contactSkinMesh);
+
+  auto roundTrippedShape = ContextImpl::CreateShapeFromModelData(ModelData{actual}, ExpectOK{});
+  ASSERT_NE(roundTrippedShape, nullptr);
+  ModelData const roundTripped = roundTrippedShape->GetModelData(ExpectOK{});
+  EXPECT_EQ(expected.visualMesh, roundTripped.visualMesh);
+  EXPECT_EQ(expected.contactSkinMesh, roundTripped.contactSkinMesh);
+}
+
+TEST_P(MochiContextTest, GetModelData_PreservesTetAndTriAuxiliaryMeshes) {
+  for (bool includeContactSkinning : {false, true}) {
+    for (bool useTrianglePrimaryMesh : {false, true}) {
+      ModelData model = CreateModelWithVisualMesh();
+      if (useTrianglePrimaryMesh) {
+        model.mesh = model.visualMesh;
+      }
+      AddContactSkin(model);
+      if (!includeContactSkinning) {
+        model.contactSkinMesh->skinning.reset();
+      }
+      ExpectAuxiliaryMeshesRoundTrip(_mochiContext, model);
+    }
+  }
+}
+
+TEST_P(MochiContextTest, GetShapeContactSkinMesh_WithContactSkin) {
+  for (bool useTrianglePrimaryMesh : {false, true}) {
+    ModelData model = CreateModelWithVisualMesh();
+    if (useTrianglePrimaryMesh) {
+      model.mesh = model.visualMesh;
+    }
+    AddContactSkin(model);
+
+    ShapeHandle const shape = _mochiContext->CreateModelShape(model, ExpectOK{});
+    ASSERT_TRUE(shape.IsValid());
+
+    MeshDataView const contactSkin = _mochiContext->GetShapeContactSkinMesh(shape, ExpectOK{});
+    EXPECT_EQ(model.contactSkinMesh->nodesPerElement, contactSkin.nodesPerElement);
+    EXPECT_SPAN_EQ(MakeConstSpan(model.contactSkinMesh->coordinates), contactSkin.coordinates);
+    EXPECT_SPAN_EQ(MakeConstSpan(model.contactSkinMesh->connectivity), contactSkin.connectivity);
+    ASSERT_TRUE(contactSkin.skinning.has_value());
+    EXPECT_EQ(
+        model.contactSkinMesh->skinning->weightsPerNode, contactSkin.skinning->weightsPerNode);
+    EXPECT_SPAN_EQ(
+        MakeConstSpan(model.contactSkinMesh->skinning->indices), contactSkin.skinning->indices);
+    EXPECT_SPAN_EQ(
+        MakeConstSpan(model.contactSkinMesh->skinning->weights), contactSkin.skinning->weights);
+  }
+}
+
+TEST_P(MochiContextTest, GetShapeContactSkinMesh_NoContactSkinReturnsEmpty) {
+  auto triMesh = CreateMinimalTriMeshSingleTri();
+  ShapeHandle const shape = _mochiContext->CreateTriMeshShape(
+      Flatten(MakeSpan(triMesh.first)), Flatten(MakeSpan(triMesh.second)), ExpectOK{});
+  ASSERT_TRUE(shape.IsValid());
+
+  EXPECT_EQ(MeshDataView{}, _mochiContext->GetShapeContactSkinMesh(shape, ExpectOK{}));
+}
+
+TEST_P(MochiContextTest, GetShapeContactSkinMesh_InvalidHandle) {
+  [[maybe_unused]] auto mesh = _mochiContext->GetShapeContactSkinMesh(ShapeHandle{}, ExpectNotOK{});
 }
 
 // Verify GetShapeVisualMesh returns correct visual mesh dimensions from a ModelData shape.
@@ -2530,7 +2881,7 @@ TEST_P(MochiContextTest, GetShapeVisualMesh_ReleasedHandle) {
   [[maybe_unused]] auto mesh = _mochiContext->GetShapeVisualMesh(shape, ExpectNotOK{});
 }
 
-static ModelData CreatePolylineModelWithVisualMesh() {
+static ModelData CreatePolylineModelWithVisualMesh(bool includeSkinning = true) {
   auto triMesh = CreateMinimalTriMeshSingleTri();
   int const numVisualNodes = isize(triMesh.first);
 
@@ -2544,13 +2895,24 @@ static ModelData CreatePolylineModelWithVisualMesh() {
   model.visualMesh->coordinates = Flatten(MakeSpan(triMesh.first));
   model.visualMesh->connectivity = Flatten(MakeSpan(triMesh.second));
 
-  // Skinning is required for ComputeRodVisualMeshEmbedding to attach the visual mesh.
-  model.visualMesh->skinning.emplace();
-  model.visualMesh->skinning->weightsPerNode = 1;
-  model.visualMesh->skinning->indices.resize(numVisualNodes, 0);
-  model.visualMesh->skinning->weights.resize(numVisualNodes, 1_r);
+  if (includeSkinning) {
+    model.visualMesh->skinning.emplace();
+    model.visualMesh->skinning->weightsPerNode = 1;
+    model.visualMesh->skinning->indices.resize(numVisualNodes, 0);
+    model.visualMesh->skinning->weights.resize(numVisualNodes, 1_r);
+  }
 
   return model;
+}
+TEST_P(MochiContextTest, GetModelData_PreservesPolylineAuxiliaryMeshes) {
+  for (bool includeContactSkinning : {false, true}) {
+    ModelData model = CreatePolylineModelWithVisualMesh();
+    AddContactSkin(model);
+    if (!includeContactSkinning) {
+      model.contactSkinMesh->skinning.reset();
+    }
+    ExpectAuxiliaryMeshesRoundTrip(_mochiContext, model);
+  }
 }
 
 // Verify GetShapeVisualMesh returns correct visual mesh dimensions for a polyline shape.
@@ -2563,6 +2925,19 @@ TEST_P(MochiContextTest, GetShapeVisualMesh_PolylineWithVisualMesh) {
   EXPECT_EQ(3, visualView.nodesPerElement);
   EXPECT_EQ(model.visualMesh->GetNumNodes(), visualView.GetNumNodes());
   EXPECT_EQ(model.visualMesh->GetNumElements(), visualView.GetNumElements());
+  EXPECT_FALSE(visualView.skinning.has_value());
+}
+
+TEST_P(MochiContextTest, GetShapeVisualMesh_PolylineWithoutSkinningPreservesGeometry) {
+  ModelData model = CreatePolylineModelWithVisualMesh(/*includeSkinning=*/false);
+  ShapeHandle shape = _mochiContext->CreateModelShape(model, ExpectOK{});
+  ASSERT_TRUE(shape.IsValid());
+
+  MeshDataView visualView = _mochiContext->GetShapeVisualMesh(shape, ExpectOK{});
+  ASSERT_TRUE(model.visualMesh.has_value());
+  EXPECT_EQ(model.visualMesh->nodesPerElement, visualView.nodesPerElement);
+  EXPECT_SPAN_EQ(MakeConstSpan(model.visualMesh->coordinates), visualView.coordinates);
+  EXPECT_SPAN_EQ(MakeConstSpan(model.visualMesh->connectivity), visualView.connectivity);
   EXPECT_FALSE(visualView.skinning.has_value());
 }
 

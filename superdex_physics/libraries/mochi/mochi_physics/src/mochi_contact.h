@@ -21,6 +21,7 @@
 #include <mochi_physics/mochi_physics_experimental.h>
 
 #include "mochi_common_components.h"
+#include "mochi_contact_pair_params.h"
 #include "mochi_discretization_components.h"
 #include "mochi_ecs.h"
 #include "mochi_query.h"
@@ -36,7 +37,9 @@
 #include <mochi_core/geometry/base_map.h>
 #include <mochi_core/geometry/bvh_tree.h>
 #include <mochi_core/geometry/geometry_utils.h>
+#include <mochi_core/geometry/sphere_tree.h>
 #include <mochi_core/linear_algebra/block_sparse_matrix.h>
+#include <mochi_core/linear_algebra/sparse_matrix.h>
 #include <mochi_core/utils/basic_utils.h>
 #include <mochi_core/utils/constants.h>
 #include <mochi_core/utils/dynamic_array.h>
@@ -156,26 +159,6 @@ struct CSdfColliderPending final : SdfCollider, NoCopy {
 template <TimeStep kStep>
 struct CSdfMapping : std::unique_ptr<BaseMap>, NoCopy {};
 
-namespace details {
-template <ContactType kContactType, TimeStep kTimeStep>
-struct BoundingVolumeForImpl {
-  static_assert(kTimeStep == TimeStep::Current || kTimeStep == TimeStep::StageStart);
-  using Type = std::conditional_t<
-      kContactType == ContactType::Async && kTimeStep == TimeStep::StageStart,
-      CBoundingVolume<TimeStep::Previous>,
-      CBoundingVolume<TimeStep::Current>>;
-};
-} // namespace details
-
-/**
- * @brief Alias to get the appropriate CBoundingVolume component of a collider during collision
- * detection, depending on contact type (sync = dynamic collider / async = static collider) and time
- * step (current / stage start). Static colliders at stage start use previous bounds. All other
- * cases use current bounds.
- */
-template <ContactType kContactType, TimeStep kTimeStep>
-using CBoundingVolumeFor = typename details::BoundingVolumeForImpl<kContactType, kTimeStep>::Type;
-
 /**************************************************************************
   ECS Broadphase Components
 */
@@ -244,6 +227,8 @@ struct ActiveCollision {
  * potentially colliding), and the corresponding contact result. The size is equal to the number of
  * potential colliders times the number of partitions. Templatized according to async or sync
  * contact, and according to the time step (Current or StageStart).
+ *
+ * @note Entries must remain sorted by collider entity, then colliding partition ID.
  */
 template <ContactType kContactType, TimeStep kTimeStep>
 struct CActiveCollisions : public std::vector<ActiveCollision> {
@@ -277,6 +262,7 @@ struct CActiveCollisions : public std::vector<ActiveCollision> {
 
     // Add colliders that previously were not potentially in contact but are now potentially in
     // contact.
+    bool appended = false;
     for (int c = 0; c < isize(potentialColls); ++c) {
       bool prevInContact = false;
       for (auto const& col : *this) {
@@ -286,6 +272,7 @@ struct CActiveCollisions : public std::vector<ActiveCollision> {
         }
       }
       if (!prevInContact) {
+        appended = true;
         for (int p = 0; p < numPartitions; ++p) {
           emplace_back(
               ActiveCollision{
@@ -294,9 +281,13 @@ struct CActiveCollisions : public std::vector<ActiveCollision> {
       }
     }
 
-    // Sort colliders by colliderEntity first, then by collidingPartitionId. This allows
-    // deterministic assembly of contact under scene resetting.
-    std::sort(begin(), end());
+    // Sort colliders by colliderEntity first, then by collidingPartitionId for deterministic
+    // assembly of contact under scene resetting. Stable removal preserves order and Clear()
+    // preserves both sort keys, so only appending collider blocks can require sorting.
+    if (appended) {
+      std::sort(begin(), end());
+    }
+    MOCHI_ASSERT_VERBOSE(std::is_sorted(begin(), end()), "Expected sorted active collisions.");
   }
 };
 
@@ -524,46 +515,6 @@ struct CDeformablePointAsyncCollisionsResponse {
   }
 };
 
-template <typename BvType>
-class ContactSamplesBvh : public NoCopy {
-  // BvhTree stores a raw pointer to PointSetBvhObject. Use unique_ptr's to avoid dangling pointers.
-  std::unique_ptr<PointSetBvhObject<BvType>> _object;
-  std::unique_ptr<BvhTree<BvType>> _bvh;
-
- public:
-  ContactSamplesBvh(Span<Real3 const> points)
-      : _object(std::make_unique<PointSetBvhObject<BvType>>(points)),
-        _bvh(
-            std::make_unique<BvhTree<BvType>>(
-                _object.get(),
-                BvhTreeParams{.splittingAlgorithm = BvhSplittingAlgorithm::TopDown_Mean})) {}
-
-  template <typename BvOther>
-  void FindIntersectingSamples(BvOther const& bv, DynamicArray<int>& outIntersectingSamples) const {
-    _bvh->template FindIntersectingElements</*kSkipElementBvCheck*/ true>(
-        bv, outIntersectingSamples);
-  }
-
-  void FindIntersectingSamples(
-      AnyBoundingVolume const& anyBv,
-      DynamicArray<int>& outIntersectingSamples) const {
-    std::visit([&](auto const& bv) { FindIntersectingSamples(bv, outIntersectingSamples); }, anyBv);
-  }
-
-  void Refit() {
-    _bvh->Refit();
-  }
-
-  int NumSamplePoints() const {
-    return _object->GetNumElements();
-  }
-
-  /// @brief Read-only access to the underlying bounding volume hierarchy (used for debug drawing).
-  BvhTree<BvType> const& GetBvh() const {
-    return *_bvh;
-  }
-};
-
 /// @brief Contains a vector of potential contact points of an actor in local space.
 struct ContactSamples : public NoCopy {
   /// @brief Non-default constructor for sizing of members used by all actor types.
@@ -592,7 +543,19 @@ struct ContactSamples : public NoCopy {
 
   /// @brief Optional BSH tree to accelerate collision detection by culling only sample points that
   /// are potentially in contact.
-  std::optional<ContactSamplesBvh<Sphere>> bsh;
+  std::optional<SphereOctTree> bsh;
+};
+
+// Sparse Jacobian from embedded contact-skin nodes to actor DoFs. Each row corresponds to one skin
+// node, and each Real3 entry is that node's derivative with respect to one actor DoF.
+struct CContactSkinningData : public NoCopy {
+  SparseMatrix<Real3> jacobian;
+};
+
+// Cached contact-skin node positions, pre-allocated during actor creation.
+struct CDeformedContactSkinNodes : public NoCopy {
+  DynamicArray<real> referencePositions;
+  DynamicArray<real> positions;
 };
 
 /**
@@ -729,6 +692,26 @@ struct JacData {
       }
     }
   }
+
+  [[nodiscard]] bool HasSolverDoFs() const {
+    return std::any_of(jacs->begin(), jacs->end(), [](ContactJac const& jac) {
+      return jac.nContacts > 0 && jac.nDoFsState > 0;
+    });
+  }
+
+  // Clear recycled slices, then preserve the contact count in the first slice with zero columns.
+  // Sync sparsity construction needs a colliding Jacobian to pair with the collider Jacobian; the
+  // slice identity is irrelevant because it contains no DoFs.
+  void SetZeroDofJacobian() {
+    MOCHI_ASSERT_VERBOSE(query != nullptr, "Missing contact query");
+    for (auto& jac : *jacs) {
+      jac.Resize(false, false, 0, 0, 0);
+      jac.SetJacAuxView({});
+    }
+    auto& jac = jacs->front();
+    jac.Resize(true, false, 0, 0, isize(query->sampleIndices));
+    jac.CompressIndices();
+  }
 };
 
 enum class CollRole { Colliding = 0, Collider = 1 };
@@ -754,52 +737,69 @@ struct CCollJacs : public std::vector<JacData>, NoCopy {
 
 inline void ValidateContactParams(ContactParams const& params, Error& error) {
   MOCHI_ERROR_IF_NOT(
-      params.penaltyCoefficient > 0_r,
+      IsFinite(params.penaltyCoefficient) && params.penaltyCoefficient > 0_r,
       error,
-      "Contact penalty coefficient (penaltyCoefficient) must be positive.");
+      "Contact penalty coefficient (penaltyCoefficient) must be finite and positive.");
   MOCHI_ERROR_IF_NOT(
-      params.penaltySmoothingHalfDistance >= 0_r,
+      IsFinite(params.penaltySmoothingHalfDistance) && params.penaltySmoothingHalfDistance >= 0_r,
       error,
-      "Contact penalty smoothing half-distance (penaltySmoothingHalfDistance) must not be negative.");
+      "Contact penalty smoothing half-distance (penaltySmoothingHalfDistance) must be finite and not "
+      "negative.");
   MOCHI_ERROR_IF_NOT(
-      params.penaltyThresholdExtraPadding >= 0_r,
+      IsFinite(params.penaltyThresholdDefault),
       error,
-      "Penalty threshold extra padding (penaltyThresholdExtraPadding) must not be negative.");
+      "Contact penalty threshold (penaltyThresholdDefault) must be finite.");
+  MOCHI_ERROR_IF_NOT(
+      IsFinite(params.penaltyThresholdExtraPadding) && params.penaltyThresholdExtraPadding >= 0_r,
+      error,
+      "Penalty threshold extra padding (penaltyThresholdExtraPadding) must be finite and not "
+      "negative.");
   MOCHI_ERROR_IF_NOT(
       params.maxAlignmentNormals >= -1_r && params.maxAlignmentNormals <= 1_r,
       error,
       "Maximum normal alignment (maxAlignmentNormals) must be in [-1, 1].");
   MOCHI_ERROR_IF_NOT(
-      params.coulombFrictionCoefficient >= 0_r,
+      IsFinite(params.coulombFrictionCoefficient) && params.coulombFrictionCoefficient >= 0_r,
       error,
-      "Coulomb friction coefficient (coulombFrictionCoefficient) must not be negative.");
+      "Coulomb friction coefficient (coulombFrictionCoefficient) must be finite and not negative.");
   MOCHI_ERROR_IF_NOT(
-      params.viscousFrictionCoefficient >= 0_r,
+      IsFinite(params.viscousFrictionCoefficient) && params.viscousFrictionCoefficient >= 0_r,
       error,
-      "Viscous friction coefficient (viscousFrictionCoefficient) must not be negative.");
+      "Viscous friction coefficient (viscousFrictionCoefficient) must be finite and not negative.");
   MOCHI_ERROR_IF_NOT(
-      params.frictionFalloffVel >= 0_r,
+      IsFinite(params.frictionFalloffVel) && params.frictionFalloffVel >= 0_r,
       error,
-      "Friction falloff velocity (frictionFalloffVel) must not be negative.");
+      "Friction falloff velocity (frictionFalloffVel) must be finite and not negative.");
   MOCHI_ERROR_IF_NOT(
-      params.normalViscousDampingCoefficient >= 0_r,
+      IsFinite(params.normalViscousDampingCoefficient) &&
+          params.normalViscousDampingCoefficient >= 0_r,
       error,
-      "Normal viscous damping coefficient (normalViscousDampingCoefficient) must not be negative.");
+      "Normal viscous damping coefficient (normalViscousDampingCoefficient) must be finite and not "
+      "negative.");
   MOCHI_ERROR_IF_NOT(
-      params.collidingPenaltyLengthScale > 0_r,
+      IsFinite(params.distanceErrorBound),
       error,
-      "Colliding penalty length scale (collidingPenaltyLengthScale) must be positive.");
+      "Contact distance error bound (distanceErrorBound) must be finite.");
+  MOCHI_ERROR_IF_NOT(
+      IsFinite(params.objScale) && params.objScale > 0_r,
+      error,
+      "Contact object scale (objScale) must be finite and strictly positive.");
+  MOCHI_ERROR_IF_NOT(
+      IsFinite(params.collidingPenaltyLengthScale) && params.collidingPenaltyLengthScale > 0_r,
+      error,
+      "Colliding penalty length scale (collidingPenaltyLengthScale) must be finite and positive.");
 }
 
 using ContactAssemblyReg = ecs::PartialRegistry<
+    CContactPairParamsOverrideTable const,
     CContactParams const,
     CPointCloudColliderParams const,
     CColliderInfo const,
     CFemSurfaceDiscretization const,
     TagStaticActor const,
     TagShellActor const,
+    TagUseDeformableContactSkin const,
     TagRodActor const,
-    TagUseVisualMeshContact const,
     CRootTransform const,
     CRigidState<TimeStep::Current> const,
     CRigidState<TimeStep::StageStart> const,
@@ -808,11 +808,11 @@ using ContactAssemblyReg = ecs::PartialRegistry<
 [[nodiscard]] inline int CollidingIntegralDim(
     ContactAssemblyReg const& reg,
     entt::entity colliding) {
-  // Rod actors with visual mesh contact integrate over a 2D surface. Rod actors using centerline
+  // Rod actors with a contact skin integrate over a 2D surface. Rod actors using centerline
   // contact lump contact traction on the centerline, taking a 1D line integral. All other actor
   // types currently integrate contact on 2D surfaces.
   if (reg.all_of<TagRodActor>(colliding)) {
-    return reg.all_of<TagUseVisualMeshContact>(colliding) ? 2 : 1;
+    return reg.all_of<TagUseDeformableContactSkin>(colliding) ? 2 : 1;
   }
   return 2;
   // NOTE: Contact with point masses would return 0 here, but it's not supported.
@@ -854,6 +854,7 @@ using ContactAssemblyReg = ecs::PartialRegistry<
  *
  * @param collidingParams Contact parameters from the colliding actor.
  * @param colliderParams Contact parameters from the collider actor.
+ * @param paramsOverride Optional pair-specific parameter replacements.
  * @param isStaticCollider If true, use the colliding actor's penalty and falloff values directly
  * instead of taking the geometric mean.
  * @param collidingIntegralDim The dimension of the colliding-side contact integral (2 for surfaces,
@@ -867,21 +868,47 @@ using ContactAssemblyReg = ecs::PartialRegistry<
 inline ContactParams CombineContactParams(
     ContactParams const& collidingParams,
     ContactParams const& colliderParams,
+    ContactPairParamsOverride const* paramsOverride,
     bool isStaticCollider,
     int collidingIntegralDim,
     int colliderIntegralDim,
     real colliderPenaltyLengthScale) {
   ContactParams pairParams = colliderParams;
+  if (paramsOverride != nullptr) {
+    pairParams = ApplyContactPairParamsOverride(pairParams, *paramsOverride);
+  }
 
   // Friction coefficients: Use the geometric mean of the colliding and collider actors.
-  pairParams.coulombFrictionCoefficient =
-      Sqrt(collidingParams.coulombFrictionCoefficient * colliderParams.coulombFrictionCoefficient);
-  pairParams.viscousFrictionCoefficient =
-      Sqrt(collidingParams.viscousFrictionCoefficient * colliderParams.viscousFrictionCoefficient);
-  pairParams.normalViscousDampingCoefficient = Sqrt(
-      collidingParams.normalViscousDampingCoefficient *
-      colliderParams.normalViscousDampingCoefficient);
-  if (Max(collidingParams.coulombFrictionCoefficient, collidingParams.viscousFrictionCoefficient) >
+  if (paramsOverride == nullptr || !paramsOverride->coulombFrictionCoefficient) {
+    pairParams.coulombFrictionCoefficient = Sqrt(
+        collidingParams.coulombFrictionCoefficient * colliderParams.coulombFrictionCoefficient);
+  }
+  if (paramsOverride == nullptr || !paramsOverride->viscousFrictionCoefficient) {
+    pairParams.viscousFrictionCoefficient = Sqrt(
+        collidingParams.viscousFrictionCoefficient * colliderParams.viscousFrictionCoefficient);
+  }
+  if (paramsOverride == nullptr || !paramsOverride->normalViscousDampingCoefficient) {
+    pairParams.normalViscousDampingCoefficient = Sqrt(
+        collidingParams.normalViscousDampingCoefficient *
+        colliderParams.normalViscousDampingCoefficient);
+  }
+  // Penalty coefficient and friction falloff velocity: Use the geometric mean if both actors are
+  // dynamic, and the colliding if the collider is static.
+  if (paramsOverride == nullptr || !paramsOverride->penaltyCoefficient) {
+    pairParams.penaltyCoefficient = isStaticCollider
+        ? collidingParams.penaltyCoefficient
+        : Sqrt(collidingParams.penaltyCoefficient * colliderParams.penaltyCoefficient);
+  }
+  if (paramsOverride == nullptr || !paramsOverride->frictionFalloffVel) {
+    pairParams.frictionFalloffVel = isStaticCollider
+        ? collidingParams.frictionFalloffVel
+        : Sqrt(collidingParams.frictionFalloffVel * colliderParams.frictionFalloffVel);
+  }
+
+  bool const hasFrictionOverride = paramsOverride != nullptr &&
+      (paramsOverride->coulombFrictionCoefficient || paramsOverride->viscousFrictionCoefficient);
+  if (!hasFrictionOverride &&
+      Max(collidingParams.coulombFrictionCoefficient, collidingParams.viscousFrictionCoefficient) >
           0_r &&
       Max(colliderParams.coulombFrictionCoefficient, colliderParams.viscousFrictionCoefficient) >
           0_r &&
@@ -889,15 +916,6 @@ inline ContactParams CombineContactParams(
     MOCHI_LOG_WARNING_ONCE(
         "Inconsistent friction coefficients between the contact pair. No friction will be applied.");
   }
-
-  // Penalty coefficient and friction falloff velocity: Use the geometric mean if both actors are
-  // dynamic, and the colliding if the collider is static.
-  pairParams.penaltyCoefficient = isStaticCollider
-      ? collidingParams.penaltyCoefficient
-      : Sqrt(collidingParams.penaltyCoefficient * colliderParams.penaltyCoefficient);
-  pairParams.frictionFalloffVel = isStaticCollider
-      ? collidingParams.frictionFalloffVel
-      : Sqrt(collidingParams.frictionFalloffVel * colliderParams.frictionFalloffVel);
 
   // If penalty tractions are integrated on some colliding manifold other than a 2D surface (e.g.,
   // lumping contact tractions on a thin rod's centerline), we need to correct the penalty factor
@@ -938,10 +956,14 @@ GetContactPairParams(ContactAssemblyReg const& reg, entt::entity colliding, entt
   int const collidingIntegralDim = CollidingIntegralDim(reg, colliding);
   int const colliderIntegralDim = ColliderIntegralDim(reg, collider);
   real const colliderPenaltyLengthScale = ColliderPenaltyLengthScale(reg, collider);
+  auto const& overrideTable = reg.ctx<CContactPairParamsOverrideTable const>();
+  ContactPairParamsOverride const* const paramsOverride =
+      overrideTable.Empty() ? nullptr : overrideTable.Find(colliding, collider);
 
   return CombineContactParams(
       collidingParams,
       colliderParams,
+      paramsOverride,
       isStaticCollider,
       collidingIntegralDim,
       colliderIntegralDim,
@@ -960,11 +982,9 @@ inline bool ValidCollidingNormals(ContactAssemblyReg const& reg, entt::entity co
 void UpdateStageStartDataPipeline(entt::registry& reg, CIslandDescendants const& descendants);
 
 template <TimeStep kTimeStep>
-MOCHI_API void CollisionDetectionPipeline(
-    entt::registry& reg,
-    CIslandDescendants const& descendants);
+void CollisionDetectionPipeline(entt::registry& reg, CIslandDescendants const& descendants);
 
-MOCHI_API void ContactJacobiansPipeline(
+void ContactJacobiansPipeline(
     entt::registry& reg,
     GradTarget gradTarget,
     CIslandDescendants const& descendants,
@@ -972,7 +992,7 @@ MOCHI_API void ContactJacobiansPipeline(
 
 // Collision detection for far SDF queries.
 // Handles both ContactType::Async and ContactType::Sync.
-MOCHI_API void FarSdfCollisionDetection(
+void FarSdfCollisionDetection(
     ecs::Included<TagUseContact, CRequiresFarSdfEvaluation>,
     entt::registry& reg,
     entt::entity ent);
@@ -982,17 +1002,23 @@ MOCHI_API void FarSdfCollisionDetection(
 */
 
 template <bool kUpdateOnlyActiveFaces, typename DiscretizationType, int kNumFields>
-void UpdateCollisionSamplePositionsImpl(
+void UpdateCollisionSamplePositionsFromNodeDisplacements(
     ColumnVectorView<real const> currSol,
     DiscretizationType const& boundaryDiscrVariant,
     CActiveBoundaryFaces const* activeBoundaryFaces,
     ContactSamples& outSamples);
 
+void UpdateCollisionSamplePositionsFromNodePositions(
+    Span<Real3 const> nodePositions,
+    CFemSurfaceDiscretization const& surfaceDiscretization,
+    ContactSamples& outSamples);
+
 // Updates the collision sample positions, having them match 1:1 the quadrature points of the
 // given discretization. Used for colliding objects with a deforming surface.
 template <typename DiscretizationType, TimeStep kTimeStep, int kNumFields>
-MOCHI_API void UpdateCollisionSamplePositions(
+void UpdateCollisionSamplePositions(
     ecs::RequiredTag<TagUseContact>,
+    ecs::Excluded<TagUseDeformableContactSkin>,
     CFinalDisplacementRef<kTimeStep> const& currSol,
     DiscretizationType const& discretization,
     CActiveBoundaryFaces const* activeBoundaryFaces,
@@ -1022,7 +1048,7 @@ void AddStageStartCollisionDetection(
 // Update CQuerySdfSurface which is used for debug drawing of the SDF surface and its normals.
 void UpdateQuerySdfSurface(
     CSdfCollider const& collider,
-    CBoundingVolume<TimeStep::Current> const& bounds,
+    CBoundingVolume const& bounds,
     CQuerySdfSurface& outQuery);
 
 // Update CQueryContactSamples which is used for debug drawing of contact samples.
@@ -1074,7 +1100,7 @@ void UpdateQueryActorContactForces(
     CQueryActorContactForces& outQueryActorForces);
 
 // Assemble collision response into DoFs
-MOCHI_API void AssembleCollisionResponse(
+void AssembleCollisionResponse(
     ContactAssemblyReg reg,
     entt::entity colliding,
     entt::entity collider,
@@ -1083,9 +1109,9 @@ MOCHI_API void AssembleCollisionResponse(
     Span<real const> intWeights,
     Span<ContactJac const*> jacs,
     Allocator* filoAllocator, // Will be used in first-in-last-out order
-    double* objective,
-    ColumnVectorView<real> residual,
-    AnyMatrixView<real> dresidual,
+    double* outObj,
+    ColumnVectorView<real> outRes,
+    AnyMatrixView<real> outDRes,
     bool isSyncRigid = false); // Optionally set to 'true' to improve performance when assembling
                                // sync contact between rigid (including articulated rigid) actors.
 
@@ -1100,10 +1126,26 @@ void AssembleIslandSyncContact(
     CIslandDescendants const& descendants,
     CIslandContactSnle& outContactSnle);
 
+// Builds the constant sparse Jacobian for a node-based linear contact-skin embedding.
+void InitializeLinearContactSkinningJacobian(
+    LinearMeshEmbedding const& embedding,
+    int numPhysicsNodes,
+    Span<int const> skinNodeIndices,
+    CContactSkinningData& outSkinning);
+
+// Sets up colliding Jacobians through DMap<DQuad, DMapRTConst, DMapSparseSkinning>.
+void SetupContactSkinCollidingJacobians(
+    ecs::RequiredTag<TagUseDeformableContactSkin>,
+    CFemSurfaceDiscretization const& surfaceDisc,
+    CRootTransform const& transform,
+    CDofOffset const& dofOffset,
+    CContactSkinningData const& skinningData,
+    CCollJacs<CollRole::Colliding>& outJacobians);
+
 // Assemble async contact for a single colliding actor whose contact samples are tied to its DoFs
 // through skinning/embedding (i.e. it carries CSkinnedContactSnle). Currently used for articulated
-// actors with skinned contact meshes, soft-skinned actors, and rod actors that use visual-mesh
-// contact. Results are written to CSkinnedContactSnle.
+// actors with skinned contact meshes, nested soft actors configured as colliding actors, and rod or
+// shell actors that use contact-skin surface contact. Results are written to CSkinnedContactSnle.
 void AssembleAsyncSkinnedContact(
     AssemblyParams const& params,
     bool useBlockSparse3x3,
@@ -1123,10 +1165,7 @@ void AssembleAsyncSkinnedContact(
 
 Aabb ExpandConservativeBoundsWithContactPadding(
     Aabb bounds,
-    ecs::PartialRegistry<
-        CContactParams const,
-        CRequiresFarSdfEvaluation const,
-        CPointCloudColliderParams const> reg,
+    ecs::PartialRegistry<CContactParams const, CRequiresFarSdfEvaluation const> reg,
     entt::entity e);
 
 inline real GetColliderPadding(ContactParams const& contactParams) {

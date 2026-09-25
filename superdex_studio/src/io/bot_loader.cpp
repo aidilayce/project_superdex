@@ -87,4 +87,15 @@ mochi::ShapeHandle SuperDexStudioBotLoader::LoadShape(
   return loader.LoadShape(path, bakeScale, bakeTransform, context, error);
 }
 
+mochi::ModelData SuperDexStudioBotLoader::LoadModelData(std::string_view path, mochi::Error& error)
+    const {
+  MOCHI_ERROR_RETURN(error, {});
+  // Prefer the in-memory (possibly edited) asset so remapped skin shapes reflect editor state.
+  if (auto* model = _manager->FindAssetByPath<MochiModelAsset>(mochi::Path{std::string(path)})) {
+    return model->GetModelData();
+  }
+  superdex::robotics::FileBotLoader loader;
+  return loader.LoadModelData(path, error);
+}
+
 } // namespace superdex::studio

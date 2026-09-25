@@ -13,15 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# PEP 723 inline metadata. The empty dependency list is not a no-op: without a script block,
-# `uv run` treats the surrounding directory as a project and syncs it first, building the
-# editable installs before this script starts. This script imports only the standard library.
+# PEP 723 inline metadata makes this script's empty dependency environment explicit, so
+# running it does not sync whichever uv project contains or invokes it. This script imports
+# only the standard library.
 # Auditing a Windows wheel's linkage additionally needs `delvewheel`, but it is run as a
 # subprocess rather than imported, and only for `win_amd64` wheels, so it stays out of the list
 # rather than being installed on the platforms that never reach that check.
 # /// script
 # requires-python = ">=3.12"
-# dependencies = []
+# dependencies = ["delvewheel==1.13.0"]
 # ///
 
 """Verify a wheelhouse built by `tools/build_wheels.py`.
@@ -162,6 +162,15 @@ TOOL_DISTRIBUTIONS = (
 
 PURE_WHEEL_NAMES = ("superdex_lab", "superdex")
 FP64_WHEEL_NAMES = ("superdex_physics_fp64", "superdex_robotics_fp64")
+NATIVE_WHEEL_NAMES = frozenset(
+    distribution.wheel_name for distribution in NATIVE_DISTRIBUTIONS
+)
+TOOL_WHEEL_NAMES = frozenset(
+    distribution.wheel_name for distribution in TOOL_DISTRIBUTIONS
+)
+
+MINIMUM_PYTHON_TAG = "cp312"
+STABLE_ABI_TAG = "abi3"
 
 # The studio's resource trees. It resolves both relative to its own executable, so they have to
 # be inside the payload directory.
@@ -192,11 +201,13 @@ _CORE_THIRD_PARTY_LICENSE_FILES = (
 )
 _PHYSICS_THIRD_PARTY_LICENSE_FILES = _CORE_THIRD_PARTY_LICENSE_FILES + (
     "entt/LICENSE",
-    "pybind11/LICENSE",
+    "nanobind/LICENSE",
+    "robin_map/LICENSE",
 )
 _ROBOTICS_THIRD_PARTY_LICENSE_FILES = _CORE_THIRD_PARTY_LICENSE_FILES + (
     "miniz/LICENSE",
-    "pybind11/LICENSE",
+    "nanobind/LICENSE",
+    "robin_map/LICENSE",
     "tinyxml2/LICENSE",
     "xxhash/LICENSE",
 )
@@ -282,6 +293,8 @@ _LIBRARY_FILE = re.compile(
     r"^(?:lib)?(?P<stem>[A-Za-z0-9_.+]+?)"
     # auditwheel and delvewheel append a content hash to libraries they vendor.
     r"(?:[-_][0-9a-f]{6,})?"
+    # Stable-ABI Python extensions carry this before the platform's library extension.
+    r"(?:\.abi3)?"
     # ELF puts the SOVERSION after the extension (libmarl.so.1); Mach-O puts it before
     # (libmarl.1.dylib), which the stem would otherwise swallow.
     r"\.(?:so|dylib|dll|pyd)(?:\.[0-9]+)*$"
@@ -675,6 +688,20 @@ def check_payload_layout(
         problems.append(
             f"{wheel.name}: {distribution.payload_dir} has no {distribution.extension} "
             f"extension (found {sorted(s for s in stems if s)})"
+        )
+    filename = _wheel_filename(wheel)
+    if (
+        filename is not None
+        and "abi3" in filename.abi_tags
+        and not any(tag.startswith("win_") for tag in filename.platform_tags)
+        and not any(
+            name.rsplit("/", 1)[-1] == f"{distribution.extension}.abi3.so"
+            for name in payload
+        )
+    ):
+        problems.append(
+            f"{wheel.name}: abi3-tagged wheel has no "
+            f"{distribution.extension}.abi3.so extension"
         )
     for library in distribution.own_libraries:
         if library not in stems:
@@ -1157,7 +1184,7 @@ def _canonical_arch(target: str, arch: str) -> str:
     return aliases.get((target, normalized), normalized)
 
 
-def check_target_tag(
+def check_target_tag(  # noqa: C901
     wheel: Path,
     *,
     target: str | None,
@@ -1165,21 +1192,39 @@ def check_target_tag(
     target_python: str | None,
     target_abi: str | None,
 ) -> list[str]:
-    """Reject foreign-platform and foreign-architecture wheels."""
+    """Reject wheels whose compatibility tags do not match the distribution."""
 
     filename = _wheel_filename(wheel)
     if filename is None:
         return [f"{wheel.name}: malformed wheel filename"]
+    distribution = _normalize_distribution(filename.distribution)
     platforms = filename.platform_tags
-    if platforms == ("any",):
-        if filename.python_tags != ("py3",) or filename.abi_tags != ("none",):
+    if distribution not in (
+        NATIVE_WHEEL_NAMES | TOOL_WHEEL_NAMES | set(PURE_WHEEL_NAMES)
+    ):
+        return [f"{wheel.name}: unrecognized distribution {distribution}"]
+    if distribution in PURE_WHEEL_NAMES:
+        if (
+            filename.python_tags != ("py3",)
+            or filename.abi_tags != ("none",)
+            or platforms != ("any",)
+        ):
             return [f"{wheel.name}: pure wheel must be tagged py3-none-any"]
         return []
+    if platforms == ("any",):
+        return [f"{wheel.name}: platform wheel must not be tagged for any platform"]
 
-    if target_python is not None and target_python not in filename.python_tags:
-        return [f"{wheel.name}: Python tag does not match target {target_python}"]
-    if target_abi is not None and target_abi not in filename.abi_tags:
-        return [f"{wheel.name}: ABI tag does not match target {target_abi}"]
+    if distribution in NATIVE_WHEEL_NAMES:
+        expected_python = target_python or MINIMUM_PYTHON_TAG
+        expected_abi = target_abi or STABLE_ABI_TAG
+    else:
+        expected_python = "py3"
+        expected_abi = "none"
+
+    if expected_python not in filename.python_tags:
+        return [f"{wheel.name}: Python tag does not match target {expected_python}"]
+    if expected_abi not in filename.abi_tags:
+        return [f"{wheel.name}: ABI tag does not match target {expected_abi}"]
 
     selected_target = target or platform.system()
     prefixes = {
@@ -1435,7 +1480,7 @@ for module_name, module in tuple(sys.modules.items()):
         origins.append(Path(module_file).resolve())
     origins.extend(Path(path).resolve() for path in getattr(module, "__path__", ()))
     if not origins:
-        # pybind11's def_submodule() registers e.g. `superdex_robotics.bots` through
+        # Native def_submodule() calls register e.g. `superdex_robotics.bots` through
         # PyImport_AddModule, so it has no file, no __path__ and no spec. No finder ever
         # located it: it is part of whatever binary its parent was loaded from, and that
         # parent is checked in its own right. A top-level name has no parent to inherit
@@ -1461,8 +1506,8 @@ from pathlib import Path
 
 expect_double = os.environ["SUPERDEX_EXPECT_DOUBLE"] == "1"
 
-import superdex.physics as physics
-import superdex.robotics as robotics
+import superdex.physics as sdp
+import superdex.robotics as sdr
 
 """
     + MODULE_ORIGIN_AUDIT
@@ -1482,7 +1527,7 @@ try:
 finally:
     physics.shutdown()
 
-print("smoke ok:", "double" if reported else "single", physics.__file__)
+print("smoke ok:", "fp64" if reported else "fp32", physics.__file__)
 """
 )
 
@@ -1493,11 +1538,11 @@ try:
     import superdex.physics
 except ImportError as error:
     message = str(error)
-    assert "superdex-physics[double]" in message, f"unhelpful error: {message}"
+    assert "superdex-physics[fp64]" in message, f"unhelpful error: {message}"
     print("missing-payload error ok")
     sys.exit(0)
 
-sys.exit("importing superdex.physics at double precision should have failed")
+sys.exit("importing superdex.physics at FP64 should have failed")
 """
 
 
@@ -1646,25 +1691,43 @@ def check_complete_install(workspace: Path, wheelhouse: Path, deps: Path) -> Non
     _run_script(
         python,
         SMOKE_TEST,
-        {"SUPERDEX_EXPECT_DOUBLE": "1", "SUPERDEX_PRECISION": "double"},
+        {"SUPERDEX_EXPECT_DOUBLE": "1", "SUPERDEX_PRECISION": "fp64"},
     )
 
 
-def check_single_precision_install(
-    workspace: Path, wheelhouse: Path, deps: Path
-) -> None:
-    """Without the `double` extra, asking for double precision explains itself."""
+def check_fp32_install(workspace: Path, wheelhouse: Path, deps: Path) -> None:
+    """Without the `fp64` extra, asking for FP64 explains itself."""
 
-    python = _create_venv(workspace / "single")
+    python = _create_venv(workspace / "fp32")
     _install_offline(python, wheelhouse, deps, "superdex-physics", "superdex-robotics")
     _run_script(python, SMOKE_TEST, {"SUPERDEX_EXPECT_DOUBLE": "0"})
-    _run_script(python, MISSING_PAYLOAD_TEST, {"SUPERDEX_PRECISION": "double"})
+    _run_script(python, MISSING_PAYLOAD_TEST, {"SUPERDEX_PRECISION": "fp64"})
 
 
-def check_double_extra_install(workspace: Path, wheelhouse: Path, deps: Path) -> None:
-    """The `[double]` extra pulls in the fp64 wheel and makes double precision work."""
+def check_fp64_extra_install(workspace: Path, wheelhouse: Path, deps: Path) -> None:
+    """The `[fp64]` extra pulls in the FP64 wheel and makes FP64 work."""
 
     python = _create_venv(workspace / "extra")
+    _install_offline(
+        python,
+        wheelhouse,
+        deps,
+        "superdex-physics[fp64]",
+        "superdex-robotics[fp64]",
+    )
+    _run_script(
+        python,
+        SMOKE_TEST,
+        {"SUPERDEX_EXPECT_DOUBLE": "1", "SUPERDEX_PRECISION": "fp64"},
+    )
+
+
+def check_legacy_double_extra_install(
+    workspace: Path, wheelhouse: Path, deps: Path
+) -> None:
+    """The legacy `[double]` extra and precision value continue to select FP64."""
+
+    python = _create_venv(workspace / "legacy-double-extra")
     _install_offline(
         python,
         wheelhouse,
@@ -1855,8 +1918,9 @@ def _run_runtime_checks(
         if not args.skip_download:
             populate_dependencies(_create_venv(workspace / "download"), wheels, deps)
         check_complete_install(workspace, wheelhouse, deps)
-        check_single_precision_install(workspace, wheelhouse, deps)
-        check_double_extra_install(workspace, wheelhouse, deps)
+        check_fp32_install(workspace, wheelhouse, deps)
+        check_fp64_extra_install(workspace, wheelhouse, deps)
+        check_legacy_double_extra_install(workspace, wheelhouse, deps)
 
 
 def main() -> int:

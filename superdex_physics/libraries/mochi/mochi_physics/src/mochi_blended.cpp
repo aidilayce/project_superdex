@@ -26,6 +26,7 @@
 #include <mochi_core/rom/rom_hyper_reduction.h>
 #include <mochi_core/utils/basic_utils.h>
 #include <mochi_core/utils/container_utils.h>
+#include <mochi_core/utils/dskinning.h>
 #include <mochi_core/utils/sparsity_utils.h>
 #include <mochi_core/utils/task_scheduler.h>
 
@@ -137,7 +138,7 @@ static void InitBlendedMesh(
         "No blending data for this soft actor");
     MOCHI_ERROR_RETURN(error);
     int const numNodes = reg.get<CSimplicialMesh const>(soft).mesh->GetNumNodes();
-    blending.emplace_back(blendingDataTarget->second.GetSourceBlendingData<1>(numNodes));
+    blending.emplace_back(blendingDataTarget->second.GetSourceBlendingData(numNodes));
   }
 
   // If needed, emplace the per-soft-actor active node component
@@ -172,52 +173,80 @@ static void InitBlendedMesh(
 }
 
 /*
- * System to update the blended positions after skinning.
+ * System to update the blended displacements after skinning.
  */
 template <TimeStep kStep, bool kForceUseAllNodes = false>
 static void ResolveBlending(
-    ecs::PartialRegistry<CDisplacementSlice<real, kStep, DisplacementLayer::Skinned> const> reg,
+    ecs::PartialRegistry<
+        CArticulatedSkinningData const,
+        CDisplacementSlice<real, kStep, DisplacementLayer::Skinned> const> reg,
     CBlendedComposition const& composition,
     CBlendingData const& blendingData,
+    CArticulatedSkinningData const& skinningData,
     CActiveUniqueNodes const* activeNodes,
     CBlendedActiveNodes const* activeNodesBlended,
+    CRootTransform const& rootTransform,
     CDisplacementSlice<real, kStep, DisplacementLayer::Skinned>& outDisplacements) {
   MOCHI_PROFILE_SCOPE();
   MOCHI_ASSERT(
       (activeNodes == nullptr) == (activeNodesBlended == nullptr), "Inconsistent active nodes");
 
-  // Note that displacements are already initialized with the articulated displacements
+  // Note that displacements are already initialized with the articulated displacements.
+  // Articulation displacements are in local frame; soft displacements/positions are in world frame.
   auto disp3 = Unflatten<Real3>(MakeSpan(outDisplacements.value));
+  auto const rest3 = Unflatten<Real3 const>(MakeConstSpan(skinningData.restCoords));
+  auto const rootFromWorld = Invert(rootTransform.worldFromLocal);
 
-  // Iterate over soft skinned actors and blend displacements
+  // Iterate over nested soft actors and blend displacements
   for (int s = 0; s < composition.soft.size(); s++) {
+    entt::entity const soft = composition.soft[s];
     auto const& blending = blendingData[s];
     auto const& softDisp =
-        reg.template get<CDisplacementSlice<real, kStep, DisplacementLayer::Skinned> const>(
-            composition.soft[s]);
-    auto softDisp3 = Unflatten<Real3 const>(MakeConstSpan(softDisp.value));
+        reg.template get<CDisplacementSlice<real, kStep, DisplacementLayer::Skinned> const>(soft);
+    auto const softDisp3 = Unflatten<Real3 const>(MakeConstSpan(softDisp.value));
+    auto const& softSkinningData = reg.template get<CArticulatedSkinningData const>(soft);
+    auto const softRest3 = Unflatten<Real3 const>(MakeConstSpan(softSkinningData.restCoords));
 
     // Define the nodes to blend
     auto const nodes = (activeNodes && !kForceUseAllNodes) ? MakeConstSpan((*activeNodesBlended)[s])
                                                            : MakeConstSpan(blending.nodesSource);
     for (int src : nodes) {
-      // Blend the displacements of the soft actor and the articulated actor.
+      // Convert soft position to local displacement and blend it.
       int const dst = blending.mappingSourceToTarget[src];
-      disp3[dst] += blending.weightsSource[src] * (softDisp3[src] - disp3[dst]);
+      Real3 const softLocalDisp =
+          rootFromWorld.TransformPoint(softRest3[src] + softDisp3[src]) - rest3[dst];
+      disp3[dst] += blending.weightsSource[src] * (softLocalDisp - disp3[dst]);
     }
   }
 }
 
-/*
- * Pipeline to resolve current blending displacements for all nodes, including inactive nodes when
- * subsampling is enabled.
- */
-static void ResolveAllNodeBlendingDisplacementsPipeline(
+void blended::ResolveAllNodeBlendingDisplacementsPipeline(
     entt::registry& reg,
     Span<entt::entity const> entities) {
   MOCHI_PROFILE_SCOPE();
   ecs::InvokeForEach<ecs::policy::AllowReadWriteSameComponent>(
       &ResolveBlending<TimeStep::Current, /* kForceUseAllNodes */ true>, reg, entities);
+}
+
+void blended::UpdateBlendingVelocity(
+    ecs::PartialRegistry<CVelocitySlice<real, TimeStep::Current, DisplacementLayer::Skinned> const>
+        reg,
+    CBlendedComposition const& composition,
+    CBlendingData const& blendingData,
+    CVelocitySlice<real, TimeStep::Current, DisplacementLayer::Skinned>& inOutVelocity) {
+  // Velocity is initialized with world-space skinning velocity. Blend the soft actor contribution.
+  auto blendedVel3 = Unflatten<Real3>(inOutVelocity.value.GetSpan());
+  for (int s = 0; s < isize(composition.soft); ++s) {
+    auto const soft = composition.soft[s];
+    auto const softVel3 = Unflatten<Real3 const>(
+        reg.get<CVelocitySlice<real, TimeStep::Current, DisplacementLayer::Skinned> const>(soft)
+            .value.GetConstSpan());
+    auto const& blending = blendingData[s];
+    for (int src : blending.nodesSource) {
+      int const dst = blending.mappingSourceToTarget[src];
+      blendedVel3[dst] += blending.weightsSource[src] * (softVel3[src] - blendedVel3[dst]);
+    }
+  }
 }
 
 void blended::InitBlendedActor(
@@ -238,7 +267,7 @@ void blended::InitBlendedActor(
   composition.softHandles.reserve(softHandles.size());
   for (auto handle : softHandles) {
     auto entity = GetEntity(reg, handle, ErrorAssert{});
-    MOCHI_ASSERT(reg.all_of<TagSoftSkinnedActor const>(entity), "Not a soft skinned actor.");
+    MOCHI_ASSERT(reg.all_of<TagNestedSoftActor const>(entity), "Not a nested soft actor.");
     composition.soft.emplace_back(entity);
     composition.softHandles.emplace_back(handle);
   }
@@ -281,7 +310,7 @@ static void ResolveJacobianDJoints(
   // Note that the Jacobian is already initialized with the articulated Jacobian
   auto result = AsView(outSkinningData.jacobianDJoints);
 
-  // Iterate over soft skinned actors and blend Jacobians
+  // Iterate over nested soft actors and blend Jacobians
   for (int s = 0; s < composition.soft.size(); s++) {
     auto const& blending = blendingData[s];
     auto const& softJac =
@@ -357,15 +386,23 @@ void blended::SetupCollidingJacobians(
   }
 
   // Prepare bone rotations
-  std::vector<VMatrix3x3r> rotations(linkTransforms.size());
-  auto const& transforms = skinningInfo.skinningTransform.GetParameterizations();
-  for (int i = 0; i < rotations.size(); i++) {
-    auto const& preTransform = transforms[i].preTransform.GetRotation();
-    rotations[i] = ToVMatrix3x3(linkTransforms[i].GetRotation() * preTransform);
-  }
+  MOCHI_ASSERT_VERBOSE(linkTransforms.size() == skinningInfo.skinningTransform.GetBoneCount());
+  MOCHI_FILO_STACK_ALLOCATOR(rotationAllocator, details::kBoneJacobiansStackSize);
+  DynamicArray<VMatrix3x3r> rotations(&rotationAllocator);
+  details::ComputeBoneJacobians</*kTranspose*/ false>(
+      skinningInfo.skinningTransform, linkTransforms, rotations);
 
   // Compute Jacobians
   ParallelForEach("SetupCollidingJacobianSoftSkinned", jacobiansActive, 1, [&](JacData* jacData) {
+    auto const& descriptors =
+        contactPartitions[jacData->query->collidingPartitionId].GetDofDescriptors();
+    auto dofs = MakeConstSpan(std::get<DynamicArray<int>>(descriptors[0]));
+    int const softId = std::get<int>(descriptors[1]);
+    if (dofs.empty() && softId < 0) {
+      jacData->SetZeroDofJacobian();
+      return;
+    }
+
     discretization.Visit([&](auto const& discretizationImpl) {
       using DiscretizationImplT = std::decay_t<decltype(discretizationImpl)>;
       using DQuad = DMapQuad<typename DiscretizationImplT::ElementT>;
@@ -378,9 +415,6 @@ void blended::SetupCollidingJacobians(
 
       // Get the soft actor from the contact partition [possibly none].
       std::optional<entt::entity> soft;
-      auto const& variantId =
-          contactPartitions[jacData->query->collidingPartitionId].GetDofDescriptors()[1];
-      int softId = std::get<int>(variantId);
       if (softId >= 0) {
         soft = composition.soft[softId];
       }
@@ -403,9 +437,6 @@ void blended::SetupCollidingJacobians(
       // Prepare the skinning dmap
       std::optional<DMapSkinInput> dskinIn;
       std::optional<DMapSkinNoInput> dskinNoIn;
-      auto const& dofsVariant =
-          contactPartitions[jacData->query->collidingPartitionId].GetDofDescriptors()[0];
-      auto dofs = MakeConstSpan(std::get<DynamicArray<int>>(dofsVariant));
       if (soft) {
         dskinIn.emplace(1, skinningJacobian, dofs, dofOffset.dofsOffset, skinningData, rotations);
       } else {

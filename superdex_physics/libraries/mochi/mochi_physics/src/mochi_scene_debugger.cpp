@@ -16,6 +16,7 @@
 
 #include "mochi_scene_debugger.h"
 #include "mochi_scene.h"
+#include "mochi_step.h"
 
 #include <mochi_core/geometry/mesh_data.h>
 #include <mochi_core/net/message_dispatcher.h>
@@ -126,6 +127,7 @@ class SceneDebuggerImpl final : public SceneDebugger {
   void SendSyncIfRequested(SceneImpl* scene);
 
   // Message Handlers (called on the scene's thread)
+  void OnDebugDrawRequest(SceneImpl* scene, protocol::DebugDrawRequest&& request);
   void OnSceneStepRequest(SceneImpl* scene, protocol::SceneStepRequest&& request);
   void OnSceneSyncRequest(SceneImpl* scene, protocol::SceneSyncRequest&& request);
 
@@ -139,7 +141,7 @@ class SceneDebuggerImpl final : public SceneDebugger {
   Guarded<DynamicArray<std::unique_ptr<net::Message>>> _inbox;
   DynamicArray<std::unique_ptr<net::Message>> _newMessages;
 
-  // Counts simulation steps. Incremented only in OnPostStep.
+  // Counts simulation steps. Incremented in OnPostStep.
   uint64_t _stepCounter = 1;
 
   // Sync state. Only touched on the scene's owning (step) thread.
@@ -203,6 +205,9 @@ void SceneDebuggerImpl::Init(SceneImpl* scene) {
   MOCHI_ASSERT(_sceneHandle.IsValid(), "Invalid SceneHandle");
 
   // Register message handlers
+  _dispatcher.Register<protocol::DebugDrawRequest>([this](auto* scene, auto&& msg) {
+    OnDebugDrawRequest(scene, std::forward<decltype(msg)>(msg));
+  });
   _dispatcher.Register<protocol::SceneStepRequest>([this](auto* scene, auto&& msg) {
     OnSceneStepRequest(scene, std::forward<decltype(msg)>(msg));
   });
@@ -405,6 +410,38 @@ void SceneDebuggerImpl::OnReceiveAsync(std::unique_ptr<net::Message> msg) {
   _inbox.Mutate([&](auto& inbox) { inbox.emplace_back(std::move(msg)); });
 }
 
+void SceneDebuggerImpl::OnDebugDrawRequest(SceneImpl* scene, protocol::DebugDrawRequest&& request) {
+  MOCHI_ASSERT_VERBOSE(request.scene == _sceneHandle, "Received by the wrong scene");
+  protocol::DebugDrawReply reply(request);
+
+  auto& debugDraw = scene->GetDebugDraw();
+  int const numFeatures = debugDraw.GetNumFeatures();
+  if (isize(request.featureEnable) != numFeatures) {
+    reply.error = Format(
+        "Expected %d debug draw feature flags but received %d",
+        numFeatures,
+        isize(request.featureEnable));
+    MOCHI_LOG_WARNING("[SceneDebugger] Ignoring DebugDrawRequest. %s.", reply.error.c_str());
+  } else {
+    bool didChange = debugDraw.IsEnabled() != request.masterEnable;
+    debugDraw.Enable(request.masterEnable);
+    for (int i = 0; i < numFeatures; ++i) {
+      didChange |= debugDraw.IsFeatureEnabled(i) != request.featureEnable[i];
+      debugDraw.EnableFeature(i, request.featureEnable[i]);
+    }
+
+    // The visible state of the scene changed, so the client should receive fresh data on the next
+    // pump, even while paused.
+    if (didChange) {
+      ++_stepCounter;
+    }
+  }
+
+  if (request.sendReply) {
+    SendToClient(reply);
+  }
+}
+
 void SceneDebuggerImpl::OnSceneStepRequest(SceneImpl* scene, protocol::SceneStepRequest&& request) {
   protocol::SceneStepReply reply(request);
 
@@ -441,6 +478,9 @@ void SceneDebuggerImpl::OnSceneStepRequest(SceneImpl* scene, protocol::SceneStep
         // Increment the step counter because the state of the scene has changed
         // and should thus be synced to client.
         ++_stepCounter;
+
+        // Re-process queries after RestoreStateFromBytes
+        UpdateAllActorQueries(scene->GetRegistry());
       } else {
         reply.error =
             Format("Failed to restore initial scene state. Reason: %s", error.GetDescription());
@@ -455,7 +495,7 @@ void SceneDebuggerImpl::OnSceneStepRequest(SceneImpl* scene, protocol::SceneStep
 
 void SceneDebuggerImpl::OnSceneSyncRequest(SceneImpl* scene, protocol::SceneSyncRequest&& request) {
   MOCHI_ASSERT_VERBOSE(request.scene == _sceneHandle, "Received by the wrong scene");
-  bool const disableAutoSync = request.enableAutoSync.has_value() && !*request.enableAutoSync;
+  bool const wasSyncingMeshes = _sync && _sync->syncActors && _sync->syncMeshes;
 
   // If enableAutoSync.has_value() then enable/disable auto-syncing. Otherwise this is a one-time
   // sync request that must not affect the active syncing state.
@@ -486,6 +526,13 @@ void SceneDebuggerImpl::OnSceneSyncRequest(SceneImpl* scene, protocol::SceneSync
     request.syncMeshes = false;
   }
 
+  bool const isSyncingMeshes = _sync && _sync->syncActors && _sync->syncMeshes;
+  bool const preserveMeshQueries = wasSyncingMeshes && isSyncingMeshes;
+  if (!preserveMeshQueries) {
+    UpdateMeshQueries(scene, /*meshesEnabled=*/false, /*useVisualMesh=*/false);
+  }
+  request.syncMeshes = request.syncMeshes && isSyncingMeshes;
+
   // Send a reply immediately
   if (request.sendReply) {
     SendSyncReply(
@@ -495,11 +542,6 @@ void SceneDebuggerImpl::OnSceneSyncRequest(SceneImpl* scene, protocol::SceneSync
         request.syncMeshes,
         request.useVisualMesh,
         request.requestId);
-  }
-
-  if (disableAutoSync) {
-    // The immediate reply may gather meshes, so clean up afterward to end in a disabled state.
-    UpdateMeshQueries(scene, /*meshesEnabled=*/false, /*useVisualMesh=*/false);
   }
 }
 
@@ -756,6 +798,13 @@ void SceneDebuggerImpl::ShutdownOnSceneThread(SceneImpl* scene) {
 
   // No more syncing
   _sync = std::nullopt;
+
+  // The debugger owns debug draw while connected. Return the scene to a fully disabled state.
+  auto& debugDraw = scene->GetDebugDraw();
+  debugDraw.Enable(false);
+  for (int i = 0; i < debugDraw.GetNumFeatures(); ++i) {
+    debugDraw.EnableFeature(i, false);
+  }
 
   // Cancel all queries
   UpdateMeshQueries(scene, /*meshesEnabled*/ false, /*useVisualMesh*/ false);

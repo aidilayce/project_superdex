@@ -140,6 +140,16 @@ void MochiModelAsset::ClearShapeCache() {
   _shapeCache.clear();
 }
 
+mochi::MeshDataView MochiModelAsset::GetNativeSurfaceMesh(mochi::Error& error) {
+  using namespace mochi;
+  // Load the native (unbaked) shape once (cached) and read its render surface -- the tetrahedral
+  // boundary for a tet mesh, or the triangle surface itself for a surface mesh. This is the same
+  // surface-mesh data the physics engine exposes, so the vertex ordering/count matches the
+  // per-frame SurfaceNodePositions query during simulation.
+  ShapeHandle const shape = GetShape(Real3{1_r, 1_r, 1_r}, TransformRT::Identity(), error);
+  return _manager->GetStudio()->GetMochiContext()->GetShapeSurfaceMesh(shape, error);
+}
+
 mochi::MeshDataView MochiModelAsset::GetNativeSoftSurface(mochi::Error& error) {
   using namespace mochi;
   // Only tetrahedral (volumetric) models have a soft-body boundary surface; anything else (surface
@@ -149,11 +159,7 @@ mochi::MeshDataView MochiModelAsset::GetNativeSoftSurface(mochi::Error& error) {
         "MochiModelAsset: model is not a tetrahedral mesh; cannot build a soft surface.");
     return {};
   }
-  // Load the native (unbaked) shape once (cached) and read its boundary surface -- the same
-  // surface-mesh data the physics engine exposes, so the vertex ordering/count matches the
-  // per-frame SurfaceNodePositions query during simulation.
-  ShapeHandle const shape = GetShape(Real3{1_r, 1_r, 1_r}, TransformRT::Identity(), error);
-  return _manager->GetStudio()->GetMochiContext()->GetShapeSurfaceMesh(shape, error);
+  return GetNativeSurfaceMesh(error);
 }
 
 bool MochiModelAsset::BakeSoftSurface(
@@ -164,7 +170,7 @@ bool MochiModelAsset::BakeSoftSurface(
     std::vector<int>& indices) {
   using namespace mochi;
   ErrorLog e;
-  MeshDataView const surface = GetNativeSoftSurface(e);
+  MeshDataView const surface = GetNativeSurfaceMesh(e);
   if (!e.IsOK() || surface.IsEmpty()) {
     return false;
   }
@@ -193,6 +199,12 @@ bool MochiModelAsset::BakeSoftSurface(
 int MochiModelAsset::GetSoftSurfaceVertexCount() {
   mochi::ErrorLog e;
   mochi::MeshDataView const surface = GetNativeSoftSurface(e);
+  return (e.IsOK() && !surface.IsEmpty()) ? surface.GetNumNodes() : 0;
+}
+
+int MochiModelAsset::GetSurfaceVertexCount() {
+  mochi::ErrorLog e;
+  mochi::MeshDataView const surface = GetNativeSurfaceMesh(e);
   return (e.IsOK() && !surface.IsEmpty()) ? surface.GetNumNodes() : 0;
 }
 
@@ -231,6 +243,71 @@ bool MochiModelAsset::CreateSoftDynamicMeshes(
       /*isClosed=*/true,
       /*castShadows=*/true,
       /*isDynamic=*/true);
+  return true;
+}
+
+bool MochiModelAsset::BakeSoftSurfaceSkinning(
+    std::vector<int>& boneIndices,
+    std::vector<float>& boneWeights,
+    int& weightsPerNode,
+    int& outMaxBoneIndex) {
+  using namespace mochi;
+  ErrorLog e;
+  MeshDataView const surface = GetNativeSurfaceMesh(e);
+  if (!e.IsOK() || surface.IsEmpty() || !surface.skinning) {
+    return false;
+  }
+  auto const& skin = *surface.skinning;
+  weightsPerNode = skin.weightsPerNode;
+  if (weightsPerNode <= 0 || skin.indices.empty()) {
+    return false;
+  }
+  boneIndices.assign(skin.indices.begin(), skin.indices.end());
+  boneWeights.resize(skin.weights.size());
+  for (int i = 0; i < isize(skin.weights); ++i) {
+    boneWeights[i] = static_cast<float>(skin.weights[i]);
+  }
+  outMaxBoneIndex = -1;
+  for (int idx : boneIndices) {
+    outMaxBoneIndex = std::max(outMaxBoneIndex, idx);
+  }
+  return true;
+}
+
+bool MochiModelAsset::CreateSkinnedCollisionWireframe(
+    mochi::Real3 const& bakeScale,
+    mochi::TransformRT const& shapeTransform,
+    int boneCount,
+    std::unique_ptr<WireframeMesh>& outWireframe) {
+  std::vector<float> positions;
+  std::vector<float> normals;
+  std::vector<int> indices;
+  if (!BakeSoftSurface(bakeScale, shapeTransform, positions, normals, indices)) {
+    return false;
+  }
+  std::vector<int> boneIndices;
+  std::vector<float> boneWeights;
+  int weightsPerNode = 0;
+  int maxBoneIndex = -1;
+  if (!BakeSoftSurfaceSkinning(boneIndices, boneWeights, weightsPerNode, maxBoneIndex)) {
+    return false;
+  }
+  // Allocate at least enough bones to cover the referenced indices (bone index == articulation link
+  // index; boneCount is the caller's link count, so this is normally already sufficient).
+  int const allocatedBones = std::max(boneCount, maxBoneIndex + 1);
+  ResourceManager& rm = _manager->GetStudio()->GetResourceManager();
+  outWireframe = WireframeMesh::CreateSkinnedWireframeMesh(
+      rm.GetEngine(),
+      mochi::MakeConstSpan(positions),
+      mochi::MakeConstSpan(normals),
+      mochi::MakeConstSpan(indices),
+      mochi::MakeConstSpan(boneIndices),
+      mochi::MakeConstSpan(boneWeights),
+      weightsPerNode,
+      allocatedBones,
+      rm.CreateWireframeMaterial({_wireframeColor.x, _wireframeColor.y, _wireframeColor.z, 1.0f}),
+      rm.CreateFlatLitOpaqueMaterial(_color),
+      /*isClosed=*/true);
   return true;
 }
 
@@ -292,9 +369,9 @@ bool MochiModelAsset::ReloadFromDisk() {
     return false;
   }
   _modelData = std::move(reloaded);
-  // Physics shapes were baked from the previous model data; drop them so consumers re-bake from the
-  // reloaded data on their next GetShape.
-  ClearShapeCache();
+  // Physics shapes were baked from the previous model data; drop them everywhere they are cached so
+  // consumers re-bake from the reloaded data on their next physics load.
+  _manager->InvalidateShapeCachesForPath(_path);
   // Re-point the single render mesh (and every live instance -- open editors, staged bot scenes) at
   // the reloaded geometry.
   if (_renderModel) {

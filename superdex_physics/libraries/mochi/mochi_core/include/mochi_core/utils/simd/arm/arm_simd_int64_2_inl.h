@@ -40,9 +40,9 @@ class Simd<int64_t, 2> {
     return vgetq_lane_s64(v.raw, i);
   }
 
-  [[nodiscard]] MOCHI_FORCE_INLINE static Scalar Get(Simd v, int i) {
+  [[nodiscard]] MOCHI_FORCE_INLINE Scalar operator[](int i) const {
     MOCHI_ASSERT_VERBOSE(i >= 0 && i < kSize, "Index out of range");
-    return v.raw[i];
+    return raw[i];
   }
 
   [[nodiscard]] MOCHI_FORCE_INLINE static Simd Set(Simd v, int i, Scalar value) {
@@ -311,6 +311,7 @@ class Simd<int64_t, 2> {
 
   template <int kShift>
   [[nodiscard]] MOCHI_FORCE_INLINE static Simd ShiftRight(Simd a) {
+    static_assert(kShift >= 0 && kShift < 64, "Shift amount out-of-range");
     return vshrq_n_s64(a.raw, kShift);
   }
 };

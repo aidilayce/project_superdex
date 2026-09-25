@@ -16,6 +16,7 @@
 
 #include "rendering/viewport.h"
 #include "app/app.h"
+#include "rendering/measure_tool.h"
 #include "rendering/scene_stage.h"
 #include "ui/imgui_widgets.h"
 
@@ -120,6 +121,7 @@ static float ToolbarButtonSize() {
       ICON_FA_HOME,
       ICON_FA_VIDEO,
       ICON_FA_CUBES,
+      ICON_FA_RULER,
   };
   float maxIconWidth = 0.0f;
   for (char const* icon : kToolbarIcons) {
@@ -172,7 +174,7 @@ Viewport::Viewport(SuperDexStudio* studio, mochi_renderer::SceneViewSettings con
   _renderScene->CreateSunlight();
   _renderScene->CreateIndirectLight();
   _renderScene->CreateGroundPlane();
-  _renderScene->SetIbl(_studio->GetDefaultIbl());
+  _renderScene->SetIbl(_studio->GetCurrentIbl());
   _renderScene->SetSkyboxVisible(false);
   _renderScene->CreateDebugDraw();
   auto const& converter = _studio->GetEditorToRendererSpaceConverter();
@@ -198,6 +200,15 @@ Viewport::Viewport(SuperDexStudio* studio, mochi_renderer::SceneViewSettings con
        .onToggle = [this] { _showGroundGrid = !_showGroundGrid; },
        .getState = [this] { return _showGroundGrid; },
        .shortcut = ImGuiKey_G});
+  // The Measure tool, like the grid, belongs to every viewport rather than to one editor, so it is
+  // registered here. Ctrl+M rather than M: M is already the Bot Editor's Center of Mass toggle.
+  _measureTool = std::make_unique<MeasureTool>(_studio, this);
+  RegisterShowCommand(
+      {.name = "Measure Tool",
+       .onToggle = [this] { _measureTool->ToggleFromShortcut(); },
+       .getState = [this] { return _measureTool->IsActive(); },
+       .isEnabled = [this] { return _measureTool->IsAvailable(); },
+       .shortcut = ImGuiKey_M | ImGuiMod_Ctrl});
 }
 
 Viewport::~Viewport() {
@@ -705,6 +716,16 @@ void Viewport::ShowViewportContents(bool showCameraOrientationGizmo) {
     HandleShowCommandShortcuts();
   }
 
+  // The Measure tool gets the cursor before the drag/selection paths below. While it is active it
+  // has already turned enableViewportPicking / enableSceneObjectDrag off (see
+  // MeasureTool::SetActive), so those paths are gated out and a measure click cannot also reselect
+  // a link or start a force-drag.
+  HandleMeasureToolInput(
+      !orientationGizmoActive && !transformGizmoActive && !transformGizmoToolbarClicked &&
+          !ImGui::GetIO().KeyAlt,
+      renderHeight,
+      fbScale);
+
   // Scene-object drag (left-drag on an object). The drag is issued on press but only commits once
   // the pointer moves past a threshold, so a plain click still falls through to selection. Alt+left
   // is excluded so it drives the camera's orbit instead.
@@ -1143,6 +1164,29 @@ bool Viewport::ShowCameraOrientationToolbar() const {
     ImGui::SetTooltip(isPerspective ? "Perspective (Numpad 5)" : "Orthographic (Numpad 5)");
   }
 
+  // Measure tool, enabled only when availalble (i.e. not during simulation)
+  bool const measureAvailable = _measureTool->IsAvailable();
+  bool const measureActive = _measureTool->IsActive();
+  ImGui::SetCursorScreenPos({startX, startY + 3.0f * rowStride});
+  ImGui::BeginDisabled(!measureAvailable);
+  if (measureActive) {
+    ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+  }
+  if (ImGui::Button(ICON_FA_RULER "##MeasureTool", {buttonSize, buttonSize})) {
+    // ToggleFromShortcut which opens the panel automatically
+    _measureTool->ToggleFromShortcut();
+    clicked = true;
+  }
+  if (measureActive) {
+    ImGui::PopStyleColor();
+  }
+  ImGui::EndDisabled();
+  if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+    ImGui::SetTooltip(
+        measureAvailable ? "Measure Tool (Ctrl+M)"
+                         : "Measure Tool unavailable while the simulation is running");
+  }
+
   ImGui::PopFont();
   ImGui::PopStyleVar(); // ImGuiStyleVar_FrameRounding
   return clicked;
@@ -1500,6 +1544,45 @@ bool Viewport::ShowTransformGizmoToolbar() {
   return toolbarClicked;
 }
 
+void Viewport::HandleMeasureToolInput(bool canPick, int renderHeight, float fbScale) {
+  // Switch the tool off as soon as an editor withdraws it (e.g. a simulation starts). This has to
+  // happen here, once per frame, rather than in the panel: the panel is closed by default, and the
+  // Show menu and the Ctrl+M shortcut both honour isEnabled -- so an unavailable tool left on would
+  // be unreachable, still picking stale geometry and still holding the picking gates off.
+  if (_measureTool->IsActive() && !_measureTool->IsAvailable()) {
+    _measureTool->SetActive(false);
+  }
+  if (!_measureTool->IsActive()) {
+    return;
+  }
+  // A single step re-pauses within the step, so the tool never sees an unpaused frame and cannot
+  // notice the geometry moved from the pause state alone. Checked before the pick below so a click
+  // on the frame after a step lands on a selection that was already cleared.
+  _measureTool->DiscardSelectionIfPoseChanged();
+  if (!canPick || !ImGui::IsWindowHovered()) {
+    _measureTool->ClearHover();
+    return;
+  }
+  ImVec2 const mousePos = ImGui::GetMousePos();
+  ImVec2 const windowPos = ImGui::GetWindowPos();
+  float const pickX = (mousePos.x - windowPos.x) * fbScale;
+  float const localY = (mousePos.y - windowPos.y) * fbScale;
+  // Filament indexes the framebuffer bottom-up while ImGui is top-down.
+  float const pickY = static_cast<float>(renderHeight) - 1.0f - localY;
+  WorldRay const ray = _renderScene->ScreenPixelToWorldRay(pickX, pickY);
+
+  // Commit on release, and only when the press did not turn into a drag -- the same rule the
+  // selection pick uses, so orbiting the camera never also measures.
+  bool commit = false;
+  if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+    ImVec2 const drag = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+    constexpr float kDragThresholdPx = 3.0f;
+    commit = drag.x * drag.x + drag.y * drag.y < kDragThresholdPx * kDragThresholdPx;
+  }
+  bool const additive = ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift;
+  _measureTool->ProcessCursorRay(ray.origin, ray.direction, commit, additive);
+}
+
 void Viewport::DrawDebug() {
   auto* dd = GetRenderScene()->GetDebugDraw();
   if (_showGroundGrid) {
@@ -1511,6 +1594,7 @@ void Viewport::DrawDebug() {
       dd->DrawBox(object->GetAABB(), filament::math::float4{1.0f, 0.0f, 0.0f, 1.0f});
     }
   }
+  _measureTool->DrawDebug(dd, &_debugText);
 }
 
 void Viewport::ShowDebugText(ImVec2 contentOrigin, float logicalWidth, float logicalHeight) {

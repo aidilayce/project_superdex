@@ -65,6 +65,7 @@ void mochi::AddRemoveOrRefComponentsForQuery(
     case QueryType::SurfaceNodePositions: {
       auto* component = AddRemoveOrRefComponent<CQuerySurfaceNodePositions>(reg, e, add);
       if (computeImmediately && component && component->nodePositions.empty()) {
+        ecs::TryInvokeOnEntity(&rod::UpdateQuerySurfaceNodePositions, reg, e);
         ecs::TryInvokeOnEntity(
             &UpdateQuerySurfaceNodePositions, reg, e); // compute results for new query
       }
@@ -98,7 +99,7 @@ void mochi::AddRemoveOrRefComponentsForQuery(
       auto* component = AddRemoveOrRefComponent<CQueryVisualNodePositions>(reg, e, add);
       AddRemoveOrRefComponent<CQueryVisualNodeNormals>(reg, e, add);
       if (computeImmediately && component && component->nodePositions.empty()) {
-        ecs::TryInvokeOnEntity(&rod::UpdateQueryRodVisualNodePositionsAndNormals, reg, e);
+        ecs::TryInvokeOnEntity(&rod::UpdateQueryVisualNodePositionsAndNormals, reg, e);
         ecs::TryInvokeOnEntity(&UpdateQueryVisualNodePositionsAndNormals, reg, e);
       }
     } break;

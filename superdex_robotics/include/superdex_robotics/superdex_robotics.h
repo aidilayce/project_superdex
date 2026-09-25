@@ -25,6 +25,10 @@
 
 #include <variant>
 
+#ifndef SUPERDEXROBOTICS_WITH_BOT_SCENE
+#define SUPERDEXROBOTICS_WITH_BOT_SCENE MOCHI_INTERNAL
+#endif
+
 namespace superdex::robotics {
 
 // Forwards:
@@ -322,11 +326,26 @@ struct BotPrefab {
   /// @ref mochi::ArticulatedCycleJointParams::childLink) are int indices into @ref links.
   DynamicArray<ArticulatedCycleJointParams> cycles;
 
+  /// Optional deformable skin skinned over the articulation's links, acting as a contact collidee.
+  /// When present, produces the @ref mochi::ArticulatedActorParams::skin at instantiation time.
+  std::optional<mochi::prefab::ArticulatedSkinPrefab> skin;
+
   // [Internal] The number of DOFs; computed at runtime by RebuildBotData; DO NOT TOUCH!
   int _numDofs = 0;
 
   // [Internal] Joint indices that are DOFS; computed at runtime by RebuildBotData; DO NOT TOUCH!
   DynamicArray<int> _dofIndices;
+
+  // [Internal] For a bot with a skin, the composed link name each skin bone index binds to
+  // (_skinBoneLinks[b] = link name for skin bone b). Empty means identity (bone b -> link b). Set
+  // by ApplyMod when a skin (or skinned sub-bot) is attached so the skin's baked bone indices can
+  // be remapped onto the reordered composed skeleton at instantiation time. Unlike
+  // _numDofs/_dofIndices this is NOT recomputed by RebuildBotData -- it captures composition
+  // history that cannot be reconstructed from a flattened bot, so it is serialized to survive a
+  // save/load round-trip (e.g. a flattened combo exported to a new .superdex_bot, or the UE
+  // importer's stored BotPrefab JSON). Empty for a base/standalone bot (NoSerializeDefaults omits
+  // it). Populated by ApplyMod only; DO NOT set by hand.
+  DynamicArray<DynamicString> _skinBoneLinks;
 
   MOCHI_STRUCT_BEGIN(superdex::robotics::BotPrefab)
   MOCHI_FIELD(name)
@@ -338,6 +357,8 @@ struct BotPrefab {
   MOCHI_FIELD(spatialTendons) MOCHI_ATTRIBUTE(NoSerializeDefaults);
   MOCHI_FIELD(contactOverrides) MOCHI_ATTRIBUTE(NoSerializeDefaults(/*recursive*/ false));
   MOCHI_FIELD(cycles) MOCHI_ATTRIBUTE(NoSerializeDefaults);
+  MOCHI_FIELD(skin) MOCHI_ATTRIBUTE(NoSerializeDefaults);
+  MOCHI_FIELD_NAME(_skinBoneLinks, "skinBoneLinks") MOCHI_ATTRIBUTE(NoSerializeDefaults);
   MOCHI_STRUCT_END()
 };
 
@@ -443,9 +464,22 @@ struct ReplaceLinkWithBot : BotModBase {
 };
 
 /**
+ * @brief Modification that attaches a deformable skin to the bot.
+ */
+struct AttachSkin : BotModBase {
+  /// The skin skinned over the bot's links (shape .mochi.h5 + render .glb + nonCollidingLinks).
+  mochi::prefab::ArticulatedSkinPrefab skin;
+
+  MOCHI_STRUCT_BEGIN(superdex::robotics::AttachSkin)
+  MOCHI_BASE_CLASS(superdex::robotics::BotModBase)
+  MOCHI_FIELD(skin)
+  MOCHI_STRUCT_END()
+};
+
+/**
  * @brief A bot modification action.
  */
-using BotMod = std::variant<AttachBot, AttachLink, ReplaceLink, ReplaceLinkWithBot>;
+using BotMod = std::variant<AttachBot, AttachLink, ReplaceLink, ReplaceLinkWithBot, AttachSkin>;
 
 /**
  * @brief Recipe for building a @ref BotPrefab by modifying a base bot.
@@ -460,10 +494,16 @@ struct ModBotPrefab {
   /// Ordered list of modifications to apply to the base bot.
   DynamicArray<BotMod> modifications;
 
+  /// Contact-filter overrides applied on top of the composed bot, after all modifications. Lets a
+  /// mod bot opt specific link/skin pairs in or out even though its composed BotPrefab (and its
+  /// contactOverrides) is regenerated on every build.
+  DynamicArray<BotContactOverride> contactOverrides;
+
   MOCHI_STRUCT_BEGIN(superdex::robotics::ModBotPrefab)
   MOCHI_FIELD(name)
   MOCHI_FIELD(base)
   MOCHI_FIELD(modifications) MOCHI_ATTRIBUTE(NoSerializeDefaults);
+  MOCHI_FIELD(contactOverrides) MOCHI_ATTRIBUTE(NoSerializeDefaults);
   MOCHI_STRUCT_END()
 };
 

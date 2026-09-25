@@ -19,6 +19,7 @@
 #include "editors/asset_editor.h"
 #include "editors/bot_editor_contact.h"
 #include "editors/bot_editor_control.h"
+#include "io/glb_export.h"
 #include "rendering/bot_visualization.h"
 #include "rendering/scene_stage.h"
 #include "rendering/viewport.h"
@@ -107,6 +108,7 @@ class BotEditor : public AssetEditor {
   ImGuiWindowFlags GetBotWindowFlags() const;
   void ShowBotDetailsWindow(bool* open);
   void ShowBotLinkDetailsWindow(bool* open);
+  void ShowBotSkinWindow(bool* open);
   void ApplyBotParamsEdit();
   bool ShowBotJointEditorWidgets(superdex::robotics::BotJointPrefab& joint, bool isRoot);
   bool ShowBotLinkEditorWidgets(
@@ -165,6 +167,20 @@ class BotEditor : public AssetEditor {
       std::vector<std::string>& outNewNames,
       std::vector<bool>& outRowInvalid);
 
+  //------------------------------------------------------------------------------------------------
+  // Export Skeletal GLB
+  //------------------------------------------------------------------------------------------------
+
+  struct GlbExportState {
+    bool open = false;
+    GlbExportOptions options;
+    bool requestExport = false;
+  };
+  // Reset the options to their defaults and request the modal to open.
+  void OpenExportSkeletalGlbModal();
+  // Shows the modal for .glb export with customization options
+  void ShowExportSkeletalGlbModal();
+
  private:
   // target asset
   BotAsset* _botAsset = nullptr;
@@ -180,8 +196,29 @@ class BotEditor : public AssetEditor {
     std::vector<std::string> linkNames;
     std::vector<mochi::TransformRT> linkTransforms;
     mochi::DynamicArray<float> transmissionDisplacements;
+    // Per-step deformed skin surface (0 or 1 entry), applied to the staged "Skin" dynamic mesh.
+    std::vector<SoftMeshUpdate> softMeshUpdates;
+    // Per-step skin joint poses (0 or 1 entry), applied to the staged skin's GPU-skinned render
+    // model. Carries the per-link world transforms in nested-link (== GLB joint) order.
+    std::vector<SkinnedPoseUpdate> skinnedPoseUpdates;
   };
   mochi_renderer::ProducerConsumerBuffer<SimData> _simData;
+  // Skin surface queries held while simulating: registered on the articulated actor in
+  // CreatePhysicsActors when the bot has a skin, cancelled in DestroyPhysicsActors. The deformed
+  // (linear-blend-skinned) collision surface is read each step into SimData::softMeshUpdates and
+  // applied to the staged "Skin" dynamic mesh by name.
+  struct SkinQueryState {
+    mochi::QueryHandle positions;
+    mochi::QueryHandle normals;
+    std::string name;
+    bool active = false;
+    // For a composed (mod) bot that adopted a sub-bot's skin, maps skin bone index (== GLB joint
+    // order) to the merged articulation's link index, so per-step link transforms can be reordered
+    // into skin-bone order before posing the GPU-skinned skin. Empty for a natively skinned bot
+    // (bone i == link i), meaning "use link transforms as-is".
+    std::vector<int> boneRemap;
+  };
+  SkinQueryState _skinQuery;
   // UI state
   int _selectedBotLinkIndex = -1;
   bool _forceLinkFocus = false;
@@ -207,6 +244,8 @@ class BotEditor : public AssetEditor {
   BotContactEstimator _contactEstimator;
   // batch rename dialog state
   BatchRenameState _batchRename;
+  // export skeletal GLB dialog state
+  GlbExportState _glbExport;
 };
 
 } // namespace superdex::studio

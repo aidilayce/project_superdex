@@ -27,6 +27,7 @@
 #include <mochi_core/linear_algebra/utils/matrix_concepts.h>
 #include <mochi_core/linear_algebra/utils/matrix_conversions.h>
 #include <mochi_core/mochi_platform.h>
+#include <mochi_core/utils/array_utils.h>
 #include <mochi_core/utils/graph_views.h>
 #include <mochi_core/utils/rand_utils.h>
 
@@ -98,9 +99,11 @@ struct AMGOptions {
   /// SPD. Use an explicit non-negative @ref relaxationFactor, or a larger @ref
   /// spectralRadiusSafetyFactor, when a conservative damping policy is required.
   /// @note Negative values use 2/3 for non-BlockJacobi smoothers.
-  /// @note If auto-estimation fails at a level, the preconditioner logs a warning and keeps that
-  /// level's current factor. During construction this is the default factor. During @ref Update it
-  /// is the previous factor for that level.
+  /// @note If auto-estimation fails at a level, the preconditioner logs a warning and uses 2/3 for
+  /// that level, also in @ref AMGPrec::Update instead of keeping the previous factor, because the
+  /// preconditioner must be free of hysteresis: updating it with a matrix must yield the same
+  /// preconditioner as constructing it from that matrix. Callers rely on this, e.g., to reconstruct
+  /// a preconditioner instead of persisting it.
   T relaxationFactor = T(-1);
 
   /// @brief Number of pre-smoothing iterations.
@@ -187,6 +190,10 @@ struct AMGPrec : Preconditioner<Scalar> {
       ColumnVectorView<Scalar> Px,
       ParallelWorkerInfo const& data) const override;
 
+  /// @brief Return how many times each worker waits on @c data.barrier in one
+  /// @ref ConcurrentSolve call.
+  [[nodiscard]] int NumConcurrentSolveBarriers() const;
+
   constexpr PreconditionerType GetType() const override {
     return kType;
   }
@@ -236,7 +243,7 @@ struct AMGPrec : Preconditioner<Scalar> {
 
   DynamicArray<AMGLevel<Scalar, kDofsPerNode>> _coarsenings = {};
   using SmootherType = typename std::variant<
-      BlockJacobiPrec<Scalar, kDofsPerNode>,
+      BlockJacobiPrec<Scalar, kDofsPerNode, /*kIsSymmetric*/ true>,
       ColoredSSORPrec<BlockSparseMatrixView<Scalar const, kDofsPerNode, int const, int const>>>;
   DynamicArray<SmootherType> _relaxOps = {};
   RowMatrix<Scalar> _coarseInverse;
@@ -247,6 +254,52 @@ struct AMGPrec : Preconditioner<Scalar> {
 
   template <bool kWithInitialX, typename VectorIn, typename VectorOut>
   void VCycle(VectorIn const& b, VectorOut& x, int s, ParallelWorkerInfo const& data) const;
+
+  /// @brief Return whether @ref Solve, @ref operator() and @ref ConcurrentSolve run
+  /// @ref FusedFineCycle.
+  [[nodiscard]] bool UsesFusedFineCycle() const {
+    return _options.smoother == Smoother::BlockJacobi && _options.numPreSmoothingSteps == 1 &&
+        _options.numPostSmoothingSteps == 1;
+  }
+
+  /**
+   * @brief @ref VCycle at level 0 from a zero initial guess, specialized to one block Jacobi pre-
+   * and post-smoothing step.
+   *
+   * @details Drops two of the barriers of @ref VCycle. Pre-smoothing from zero, y = omega D^{-1} b,
+   * is row-local, so it needs no barrier before it. The post-smoothing residual reads the corrected
+   * iterate from a separate buffer, so the smoothed result can be written to @p x without waiting
+   * for the other workers to finish reading it.
+   *
+   * @param[in] b RHS.
+   * @param[out] x Output vector.
+   * @param[in] data Parallel worker info.
+   */
+  void FusedFineCycle(
+      ColumnVectorView<Scalar const> b,
+      ColumnVectorView<Scalar> x,
+      ParallelWorkerInfo const& data) const;
+
+  /**
+   * @brief Coarse-grid correction e = P h on this worker's rows, where h is @ref VCycle at level
+   * s + 1 applied to Pt (b - A_s x).
+   *
+   * @details Uses three barriers, the first of which publishes @p x. @p e is written last, so it
+   * may alias the r/z workspace that the coarse V-cycle uses.
+   *
+   * @param[in] b RHS at level @p s.
+   * @param[in] x Iterate at level @p s.
+   * @param[out] e Correction at level @p s.
+   * @param[in] s Level.
+   * @param[in] data Parallel worker info.
+   */
+  template <typename VectorB, typename VectorX>
+  void CoarseCorrection(
+      VectorB const& b,
+      VectorX const& x,
+      ColumnVectorView<Scalar> e,
+      int s,
+      ParallelWorkerInfo const& data) const;
 
   /**
    * @brief Smoothing.
@@ -349,13 +402,15 @@ Scalar EstimateSpectralRadiusPowerMethod(
 /// @details Runs preconditioned CG on the system (A, D) with zero initial guess and a random RHS.
 /// The Lanczos/Ritz interpretation assumes A and D are SPD. The CG coefficients (alpha, beta)
 /// define a symmetric tridiagonal matrix T whose eigenvalues (Ritz values) approximate the
-/// eigenvalues of D^{-1} A. The largest eigenvalue of T is computed via @ref
-/// SelfAdjointEigenDecomposition. Near-zero residual norm is treated as PCG convergence.
-/// Non-finite values or materially negative curvature/residual norm make the estimate fail.
+/// eigenvalues of D^{-1} A. Runs at most min(numIterations, A.Rows()) iterations unless the
+/// represented residual becomes exactly zero first. Non-positive or non-finite recurrence values
+/// make the estimate fail. The largest eigenvalue of T is computed via @ref
+/// SelfAdjointEigenDecomposition.
 ///
 /// @param[in] A Matrix operator. Must support Apply(v, Av) and Rows().
 /// @param[in] invDiag Diagonal preconditioner D^{-1}. Must support Solve(in, out).
-/// @param[in] numIterations Number of PCG iterations. Determines the size of T.
+/// @param[in] numIterations Requested PCG iteration budget, clamped to the scalar dimension of A.
+/// The completed iteration count determines the dimension of T.
 /// @return Deterministic finite-iteration Ritz estimate of lambda_max(D^{-1} A), or 0 if the
 /// estimate fails.
 ///
@@ -367,6 +422,11 @@ auto EstimateSpectralRadius(MatrixOp const& A, PrecOp const& invDiag, int numIte
   MOCHI_ASSERT_VERBOSE(numIterations > 0, "Number of iterations must be positive.");
 
   int const n = A.Rows();
+  if (n <= 0) {
+    return Scalar(0);
+  }
+
+  int const maxIterations = Min(numIterations, n);
   // Workspace: columns are r, z, p, Ap
   Matrix<Scalar> W(n, 4);
   auto r = W.Col(0);
@@ -377,8 +437,8 @@ auto EstimateSpectralRadius(MatrixOp const& A, PrecOp const& invDiag, int numIte
   // Storage for the CG coefficients
   DynamicArray<Scalar> alphas;
   DynamicArray<Scalar> betas;
-  alphas.reserve(numIterations);
-  betas.reserve(numIterations - 1);
+  alphas.reserve(maxIterations);
+  betas.reserve(maxIterations - 1);
 
   // Initial residual r_0 is random (zero initial guess)
   SetXorShiftRandom(r);
@@ -388,16 +448,15 @@ auto EstimateSpectralRadius(MatrixOp const& A, PrecOp const& invDiag, int numIte
   Scalar rTz = z.Dot(r);
   if (!IsFinite(rTz) || rTz <= Scalar(0)) {
     MOCHI_LOG_WARNING(
-        "Could not estimate the largest eigenvalue when building AMG (non-positive initial r^T z).");
+        "Could not estimate the largest eigenvalue when building AMG (non-positive or non-finite initial r^T z).");
     return Scalar(0);
   }
-  Scalar const rTzConvergenceTolerance = Scalar(64) * std::numeric_limits<Scalar>::epsilon() * rTz;
 
   // p_0 = z_0
   p = z;
 
   int m = 0;
-  for (int iter = 0; iter < numIterations; ++iter) {
+  for (int iter = 0; iter < maxIterations; ++iter) {
     Apply(A, p, Ap);
     Scalar const pTAp = p.Dot(Ap);
     if (!IsFinite(pTAp) || pTAp <= Scalar(0)) {
@@ -406,8 +465,16 @@ auto EstimateSpectralRadius(MatrixOp const& A, PrecOp const& invDiag, int numIte
       return Scalar(0);
     }
     Scalar const alpha = rTz / pTAp;
+    if (!IsFinite(alpha) || alpha <= Scalar(0)) {
+      MOCHI_LOG_WARNING(
+          "Could not estimate the largest eigenvalue when building AMG (non-positive or non-finite alpha).");
+      return Scalar(0);
+    }
     alphas.push_back(alpha);
     ++m;
+    if (iter + 1 == maxIterations) {
+      break;
+    }
 
     // r_{i+1} = r_i - alpha * A * p
     r -= alpha * Ap;
@@ -420,18 +487,26 @@ auto EstimateSpectralRadius(MatrixOp const& A, PrecOp const& invDiag, int numIte
           "Could not estimate the largest eigenvalue when building AMG (non-finite updated r^T z).");
       return Scalar(0);
     }
-    if (rTzNew < -rTzConvergenceTolerance) {
+    if (rTzNew <= Scalar(0)) {
+      auto const rValues = r.GetConstSpan();
+      if (!IsFinite(rValues)) {
+        MOCHI_LOG_WARNING(
+            "Could not estimate the largest eigenvalue when building AMG (non-finite updated residual).");
+        return Scalar(0);
+      }
+      if (rTzNew == Scalar(0) && MaxAbs(rValues) == Scalar(0)) {
+        break;
+      }
       MOCHI_LOG_WARNING(
-          "Could not estimate the largest eigenvalue when building AMG (materially negative updated r^T z).");
+          "Could not estimate the largest eigenvalue when building AMG (non-positive updated r^T z with nonzero residual).");
       return Scalar(0);
     }
-    if (rTzNew <= rTzConvergenceTolerance) {
-      break;
-    }
-    if (iter + 1 == numIterations) {
-      break;
-    }
     Scalar const beta = rTzNew / rTz;
+    if (!IsFinite(beta) || beta <= Scalar(0)) {
+      MOCHI_LOG_WARNING(
+          "Could not estimate the largest eigenvalue when building AMG (non-positive or non-finite beta).");
+      return Scalar(0);
+    }
     betas.push_back(beta);
     rTz = rTzNew;
 
@@ -445,10 +520,24 @@ auto EstimateSpectralRadius(MatrixOp const& A, PrecOp const& invDiag, int numIte
   // T(j,j)   = 1/alpha_j + beta_{j-1}/alpha_{j-1}
   // T(j,j+1) = sqrt(beta_j) / alpha_j
   auto T = Matrix<Scalar>::Zero(m, m);
-  T(0, 0) = Scalar(1) / alphas[0];
+  Scalar const invAlpha0 = Scalar(1) / alphas[0];
+  if (!IsFinite(invAlpha0) || invAlpha0 <= Scalar(0)) {
+    MOCHI_LOG_WARNING("Could not build a positive finite AMG Ritz matrix.");
+    return Scalar(0);
+  }
+  T(0, 0) = invAlpha0;
   for (int j = 1; j < m; ++j) {
-    T(j, j) = Scalar(1) / alphas[j] + betas[j - 1] / alphas[j - 1];
-    Scalar const offDiag = Sqrt(betas[j - 1]) / alphas[j - 1];
+    Scalar const invAlpha = Scalar(1) / alphas[j];
+    Scalar const invAlphaPrev = Scalar(1) / alphas[j - 1];
+    Scalar const betaOverAlpha = betas[j - 1] * invAlphaPrev;
+    Scalar const diag = invAlpha + betaOverAlpha;
+    Scalar const offDiag = Sqrt(betas[j - 1]) * invAlphaPrev;
+    if (invAlpha <= Scalar(0) || betaOverAlpha <= Scalar(0) || !IsFinite(diag) ||
+        !IsFinite(offDiag)) {
+      MOCHI_LOG_WARNING("Could not build a positive finite AMG Ritz matrix.");
+      return Scalar(0);
+    }
+    T(j, j) = diag;
     T(j, j - 1) = offDiag;
     T(j - 1, j) = offDiag;
   }
@@ -519,9 +608,7 @@ AMGPrec<Scalar, kDofsPerNode>::AMGPrec(
 template <typename Scalar, int kDofsPerNode>
 template <typename VectorIn, typename VectorOut>
 void AMGPrec<Scalar, kDofsPerNode>::operator()(VectorIn const& x, VectorOut&& Px) const {
-  Preconditioner<Scalar>::ValidateInputOutput(_Af.Rows(), x, Px);
-  Px.SetZero();
-  VCycle<false>(x, Px, 0, ParallelWorkerInfo{0, 1, 0, Px.Rows(), ParallelBarrier(1)});
+  ConcurrentSolve(x, Px, ParallelWorkerInfo{0, 1, 0, Px.Rows(), ParallelBarrier(1)});
 }
 
 template <typename Scalar, int kDofsPerNode>
@@ -530,6 +617,10 @@ void AMGPrec<Scalar, kDofsPerNode>::ConcurrentSolve(
     ColumnVectorView<Scalar> Px,
     ParallelWorkerInfo const& data) const {
   Preconditioner<Scalar>::ValidateInputOutput(_Af.Rows(), x, Px);
+  if (UsesFusedFineCycle()) {
+    FusedFineCycle(x, Px, data);
+    return;
+  }
   Px.MiddleRows(data.rBegin, data.rEnd - data.rBegin).SetZero();
   VCycle<false>(x, Px, 0, data);
 }
@@ -606,6 +697,72 @@ void AMGPrec<Scalar, kDofsPerNode>::VCycle(
   }
 
   auto const n = x.Rows(); // Fine size
+  ColumnVectorView<Scalar> r(_workspace.data.get() + _workspace.rOffset, n);
+  ColumnVectorView<Scalar> z(_workspace.data.get() + _workspace.zOffset, n);
+
+  Smoothing<kWithInitialX>(_options.numPreSmoothingSteps, b, x, r, z, s, data);
+
+  CoarseCorrection(b, x, r, s, data);
+  x.MiddleRows(data.rBegin, numRows) += r.MiddleRows(data.rBegin, numRows);
+  //
+  if (_options.smoother == Smoother::ApproximateJacobi) {
+    // TODO(T185403857): Parallelize TransposeApply.
+    if (data.workerId == 0) {
+      ColumnVectorView<Scalar const> h(
+          _workspace.data.get() + _workspace.hOffset[s], _coarsenings[s].PtAP.Rows());
+      _coarsenings[s].PtA.TransposeApply(h, z);
+    }
+    //
+    // Next lines are equivalent to
+    // Smoothing<false>(1, "-z", x, r, z, s);
+    //
+    data.BarrierWait(); // Wait for 'z' to be up-to-date.
+    std::get<0>(_relaxOps[s]).ConcurrentSolve(z, r, data);
+    x.MiddleRows(data.rBegin, numRows) -=
+        _relaxationFactors[s] * r.MiddleRows(data.rBegin, numRows);
+  } else {
+    Smoothing<true>(_options.numPostSmoothingSteps, b, x, r, z, s, data);
+  }
+}
+
+template <typename Scalar, int kDofsPerNode>
+void AMGPrec<Scalar, kDofsPerNode>::FusedFineCycle(
+    ColumnVectorView<Scalar const> b,
+    ColumnVectorView<Scalar> x,
+    ParallelWorkerInfo const& data) const {
+  MOCHI_ASSERT_VERBOSE(UsesFusedFineCycle(), "Fused cycle requires 1+1 block Jacobi smoothing.");
+
+  auto const& smoother = std::get<0>(_relaxOps.front());
+  auto const omega = _relaxationFactors.front();
+  auto const n = x.Rows();
+  auto const rowBegin = data.rBegin;
+  auto const rowEnd = data.rEnd;
+  auto const numRows = rowEnd - rowBegin;
+  ColumnVectorView<Scalar> u(_workspace.data.get() + _workspace.rOffset, n);
+  ColumnVectorView<Scalar> r(_workspace.data.get() + _workspace.zOffset, n);
+
+  // 'x' holds the pre-smoothed iterate y until post-smoothing.
+  smoother.ConcurrentSolve(b, x, data);
+  x.MiddleRows(rowBegin, numRows) *= omega;
+  CoarseCorrection(b, x, u, 0, data);
+  u.MiddleRows(rowBegin, numRows) += x.MiddleRows(rowBegin, numRows);
+  data.BarrierWait(); // Wait for 'u' to be up-to-date.
+  _Af.ApplyToRange(u, r, rowBegin, rowEnd);
+  r.MiddleRows(rowBegin, numRows) =
+      b.MiddleRows(rowBegin, numRows) - r.MiddleRows(rowBegin, numRows);
+  smoother.ConcurrentSolve(r, x, data);
+  x.MiddleRows(rowBegin, numRows) =
+      u.MiddleRows(rowBegin, numRows) + omega * x.MiddleRows(rowBegin, numRows);
+}
+
+template <typename Scalar, int kDofsPerNode>
+template <typename VectorB, typename VectorX>
+void AMGPrec<Scalar, kDofsPerNode>::CoarseCorrection(
+    VectorB const& b,
+    VectorX const& x,
+    ColumnVectorView<Scalar> e,
+    int s,
+    ParallelWorkerInfo const& data) const {
   auto const nodeBegin = data.rBegin / kDofsPerNode;
   auto const nodeEnd = data.rEnd / kDofsPerNode;
 
@@ -619,12 +776,8 @@ void AMGPrec<Scalar, kDofsPerNode>::VCycle(
   auto const coarseRowEnd = coarseNodeEnd * kDofsPerNode;
   auto const numCoarseRows = coarseRowEnd - coarseRowBegin;
 
-  ColumnVectorView<Scalar> r(_workspace.data.get() + _workspace.rOffset, n);
-  ColumnVectorView<Scalar> z(_workspace.data.get() + _workspace.zOffset, n);
   ColumnVectorView<Scalar> g(_workspace.data.get() + _workspace.gOffset[s], N);
   ColumnVectorView<Scalar> h(_workspace.data.get() + _workspace.hOffset[s], N);
-
-  Smoothing<kWithInitialX>(_options.numPreSmoothingSteps, b, x, r, z, s, data);
 
   data.BarrierWait(); // Wait for 'x' to be up-to-date.
   _coarsenings[s].T.RestrictToNodeRange(b, g, coarseNodeBegin, coarseNodeEnd);
@@ -639,25 +792,43 @@ void AMGPrec<Scalar, kDofsPerNode>::VCycle(
   }
   //
   data.BarrierWait(); // Wait for 'h' to be up-to-date.
-  _coarsenings[s].T.InterpolateToNodeRange(h, r, nodeBegin, nodeEnd);
-  x.MiddleRows(data.rBegin, numRows) += r.MiddleRows(data.rBegin, numRows);
-  //
-  if (_options.smoother == Smoother::ApproximateJacobi) {
-    // TODO(T185403857): Parallelize TransposeApply.
-    if (data.workerId == 0) {
-      _coarsenings[s].PtA.TransposeApply(h, z);
-    }
-    //
-    // Next lines are equivalent to
-    // Smoothing<false>(1, "-z", x, r, z, s);
-    //
-    data.BarrierWait(); // Wait for 'z' to be up-to-date.
-    std::get<0>(_relaxOps[s]).ConcurrentSolve(z, r, data);
-    x.MiddleRows(data.rBegin, numRows) -=
-        _relaxationFactors[s] * r.MiddleRows(data.rBegin, numRows);
-  } else {
-    Smoothing<true>(_options.numPostSmoothingSteps, b, x, r, z, s, data);
+  _coarsenings[s].T.InterpolateToNodeRange(h, e, nodeBegin, nodeEnd);
+}
+
+template <typename Scalar, int kDofsPerNode>
+int AMGPrec<Scalar, kDofsPerNode>::NumConcurrentSolveBarriers() const {
+  if (UsesFusedFineCycle()) {
+    // CoarseCorrection's three barriers, plus FusedFineCycle's wait for 'u'.
+    return 4;
   }
+  int const numPre = _options.numPreSmoothingSteps;
+  int const numPost = _options.numPostSmoothingSteps;
+  int numBarriers = 0;
+  if (numPre > 0) {
+    // The first pre-smoothing step waits once. Later steps also publish the previous x.
+    numBarriers += 2 * numPre - 1;
+  }
+  // CoarseCorrection's three barriers.
+  numBarriers += 3;
+  switch (_options.smoother) {
+    case Smoother::ApproximateJacobi:
+      // Publish the worker-0 transpose result.
+      ++numBarriers;
+      break;
+    case Smoother::BlockJacobi:
+      // Each post-smoothing step publishes x and then r.
+      numBarriers += 2 * numPost;
+      break;
+    case Smoother::SSOR: {
+      auto const& finestSmoother = std::get<1>(_relaxOps.front());
+      // Post-smoothing has the same outer x/r barriers as block Jacobi.
+      numBarriers += 2 * numPost;
+      // Every smoothing step also executes the finest-level colored SSOR barriers.
+      numBarriers += (numPre + numPost) * finestSmoother.NumConcurrentSolveBarriers();
+      break;
+    }
+  }
+  return numBarriers;
 }
 
 template <typename Scalar, int kDofsPerNode>
@@ -798,22 +969,11 @@ void AMGPrec<Scalar, kDofsPerNode>::ValidateOptions() const {
 template <typename Scalar, int kDofsPerNode>
 void AMGPrec<Scalar, kDofsPerNode>::RefreshRelaxationFactors() {
   int const numSmoothingLevels = isize(_coarsenings);
-  if (isize(_relaxationFactors) != numSmoothingLevels) {
-    _relaxationFactors.clear();
-    _relaxationFactors.resize(numSmoothingLevels, kDefaultRelaxationFactor);
-  }
-
-  if (_options.relaxationFactor >= Scalar(0)) {
-    for (auto& relaxationFactor : _relaxationFactors) {
-      relaxationFactor = _options.relaxationFactor;
-    }
-    return;
-  }
-
-  if (_options.smoother != Smoother::BlockJacobi) {
-    for (auto& relaxationFactor : _relaxationFactors) {
-      relaxationFactor = kDefaultRelaxationFactor;
-    }
+  bool const autoRelaxation = _options.relaxationFactor < Scalar(0);
+  _relaxationFactors.clear();
+  _relaxationFactors.resize(
+      numSmoothingLevels, autoRelaxation ? kDefaultRelaxationFactor : _options.relaxationFactor);
+  if (!autoRelaxation || _options.smoother != Smoother::BlockJacobi) {
     return;
   }
 
@@ -828,7 +988,7 @@ void AMGPrec<Scalar, kDofsPerNode>::RefreshRelaxationFactors() {
               _options.spectralRadiusMaxIters);
     if (estimate == Scalar(0)) {
       MOCHI_LOG_WARNING(
-          "AMG auto relaxation factor skipped at level %d: Spectral-radius estimate was not positive and finite. Using the current relaxation factor for that level.",
+          "AMG auto relaxation factor skipped at level %d: Spectral-radius estimate was not positive and finite. Using the default relaxation factor.",
           level);
       continue;
     }
@@ -843,7 +1003,7 @@ void AMGPrec<Scalar, kDofsPerNode>::RefreshRelaxationFactors() {
         Scalar(4.0 / 3.0) / (_options.spectralRadiusSafetyFactor * estimate);
     if (!IsFinite(relaxationFactor) || relaxationFactor <= Scalar(0)) {
       MOCHI_LOG_WARNING(
-          "AMG auto relaxation factor skipped at level %d: Computed relaxation factor was not positive and finite. Using the current relaxation factor for that level.",
+          "AMG auto relaxation factor skipped at level %d: Computed relaxation factor was not positive and finite. Using the default relaxation factor.",
           level);
       continue;
     }

@@ -66,19 +66,19 @@ struct CTetrahedralMesh : public NoCopy {
 };
 
 /*
-  Stores a constant pointer to a surface mesh. In rigid actors, this mesh is used for the
-  computation of the moment of inertia and contact. In the general case, it is used for the debug
-  draw. This differs from the CVisualMesh as this is intended to be the surface portion of any
-  computational mesh. In the case of actors with computational mesh being a volumetric mesh (eg.
-  soft actors) this will be the boundary of the computational mesh (the full mesh, not the
-  subsampled mesh) in the case of actors with computational mesh being a surface mesh (eg. rigid
-  actors, shell etc) then this will be the pointer to the same mesh used for computations.
+  Stores the actor-facing surface mesh used by surface queries and visualization. It is normally
+  the boundary of the computational mesh, but may instead be an authored linearly embedded skin.
+  Physics systems that require the computational mesh must use its actor-specific mesh component.
 */
 struct CSurfaceMesh : public NoCopy {
-  explicit CSurfaceMesh(std::shared_ptr<TriangularMesh const> const& meshIn) : mesh(meshIn) {
+  explicit CSurfaceMesh(
+      std::shared_ptr<TriangularMesh const> const& meshIn,
+      std::shared_ptr<LinearMeshEmbedding const> const& embeddingIn = {})
+      : mesh(meshIn), embedding(embeddingIn) {
     MOCHI_ASSERT(mesh != nullptr);
   }
   std::shared_ptr<TriangularMesh const> mesh;
+  std::shared_ptr<LinearMeshEmbedding const> embedding;
 };
 
 // NOTE: Functionally-equivalent to CSurfaceMesh, but with a different name to make it clear that

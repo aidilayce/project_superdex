@@ -659,9 +659,8 @@ using DMapSkinInput = DMapSkinning<true>;
  * non-zero entry is a @ref Real3 holding the (x, y, z) Jacobian contribution for that
  * (node, DoF) pair.
  *
- * This is used for transmitting contact forces from skin mesh samples back to actor DoFs
- * during contact resolution, when per-node DoF sets vary (e.g., rods, where each node
- * depends on DoFs from contributing element(s)).
+ * This transmits contact forces from skin samples back to actor DoFs when per-node DoF sets vary,
+ * such as for shell and rod contact skins.
  */
 class DMapSparseSkinning final : public DMapImpl {
  public:

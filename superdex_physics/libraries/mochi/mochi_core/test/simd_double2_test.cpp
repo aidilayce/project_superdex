@@ -395,11 +395,7 @@ TEST(Vec2d, Get) {
   EXPECT_EQ(1.0, Get<0>(a));
   EXPECT_EQ(2.0, Get<1>(a));
 
-  // Slower runtime version
-  EXPECT_EQ(1.0, Get(a, 0));
-  EXPECT_EQ(2.0, Get(a, 1));
-
-  // Same but with operator[] (read only)
+  // Runtime version
   EXPECT_EQ(1.0, a[0]);
   EXPECT_EQ(2.0, a[1]);
 }
@@ -496,6 +492,7 @@ TEST(Vec2d, LessEqual) {
 TEST(Vec2d, Load) {
   alignas(alignof(Vec2d)) double const values[] = {0.0, 1.0, 2.0};
   EXPECT_VEC2D(0.0, 0.0, (Load<0, Vec2d>(nullptr)));
+  EXPECT_VEC2D(0.0, 0.0, (Load<Vec2d>(nullptr, 0)));
   EXPECT_VEC2D(1.0, 0.0, (Load<1, Vec2d>(values + 1)));
   EXPECT_VEC2D(1.0, 2.0, (Load<2, Vec2d>(values + 1)));
   EXPECT_VEC2D(1.0, 2.0, (Load<Vec2d>(values + 1)));
@@ -633,6 +630,7 @@ TEST(Vec2d, Store) {
   std::vector<double> result(
       3); // NOTE: Changed from an array on the stack to work around an MSVC optimizer bug.
   Store<0>((double*)nullptr, Vec2d(1.0, 2.0));
+  Store(static_cast<double*>(nullptr), Vec2d(1.0, 2.0), 0);
   Store<0>(&result[1], Vec2d(1.0, 2.0));
   EXPECT_SPAN_EQ((std::array<double, 2>{0.0, 0.0}), Span(&result[1], 2));
   Store<1>(&result[1], Vec2d(1.0, 2.0));
@@ -713,9 +711,7 @@ TEST(Vec2d, ExpExtreme) {
   auto expv = Exp(v), expmv = Exp(-v);
   auto tol = double(2.0) * std::numeric_limits<double>::epsilon();
   for (int i = 0; i < 2; ++i) {
-    EXPECT_NEAR_RTOL(Vec2d::Get(expv, i), std::exp(x[i]), tol);
-    EXPECT_LE(
-        Abs(Vec2d::Get(expmv, i) - std::exp(-x[i])),
-        Max(Vec2d::Get(expmv, i), std::exp(-x[i])) * tol);
+    EXPECT_NEAR_RTOL(expv[i], std::exp(x[i]), tol);
+    EXPECT_LE(Abs(expmv[i] - std::exp(-x[i])), Max(expmv[i], std::exp(-x[i])) * tol);
   }
 }

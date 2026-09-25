@@ -64,20 +64,20 @@ class Simd<int, 8> {
     }
   }
 
-  [[nodiscard]] static MOCHI_FORCE_INLINE int Get(Simd v, int i) {
+  [[nodiscard]] MOCHI_FORCE_INLINE Scalar operator[](int i) const {
     MOCHI_ASSERT_VERBOSE(i >= 0 && i < kSize, "Index out of range");
 #if MOCHI_COMPILER_MSVC
-    return v.raw.m256i_i32[i];
+    return raw.m256i_i32[i];
 #else
     switch (i) { // clang-format off
-      case 0: return Get<0>(v);
-      case 1: return Get<1>(v);
-      case 2: return Get<2>(v);
-      case 3: return Get<3>(v);
-      case 4: return Get<4>(v);
-      case 5: return Get<5>(v);
-      case 6: return Get<6>(v);
-      case 7: return Get<7>(v);
+      case 0: return Get<0>(*this);
+      case 1: return Get<1>(*this);
+      case 2: return Get<2>(*this);
+      case 3: return Get<3>(*this);
+      case 4: return Get<4>(*this);
+      case 5: return Get<5>(*this);
+      case 6: return Get<6>(*this);
+      case 7: return Get<7>(*this);
       MOCHI_UNLIKELY default: return 0;
     } // clang-format on
 #endif
@@ -246,8 +246,12 @@ class Simd<int, 8> {
 
   [[nodiscard]] static MOCHI_FORCE_INLINE Simd Load(Scalar const* ptr, int n) {
     MOCHI_ASSERT_VERBOSE(n >= 0 && n <= kSize, "Invalid size parameter");
+#if MOCHI_ARCH_X64_AVX512
+    return _mm256_maskz_loadu_epi32(x64_simd::kLaneMasksS8[n], ptr); // AVX512VL
+#else
     // Use the same masks as Simd<float, 8>
     return _mm256_maskload_epi32(ptr, x64_simd::kLoadMasksS8[n]); //  AVX2
+#endif
   }
 
   template <int kTupleCount = kSize>
@@ -289,7 +293,7 @@ class Simd<int, 8> {
     static_assert(N >= 0 && N <= kSize);
     if constexpr (N == 0) {
     } else if constexpr (N < kSize) {
-      // About 3X faster than a masked store on AMD. About the same on Intel.
+      // About 3X faster than a masked store on older AMD CPUs. About the same on others.
       memcpy(ptr, &v, sizeof(Scalar) * N);
     } else {
       return _mm256_storeu_si256(reinterpret_cast<__m256i*>(ptr), v.raw); // AVX
@@ -298,9 +302,12 @@ class Simd<int, 8> {
 
   static MOCHI_FORCE_INLINE void Store(Scalar* ptr, Simd v, int n) {
     MOCHI_ASSERT_VERBOSE(n >= 0 && n <= kSize, "Invalid size parameter");
-    // Faster than masked store on AMD.
-    // clang-format off
-    switch (n) {
+#if MOCHI_ARCH_X64_AVX512
+    _mm256_mask_storeu_epi32(ptr, x64_simd::kLaneMasksS8[n], v.raw); // AVX512VL
+#else
+    // With AVX2, this is faster than masked store for a predictable value of n.
+    // It is much slower for a random value of n.
+    switch (n) { // clang-format off
       case 1: Store<1>(ptr, v); break;
       case 2: Store<2>(ptr, v); break;
       case 3: Store<3>(ptr, v); break;
@@ -311,6 +318,7 @@ class Simd<int, 8> {
       case 8: Store<8>(ptr, v); break;
       MOCHI_UNLIKELY default: break;
     } // clang-format on
+#endif
   }
 
   MOCHI_FORCE_INLINE static int StoreSelected(Scalar* ptr, Simd condition, Simd values) {
@@ -461,7 +469,8 @@ class Simd<int, 8> {
 
   template <int kShift>
   [[nodiscard]] MOCHI_FORCE_INLINE static Simd ShiftRight(Simd a) {
-    return _mm256_srli_epi32(a.raw, kShift); // AVX2
+    static_assert(kShift >= 0 && kShift < 32, "Shift amount out-of-range");
+    return _mm256_srai_epi32(a.raw, kShift); // AVX2
   }
 
  private:

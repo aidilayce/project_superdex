@@ -33,6 +33,10 @@
 #include <utility>
 #include <vector>
 
+namespace mochi_renderer {
+class IBL;
+} // namespace mochi_renderer
+
 namespace superdex::studio {
 
 class SuperDexStudio;
@@ -64,6 +68,12 @@ class AssetManager {
   bool UnloadAssets(std::set<mochi::Path> const& paths);
   bool UnloadAllAssets();
 
+  /// Drop every physics shape cached for @p path so the next physics load re-reads the file. Call
+  /// this whenever a model file's contents change on disk: the shapes derived from it are cached
+  /// by the MochiModelAsset, by Mochi's context file cache, and by the ShapeHandles that
+  /// `prefab::EnsureFullyLoaded` pins onto every loaded prefab.
+  void InvalidateShapeCachesForPath(mochi::Path const& path);
+
   //------------------------------------------------------------------------------------------------
   // Find / Iterate Assets
   //------------------------------------------------------------------------------------------------
@@ -79,6 +89,7 @@ class AssetManager {
   //------------------------------------------------------------------------------------------------
   // Thumbnails
   //------------------------------------------------------------------------------------------------
+  void SetThumbnailIbl(mochi_renderer::IBL* ibl);
   void RenderAssetThumbnails(Renderer& renderer, int maxThumbnails = 1);
 
   /// Render @p asset's thumbnail into @p target using the shared thumbnail scene: stages the

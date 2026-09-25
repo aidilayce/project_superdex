@@ -31,18 +31,18 @@ struct BatchTypes {
   static_assert(kBatchSize > 0, "Invalid batch size");
 
   /** @brief Batched scalar type. */
-  using Real = Simd<real, RoundUp(kBatchSize, Simd<real>::kSize)>;
+  using Real = Simd<real, ::mochi::details::kNextSupportedSimdSize<real, kBatchSize>>;
 
   /** @brief Batched double-precision type. */
   using Double = Simd<double, Real::kSize>;
 
-  /** @brief Batched integer type. */
+  /** @brief Batched integer type with the same lane count as Real. */
   using Int = Simd<int, Real::kSize>;
 
   /** @brief Batched 3-vector. */
   using Real3 = NdArray<Real, 3>;
 
-  /** @brief Batched 6-vector. Also used for symmetric 3x3 matrices. */
+  /** @brief Batched 6-vector. */
   using Real6 = NdArray<Real, 6>;
 
   /** @brief Batched 9-vector. */
@@ -53,6 +53,12 @@ struct BatchTypes {
 
   /** @brief Batched 3x3 row-major matrix. */
   using Real3x3 = NdArray<Real, 3, 3>;
+
+  /** @brief Batched symmetric 2x2 matrix stored as [00, 01, 11]. */
+  using SymMatrix2x2 = Real3;
+
+  /** @brief Batched symmetric 3x3 matrix stored as [00, 11, 22, 01, 02, 12]. */
+  using SymMatrix3x3 = Real6;
 };
 
 template <int kBatchSize>
@@ -78,5 +84,11 @@ using BatchReal2x2 = typename BatchTypes<kBatchSize>::Real2x2;
 
 template <int kBatchSize>
 using BatchReal3x3 = typename BatchTypes<kBatchSize>::Real3x3;
+
+template <int kBatchSize>
+using BatchSymMatrix2x2 = typename BatchTypes<kBatchSize>::SymMatrix2x2;
+
+template <int kBatchSize>
+using BatchSymMatrix3x3 = typename BatchTypes<kBatchSize>::SymMatrix3x3;
 
 } // namespace mochi

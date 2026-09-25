@@ -130,7 +130,7 @@ MOCHI_ANY MOCHI_FORCE_INLINE Simd<T, N> Broadcast(Simd<T, N> v) {
 template <class T, int N>
 MOCHI_ANY MOCHI_FORCE_INLINE Simd<T, N> Broadcast(Simd<T, N> v, int i) {
   // TODO: Other implementations may be faster for specific vector sizes, but this covers the bases.
-  return Simd<T, N>{Simd<T, N>::Get(v, i)};
+  return Simd<T, N>{v[i]};
 }
 
 template <class V, class... MoreBools>
@@ -258,6 +258,9 @@ Select(Simd<MaskT, N> conditionMask, Simd<T, N> a, Simd<T, N> b) {
 
 template <int kShift, class T, int N>
 MOCHI_ANY MOCHI_FORCE_INLINE Simd<T, N> ShiftRight(Simd<T, N> a) {
+  static_assert(
+      Simd<T, N>::kIsSupported && std::is_integral_v<T> && std::is_signed_v<T>,
+      "ShiftRight requires a supported signed integer Simd type");
   static_assert(kShift >= 0 && kShift < (8 * sizeof(T)), "Shift amount out-of-range");
   if constexpr (kShift == 0) {
     return a;
@@ -299,11 +302,6 @@ MOCHI_ANY MOCHI_FORCE_INLINE T Get0(Simd<T, N> v) {
 template <int i, class T, int N>
 MOCHI_ANY MOCHI_FORCE_INLINE T Get(Simd<T, N> v) {
   return Simd<T, N>::template Get<i>(v);
-}
-
-template <class T, int N>
-MOCHI_ANY MOCHI_FORCE_INLINE T Get(Simd<T, N> v, int i) {
-  return Simd<T, N>::Get(v, i);
 }
 
 template <int iHalf, class T, int N>
@@ -400,12 +398,14 @@ MOCHI_ANY MOCHI_FORCE_INLINE T HMax(Simd<T, N> a) {
 }
 
 #define MOCHI_SIMD_MEMBERWISE_FALLBACK(T, N, FN, inVec) \
-  alignas(alignof(Simd<T, N>)) T buf[N];                \
-  Store(buf, inVec);                                    \
-  for (int i = 0; i < N; ++i) {                         \
-    buf[i] = FN(buf[i]);                                \
-  }                                                     \
-  return Load<Simd<T, N>>(buf)
+  ([&]() {                                              \
+    alignas(alignof(Simd<T, N>)) T buf[N];              \
+    Store(buf, inVec);                                  \
+    for (int i = 0; i < N; ++i) {                       \
+      buf[i] = FN(buf[i]);                              \
+    }                                                   \
+    return Load<Simd<T, N>>(buf);                       \
+  }())
 
 template <class T, int N>
 MOCHI_ANY MOCHI_FORCE_INLINE Simd<T, N> Floor(Simd<T, N> a) {
@@ -456,6 +456,15 @@ SinCosImpl(Simd<float, N> xf, Simd<float, N>& outSin, Simd<float, N>& outCos, Si
   // outCos = 1 - (x^2)/2! + (x^4)/4! - (x^6)/6! + (x^8)/8!
   outCos = StaticCast<Simd<float, N>>(c0 + x6 * c2);
 }
+
+// Preserve the documented accuracy bound and keep the quadrant index
+// representable by falling back for larger inputs.
+inline constexpr float kMaxFastSinCosInput = 1e6f;
+
+template <int N>
+MOCHI_ANY MOCHI_FORCE_INLINE bool IsFastSinCosInput(Simd<float, N> a) {
+  return AllTrue(Abs(a) <= Simd<float, N>{kMaxFastSinCosInput});
+}
 } // namespace details
 
 template <class T, int N>
@@ -466,6 +475,10 @@ inline Simd<T, N> Cos(Simd<T, N> a) {
     // There are x64 intrinsics if SVML extension is available
     return Simd<T, N>::Cos(a);
   } else if constexpr (std::is_same_v<T, float>) {
+    if (!details::IsFastSinCosInput(a))
+      MOCHI_UNLIKELY {
+        return MOCHI_SIMD_MEMBERWISE_FALLBACK(T, N, std::cos, a);
+      }
     // Reduce x to [-pi/4, pi/4) in quadrant n and compute Taylor series
     Simd<float, N> sin, cos;
     Simd<int, N> n;
@@ -475,7 +488,7 @@ inline Simd<T, N> Cos(Simd<T, N> a) {
     // Then flip the sign if (n == 1) || (n == 2).
     return result ^ ReinterpretCast<Simd<float, N>>((n ^ ShiftRight<1>(n)) << 31);
   } else {
-    MOCHI_SIMD_MEMBERWISE_FALLBACK(T, N, std::cos, a); // Fallback
+    return MOCHI_SIMD_MEMBERWISE_FALLBACK(T, N, std::cos, a); // Fallback
   }
 }
 
@@ -485,6 +498,10 @@ inline Simd<T, N> Sin(Simd<T, N> a) {
     // There are x64 intrinsics if SVML extension is available
     return Simd<T, N>::Sin(a);
   } else if constexpr (std::is_same_v<T, float>) {
+    if (!details::IsFastSinCosInput(a))
+      MOCHI_UNLIKELY {
+        return MOCHI_SIMD_MEMBERWISE_FALLBACK(T, N, std::sin, a);
+      }
     // Reduce x to [-pi/4, pi/4) in quadrant n and compute Taylor series
     Simd<T, N> sin, cos;
     Simd<int, N> n;
@@ -494,7 +511,7 @@ inline Simd<T, N> Sin(Simd<T, N> a) {
     // Then flip the sign if (n == 2) || (n == 3).
     return result ^ ReinterpretCast<Simd<T, N>>(ShiftRight<1>(n) << 31);
   } else {
-    MOCHI_SIMD_MEMBERWISE_FALLBACK(T, N, std::sin, a);
+    return MOCHI_SIMD_MEMBERWISE_FALLBACK(T, N, std::sin, a);
   }
 }
 
@@ -504,6 +521,10 @@ inline std::pair<Simd<T, N>, Simd<T, N>> SinCos(Simd<T, N> a) {
   // time. However, we still use call Sin and Cos separately when they are implemented with SVML, so
   // that the results will be exactly the same.
   if constexpr (!MOCHI_ARCH_X64_SVML && std::is_same_v<T, float>) {
+    if (!details::IsFastSinCosInput(a))
+      MOCHI_UNLIKELY {
+        return {Sin(a), Cos(a)};
+      }
     Simd<float, N> sin, cos;
     Simd<int, N> n;
     details::SinCosImpl(a, sin, cos, n);
@@ -523,7 +544,7 @@ MOCHI_ANY MOCHI_FORCE_INLINE Simd<T, N> Tan(Simd<T, N> a) {
     // Simd<T, N>::Tan only implemented in this case.
     return Simd<T, N>::Tan(a);
   } else {
-    MOCHI_SIMD_MEMBERWISE_FALLBACK(T, N, std::tan, a);
+    return MOCHI_SIMD_MEMBERWISE_FALLBACK(T, N, std::tan, a);
   }
 }
 
@@ -533,7 +554,7 @@ MOCHI_ANY MOCHI_FORCE_INLINE Simd<T, N> ACos(Simd<T, N> a) {
     // Simd<T, N>::ACos only implemented in this case.
     return Simd<T, N>::ACos(a);
   } else {
-    MOCHI_SIMD_MEMBERWISE_FALLBACK(T, N, std::acos, a);
+    return MOCHI_SIMD_MEMBERWISE_FALLBACK(T, N, std::acos, a);
   }
 }
 
@@ -543,7 +564,7 @@ MOCHI_ANY MOCHI_FORCE_INLINE Simd<T, N> ASin(Simd<T, N> a) {
     // Simd<T, N>::ASin only implemented in this case.
     return Simd<T, N>::ASin(a);
   } else {
-    MOCHI_SIMD_MEMBERWISE_FALLBACK(T, N, std::asin, a);
+    return MOCHI_SIMD_MEMBERWISE_FALLBACK(T, N, std::asin, a);
   }
 }
 
@@ -553,7 +574,7 @@ MOCHI_ANY MOCHI_FORCE_INLINE Simd<T, N> ATan(Simd<T, N> a) {
     // Simd<T, N>::ATan only implemented in this case.
     return Simd<T, N>::ATan(a);
   } else {
-    MOCHI_SIMD_MEMBERWISE_FALLBACK(T, N, std::atan, a);
+    return MOCHI_SIMD_MEMBERWISE_FALLBACK(T, N, std::atan, a);
   }
 }
 
@@ -680,7 +701,7 @@ MOCHI_ANY MOCHI_FORCE_INLINE Simd<T, N> Ln(Simd<T, N> a) {
     // Simd<T, N>::Ln only implemented in this case.
     return Simd<T, N>::Ln(a);
   } else {
-    MOCHI_SIMD_MEMBERWISE_FALLBACK(T, N, std::log, a);
+    return MOCHI_SIMD_MEMBERWISE_FALLBACK(T, N, std::log, a);
   }
 }
 
@@ -690,7 +711,7 @@ MOCHI_ANY MOCHI_FORCE_INLINE Simd<T, N> Tanh(Simd<T, N> a) {
     // Simd<T, N>::Tanh only implemented in this case.
     return Simd<T, N>::Tanh(a);
   } else {
-    MOCHI_SIMD_MEMBERWISE_FALLBACK(T, N, std::tanh, a);
+    return MOCHI_SIMD_MEMBERWISE_FALLBACK(T, N, std::tanh, a);
   }
 }
 
@@ -776,6 +797,10 @@ MOCHI_ANY MOCHI_FORCE_INLINE Simd<T, N> VIsFinite(Simd<T, N> a) {
       auto high2i64 = Shuffle<1, 1, 3, 3>(GetHalf<1>(temp8i32));
       auto temp4i64 = Simd<int, 8>(low2i64, high2i64);
       return ReinterpretCast<Simd<double, 4>>(temp4i64);
+    } else if constexpr (N == 8 && Simd<int64_t, 8>::kIsSupported) {
+      auto mask = Simd<int64_t, 8>{INT64_C(0x7FF0000000000000)};
+      auto bits = ReinterpretCast<Simd<int64_t, 8>>(a);
+      return ReinterpretCast<Simd<double, 8>>(VNotEqual(bits & mask, mask));
     } else if constexpr (Simd<T, N>::kIsComposite) {
       return Simd<T, N>{VIsFinite(a.first), VIsFinite(a.second)};
     } else if constexpr (!MOCHI_USE_SIMD) {
@@ -900,14 +925,28 @@ MOCHI_ANY MOCHI_FORCE_INLINE Simd<T, 4> OrthogonalVector3(Simd<T, 4> a) {
 namespace details {
 
 /**
-  Utilities to determine the smallest supported SIMD size that is greater than or equal to a given
-  size.
+  Determines the smallest supported SIMD size that uses the minimum possible number of native
+  registers for the requested lane count.
 */
+template <typename T, int kSize, bool kExceedsNativeSize = (kSize > kSimdDefaultSize<T>)>
+struct NextSupportedSimdSizeHelper;
+
 template <typename T, int kSize>
-struct NextSupportedSimdSizeHelper {
+struct NextSupportedSimdSizeHelper<T, kSize, true> {
+  static_assert(kSize > 0, "SIMD size must be positive.");
   static_assert(Simd<T>::kIsSupported, "Type T is not supported for any size N.");
+  static constexpr int value =
+      kSimdDefaultSize<T> + NextSupportedSimdSizeHelper<T, kSize - kSimdDefaultSize<T>>::value;
+};
+
+template <typename T, int kSize>
+struct NextSupportedSimdSizeHelper<T, kSize, false> {
+  static_assert(kSize > 0, "SIMD size must be positive.");
+  static_assert(Simd<T>::kIsSupported, "Type T is not supported for any size N.");
+  static constexpr bool kIsSingleRegister =
+      Simd<T, kSize>::kIsSupported && !Simd<T, kSize>::kIsComposite;
   static constexpr int value = std::conditional_t<
-      Simd<T, kSize>::kIsSupported,
+      kIsSingleRegister,
       std::integral_constant<int, kSize>,
       NextSupportedSimdSizeHelper<T, kSize + 1>>::value;
 };

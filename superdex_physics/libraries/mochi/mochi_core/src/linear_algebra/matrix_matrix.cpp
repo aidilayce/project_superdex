@@ -90,4 +90,18 @@ MatMatKernel<Vec2d>(double const* a, double const* b, double* c, int k, int b_ri
 template void
 MatMatKernel<Vec4d>(double const* a, double const* b, double* c, int k, int b_ri, int b_ci);
 
+#if MOCHI_USE_SIMD && MOCHI_ARCH_X64_AVX512
+template void
+MatMatKernel<Vec16f>(float const* a, float const* b, float* c, int k, int b_ri, int b_ci);
+
+template void
+MatMatKernel<Simd<float, 32>>(float const* a, float const* b, float* c, int k, int b_ri, int b_ci);
+
+template void
+MatMatKernel<Vec8d>(double const* a, double const* b, double* c, int k, int b_ri, int b_ci);
+
+template void
+MatMatKernel<Vec16d>(double const* a, double const* b, double* c, int k, int b_ri, int b_ci);
+#endif
+
 } // namespace mochi::details

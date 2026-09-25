@@ -18,6 +18,7 @@
 
 #include <mochi_core/contact/contact_utils.h>
 #include <mochi_core/geometry/geometry_utils.h>
+#include <mochi_core/memory/filo_allocator.h>
 
 #include <limits>
 
@@ -25,6 +26,7 @@ namespace mochi {
 
 void ValidatePointCloudColliderParams(
     experimental::PointCloudColliderParams const& params,
+    ContactParams const& contactParams,
     Error& error) {
   MOCHI_ERROR_IF_NOT(params.radius > 0_r, error, "Point-cloud collider radius must be positive.");
   MOCHI_ERROR_IF_NOT(
@@ -33,6 +35,12 @@ void ValidatePointCloudColliderParams(
       "Point-cloud self-contact exclusion ratio must be > 1.");
   MOCHI_ERROR_IF_NOT(
       params.spatialHashLoadFactor > 0_r, error, "Hash table load factor must be positive.");
+  real const contactRange =
+      params.radius + contactParams.GetPenaltyThresholdDist(/*addPadding*/ true);
+  MOCHI_ERROR_IF_NOT(
+      IsFinite(contactRange) && contactRange > 0_r,
+      error,
+      "Point-cloud collider radius plus contact threshold must be finite and positive.");
 }
 
 SpatialHashTable CreateSpatialHashTable(
@@ -41,6 +49,10 @@ SpatialHashTable CreateSpatialHashTable(
     real contactThreshold) {
   int const numColliderPoints = colliderDiscretization.GetNumColliderPoints();
   MOCHI_ASSERT(numColliderPoints > 0, "Collider discretization must have at least one point");
+  real const cellSize = params.radius + contactThreshold;
+  MOCHI_ASSERT(
+      IsFinite(cellSize) && cellSize > 0_r,
+      "Point-cloud spatial hash cell size must be finite and positive.");
   auto const minNumBinsDouble = static_cast<double>(
       Ceil(static_cast<real>(numColliderPoints) / params.spatialHashLoadFactor));
   MOCHI_ASSERT(
@@ -48,7 +60,7 @@ SpatialHashTable CreateSpatialHashTable(
           minNumBinsDouble <= static_cast<double>(std::numeric_limits<int>::max()),
       "Point-cloud spatial hash load factor produced an invalid bin count.");
   auto const minNumBins = static_cast<int>(minNumBinsDouble);
-  return {params.radius + contactThreshold, numColliderPoints, minNumBins};
+  return {cellSize, numColliderPoints, minNumBins};
 }
 
 void UpdateSpatialHashTable(
@@ -97,7 +109,151 @@ void UpdateSpatialHashTable(
   });
 }
 
-DynamicArray<DynamicArray<int>> ComputePointsToColliderPoints(
+template <bool kSelfContact, typename ColliderDiscretizationT>
+static void ComputePointCloudContactIndicesImpl(
+    experimental::PointCloudColliderParams const& pointCloudColliderParams,
+    ColliderDiscretizationT const& colliderDisc,
+    int dofsPerNode,
+    ColumnVectorView<real const> colliderDisplacements,
+    TransformRT const& worldFromCollider,
+    CollidingPointCloudDiscretization const& collidingDiscretization,
+    Span<Real3 const> collidingPointPositions,
+    Span<int const> collidingPointSampleIndices,
+    TransformRT const& worldFromColliding,
+    SpatialHashTable const& colliderHashTable,
+    real contactThreshold,
+    DynamicArray<int>& outPointIndices,
+    DynamicArray<int>& outColliderPointIndices) {
+  MOCHI_ASSERT_VERBOSE(
+      colliderHashTable.GetNumPoints() == colliderDisc.GetNumQuadPoints(),
+      "Point-cloud collider hash table must be populated before collision queries.");
+
+  int const numCollidingPoints = isize(collidingPointPositions);
+
+  struct ContactPair {
+    int collidingPointIndex;
+    int colliderPointIndex;
+  };
+  int constexpr kCollidingPointsPerRange = 256;
+  int constexpr kMaxStackAllocatedRanges = 256;
+  int const numRanges =
+      (numCollidingPoints + kCollidingPointsPerRange - 1) / kCollidingPointsPerRange;
+  MOCHI_FILO_STACK_ALLOCATOR(
+      allocator, kMaxStackAllocatedRanges * sizeof(DynamicArray<ContactPair>));
+  DynamicArray<DynamicArray<ContactPair>> contactPairsPerRange(numRanges, &allocator);
+
+  real const contactRange = pointCloudColliderParams.radius + contactThreshold;
+  [[maybe_unused]] real const cellSize = colliderHashTable.GetCellSize();
+  MOCHI_ASSERT_VERBOSE(
+      cellSize >= contactRange || NearEqualRel(cellSize, contactRange),
+      "Point-cloud spatial hash cell size must cover the contact range.");
+  real const contactRangeSquared = Sqr(contactRange);
+  real const selfContactExclusionRangeSquared =
+      Sqr(pointCloudColliderParams.radius * pointCloudColliderParams.selfContactExclusionRatio +
+          contactThreshold);
+  Aabb const queryBounds = ExpandShape(colliderHashTable.GetOccupiedPointBounds(), contactRange);
+
+  [[maybe_unused]] VMatrix4x4r colliderFromCollidingT MOCHI_NO_INIT;
+  if constexpr (kSelfContact) {
+    MOCHI_ASSERT_VERBOSE(
+        NearEqual(worldFromCollider, worldFromColliding),
+        "Self-contact requires matching collider and colliding transforms.");
+  } else {
+    // Transformation from colliding local coordinates to collider local coordinates.
+    TransformRT const colliderFromColliding = Invert(worldFromCollider) * worldFromColliding;
+    colliderFromCollidingT = ToVMatrix4x4Transpose(colliderFromColliding);
+  }
+
+  MOCHI_ASSERT_VERBOSE(
+      dofsPerNode > 0,
+      "CColliderPointCloudDiscretization::dofsPerNode was not set (zero sentinel)");
+
+  // Each range writes to a distinct output buffer. All shared inputs are read-only.
+  ParallelForN("PointCloudCollisionDetection", numRanges, 1, [&](int rangeIndex) {
+    auto& contactPairs = contactPairsPerRange[rangeIndex];
+    int const begin = rangeIndex * kCollidingPointsPerRange;
+    int const end = Min(begin + kCollidingPointsPerRange, numCollidingPoints);
+    for (int collidingPointIndex = begin; collidingPointIndex < end; ++collidingPointIndex) {
+      Vec4r const collidingPointPositionCollidingFrame =
+          Load<kSpaceDim3, Vec4r>(&(collidingPointPositions[collidingPointIndex][0]));
+      Vec4r collidingPointPositionColliderFrame MOCHI_NO_INIT;
+      if constexpr (kSelfContact) {
+        collidingPointPositionColliderFrame = ToSimdPoint(collidingPointPositionCollidingFrame);
+      } else {
+        collidingPointPositionColliderFrame =
+            DotVecMat4x4(ToSimdPoint(collidingPointPositionCollidingFrame), colliderFromCollidingT);
+      }
+      if (!ContainsPoint(queryBounds, collidingPointPositionColliderFrame)) {
+        continue;
+      }
+      Real3 const collidingPointPositionColliderFrame3 =
+          ToReal3(collidingPointPositionColliderFrame);
+
+      Real3 collidingPointReferencePositionColliderFrame MOCHI_NO_INIT;
+      if constexpr (kSelfContact) {
+        int const sampleIndex = collidingPointSampleIndices.empty()
+            ? collidingPointIndex
+            : collidingPointSampleIndices[collidingPointIndex];
+        collidingDiscretization.Visit([&](auto const& collidingDisc) {
+          using CollidingDiscretizationT = std::decay_t<decltype(collidingDisc)>;
+          int const elementIndex = sampleIndex / CollidingDiscretizationT::kNumQuads;
+          int const localQuadIndex = sampleIndex % CollidingDiscretizationT::kNumQuads;
+          collidingPointReferencePositionColliderFrame =
+              collidingDisc.femElements[elementIndex].mapEvaluated[localQuadIndex];
+        });
+      }
+
+      colliderHashTable.IteratePointsNearPosition(
+          collidingPointPositionColliderFrame3, [&](int colliderPointIndex) {
+            int const elementIndex = colliderPointIndex / ColliderDiscretizationT::kNumQuads;
+            int const localQuadIndex = colliderPointIndex % ColliderDiscretizationT::kNumQuads;
+            auto const& element = colliderDisc.femElements[elementIndex];
+
+            if constexpr (kSelfContact) {
+              Real3 const referenceDisplacement = element.mapEvaluated[localQuadIndex] -
+                  collidingPointReferencePositionColliderFrame;
+              real const referenceDistanceSquared = NormSqr(referenceDisplacement);
+              if (referenceDistanceSquared < selfContactExclusionRangeSquared) {
+                return;
+              }
+            }
+
+            Real3 const colliderPointPosition =
+                details::InterpolateColliderPointPosition<ColliderDiscretizationT>(
+                    element, elementIndex, localQuadIndex, colliderDisplacements, dofsPerNode);
+            Real3 const displacement = collidingPointPositionColliderFrame3 - colliderPointPosition;
+            real const distanceSquared = NormSqr(displacement);
+            if (distanceSquared >= contactRangeSquared) {
+              return;
+            }
+
+            contactPairs.push_back({collidingPointIndex, colliderPointIndex});
+          });
+    }
+  });
+
+  int totalContacts = 0;
+  for (auto const& contactPairs : contactPairsPerRange) {
+    totalContacts += isize(contactPairs);
+  }
+  outPointIndices.resize_noinit(totalContacts);
+  outColliderPointIndices.resize_noinit(totalContacts);
+
+  if (totalContacts == 0) {
+    return;
+  }
+
+  int contactIndex = 0;
+  for (auto const& contactPairs : contactPairsPerRange) {
+    for (auto const& contactPair : contactPairs) {
+      outPointIndices[contactIndex] = contactPair.collidingPointIndex;
+      outColliderPointIndices[contactIndex] = contactPair.colliderPointIndex;
+      ++contactIndex;
+    }
+  }
+}
+
+void ComputePointCloudContactIndices(
     experimental::PointCloudColliderParams const& pointCloudColliderParams,
     CColliderPointCloudDiscretization const& colliderDiscretization,
     ColumnVectorView<real const> colliderDisplacements,
@@ -108,143 +264,43 @@ DynamicArray<DynamicArray<int>> ComputePointsToColliderPoints(
     Span<int const> collidingPointSampleIndices,
     TransformRT const& worldFromColliding,
     SpatialHashTable const& colliderHashTable,
-    real contactThreshold) {
-  MOCHI_PROFILE_SCOPE();
-  MOCHI_ASSERT_VERBOSE(
-      colliderHashTable.GetNumPoints() == colliderDiscretization.GetNumColliderPoints(),
-      "Point-cloud collider hash table must be populated before collision queries.");
-
-  int const numCollidingPoints = isize(collidingPointPositions);
-  int constexpr kColliderPointsPerPointEstimate = 8;
-  DynamicArray<DynamicArray<int>> pointsToColliderPoints(numCollidingPoints);
-
-  real const contactRange = pointCloudColliderParams.radius + contactThreshold;
-  real const contactRangeSquared = Sqr(contactRange);
-  real const selfContactExclusionRangeSquared =
-      Sqr(pointCloudColliderParams.radius * pointCloudColliderParams.selfContactExclusionRatio +
-          contactThreshold);
-  Aabb const queryBounds = ExpandShape(colliderHashTable.GetOccupiedPointBounds(), contactRange);
-
-  // Transformation from colliding local coordinates to collider local coordinates.
-  TransformRT const colliderFromColliding = Invert(worldFromCollider) * worldFromColliding;
-  VMatrix4x4r const colliderFromCollidingT = ToVMatrix4x4Transpose(colliderFromColliding);
-
-  int const dofsPerNode = colliderDiscretization.dofsPerNode;
-  MOCHI_ASSERT_VERBOSE(
-      dofsPerNode > 0,
-      "CColliderPointCloudDiscretization::dofsPerNode was not set (zero sentinel)");
-
-  // Resolve the collider discretization type once, outside the parallel loop.
-  colliderDiscretization.VisitCollider([&](auto const& disc) {
-    using DiscretizationT = std::decay_t<decltype(disc)>;
-
-    // Safe to parallelize: each colliding point writes to a separate row of
-    // pointsToColliderPoints, and the hash table is read-only.
-    int constexpr kMinPerTask = 256;
-    ParallelForN(
-        "PointCloudCollisionDetection",
-        numCollidingPoints,
-        kMinPerTask,
-        [&](int collidingPointIndex) {
-          DynamicArray<int>& colliderPointIndices = pointsToColliderPoints[collidingPointIndex];
-
-          Vec4r const collidingPointPositionCollidingFrame =
-              Load<kSpaceDim3, Vec4r>(&(collidingPointPositions[collidingPointIndex][0]));
-          Vec4r const collidingPointPositionColliderFrame = DotVecMat4x4(
-              ToSimdPoint(collidingPointPositionCollidingFrame), colliderFromCollidingT);
-
-          if (!ContainsPoint(queryBounds, collidingPointPositionColliderFrame)) {
-            return;
-          }
-
-          Vec4r collidingPointReferencePositionColliderFrame MOCHI_NO_INIT;
-          if (selfContact) {
-            collidingDiscretization.Visit([&](auto const& collidingDisc) {
-              using CollidingDiscretizationT = std::decay_t<decltype(collidingDisc)>;
-              int const sampleIndex = collidingPointSampleIndices.empty()
-                  ? collidingPointIndex
-                  : collidingPointSampleIndices[collidingPointIndex];
-              int const collidingElementIndex = sampleIndex / CollidingDiscretizationT::kNumQuads;
-              int const collidingLocalQuadPointIndex =
-                  sampleIndex % CollidingDiscretizationT::kNumQuads;
-              Vec4r const collidingReferencePositionCollidingFrame =
-                  ToSimd(collidingDisc.femElements[collidingElementIndex]
-                             .mapEvaluated[collidingLocalQuadPointIndex]);
-              collidingPointReferencePositionColliderFrame = DotVecMat4x4(
-                  ToSimdPoint(collidingReferencePositionCollidingFrame), colliderFromCollidingT);
-            });
-          }
-
-          colliderHashTable.IteratePointsNearPosition(
-              ToReal3(collidingPointPositionColliderFrame), [&](int colliderPointIndex) {
-                int const elementIndex = colliderPointIndex / DiscretizationT::kNumQuads;
-                int const localQuadIndex = colliderPointIndex % DiscretizationT::kNumQuads;
-                auto const& element = disc.femElements[elementIndex];
-
-                // Self-contact exclusion using reference collider point position.
-                if (selfContact) {
-                  Vec4r const colliderRefPos = ToSimd(element.mapEvaluated[localQuadIndex]);
-                  Vec4r const referenceDisplacement =
-                      colliderRefPos - collidingPointReferencePositionColliderFrame;
-                  if (NormSqr<3>(referenceDisplacement) < selfContactExclusionRangeSquared) {
-                    return;
-                  }
-                }
-
-                // Interpolate the current collider point position.
-                Real3 const colliderPointPos =
-                    details::InterpolateColliderPointPosition<DiscretizationT>(
-                        element, elementIndex, localQuadIndex, colliderDisplacements, dofsPerNode);
-                Vec4r const colliderPointPositionColliderFrame =
-                    Load<kSpaceDim3, Vec4r>(&colliderPointPos[0]);
-
-                // Distance culling.
-                if (NormSqr<3>(
-                        collidingPointPositionColliderFrame - colliderPointPositionColliderFrame) >=
-                    contactRangeSquared) {
-                  return;
-                }
-
-                if (colliderPointIndices.empty()) {
-                  colliderPointIndices.reserve(kColliderPointsPerPointEstimate);
-                }
-                colliderPointIndices.push_back(colliderPointIndex);
-              });
-        });
-  });
-  return pointsToColliderPoints;
-}
-
-void ComputePointCloudContactIndices(
-    DynamicArray<DynamicArray<int>> const& pointsToColliderPoints,
+    real contactThreshold,
     DynamicArray<int>& outPointIndices,
     DynamicArray<int>& outColliderPointIndices) {
   MOCHI_PROFILE_SCOPE();
-
-  int const numCollidingPoints = isize(pointsToColliderPoints);
-
-  int totalContacts = 0;
-  for (int collidingPointIndex = 0; collidingPointIndex < numCollidingPoints;
-       ++collidingPointIndex) {
-    totalContacts += isize(pointsToColliderPoints[collidingPointIndex]);
-  }
-
-  outPointIndices.resize_noinit(totalContacts);
-  outColliderPointIndices.resize_noinit(totalContacts);
-
-  if (totalContacts == 0) {
-    return;
-  }
-
-  int contactIndex = 0;
-  for (int collidingPointIndex = 0; collidingPointIndex < numCollidingPoints;
-       ++collidingPointIndex) {
-    for (int const colliderPointIndex : pointsToColliderPoints[collidingPointIndex]) {
-      outPointIndices[contactIndex] = collidingPointIndex;
-      outColliderPointIndices[contactIndex] = colliderPointIndex;
-      ++contactIndex;
+  colliderDiscretization.VisitCollider([&](auto const& colliderDisc) {
+    if (selfContact) {
+      ComputePointCloudContactIndicesImpl</*kSelfContact*/ true>(
+          pointCloudColliderParams,
+          colliderDisc,
+          colliderDiscretization.dofsPerNode,
+          colliderDisplacements,
+          worldFromCollider,
+          collidingDiscretization,
+          collidingPointPositions,
+          collidingPointSampleIndices,
+          worldFromColliding,
+          colliderHashTable,
+          contactThreshold,
+          outPointIndices,
+          outColliderPointIndices);
+    } else {
+      ComputePointCloudContactIndicesImpl</*kSelfContact*/ false>(
+          pointCloudColliderParams,
+          colliderDisc,
+          colliderDiscretization.dofsPerNode,
+          colliderDisplacements,
+          worldFromCollider,
+          collidingDiscretization,
+          collidingPointPositions,
+          collidingPointSampleIndices,
+          worldFromColliding,
+          colliderHashTable,
+          contactThreshold,
+          outPointIndices,
+          outColliderPointIndices);
     }
-  }
+  });
 }
 
 void ComputePointCloudContactDetectionFields(

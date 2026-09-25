@@ -365,7 +365,6 @@ static auto FilledGraphColumnSizes(
       firstDesc[p] = std::min(firstDesc[p], firstDesc[nd]);
     }
   }
-  DynamicArray<int> columnSizes(N);
   DynamicArray<int> prevP(N, kMinusOne<int>); // AKA previous leaf
   DynamicArray<int> prevNbr(N, kMinusOne<int>);
 

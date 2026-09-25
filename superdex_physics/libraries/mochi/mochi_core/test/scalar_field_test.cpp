@@ -72,7 +72,7 @@ static void TestTrilinearSampleBatchEquivalence(
   Simd<real, kBatchSize> batchValues;
   grid.template TrilinearSampleBatch<kBatchSize, kMode>(simdPoints, &batchValues);
   for (int i = 0; i < kBatchSize; ++i) {
-    EXPECT_NEAR_EQ(refValues[i], Get(batchValues, i));
+    EXPECT_NEAR_EQ(refValues[i], batchValues[i]);
   }
 
   if constexpr (kIsGradientSupported) {
@@ -98,12 +98,10 @@ static void TestTrilinearSampleBatchEquivalence(
         /*kComputeGradients*/ true>(simdPoints, &bothValues, &bothGradients);
 
     for (int i = 0; i < kBatchSize; ++i) {
-      Real3 const batchGrad{
-          Get(batchGradients[0], i), Get(batchGradients[1], i), Get(batchGradients[2], i)};
-      Real3 const bothGrad{
-          Get(bothGradients[0], i), Get(bothGradients[1], i), Get(bothGradients[2], i)};
+      Real3 const batchGrad{batchGradients[0][i], batchGradients[1][i], batchGradients[2][i]};
+      Real3 const bothGrad{bothGradients[0][i], bothGradients[1][i], bothGradients[2][i]};
       EXPECT_NEAR_EQ(refGradients[i], batchGrad);
-      EXPECT_NEAR_EQ(refValues[i], Get(bothValues, i));
+      EXPECT_NEAR_EQ(refValues[i], bothValues[i]);
       EXPECT_NEAR_EQ(refGradients[i], bothGrad);
     }
   }

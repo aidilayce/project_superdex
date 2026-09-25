@@ -69,6 +69,7 @@ static void Example1() {
   {
     auto BSpC = ToBlockSparseMatrix<1>(C);
     krylov::ColoredSSORPrec<BlockSparseMatrix<Scalar, 1, int, int>> prec(BSpC, Scalar(0.7));
+    EXPECT_EQ(7, prec.NumConcurrentSolveBarriers());
     auto y = OutType::Zero(C.Rows(), 2);
     prec(x, y);
     EXPECT_NEAR_RTOL(y(0, 0), Scalar(6.673333333333333e-01), tol);
@@ -304,6 +305,7 @@ static void Example4() {
       break;
     }
     krylov::ColoredSSORPrec<BlockSparseMatrix<Scalar, kBlockSize, int, int>> prec(C);
+    EXPECT_EQ(2 + 2 * prec.NumColors(), prec.NumConcurrentSolveBarriers());
     auto y = OutType::Zero(C.Rows(), 1);
     prec(x, y);
     auto yp = OutType::Zero(C.Rows(), 1);

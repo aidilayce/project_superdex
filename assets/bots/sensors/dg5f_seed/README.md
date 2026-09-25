@@ -10,3 +10,11 @@ The SuperDex assembly in this directory also references Tesollo DG-5F-M short-wr
 - Tesollo hand terms and attribution: [`../../hands/dg5f_short`](../../hands/dg5f_short) — see its README, LICENSE, and NOTICE.
 
 **You are responsible for ensuring your use is compatible with all third-party licenses of the referenced sub-assets.**
+
+## Mounting adapter CAD
+
+[`step/DG5F_Seed_Fingertip_Mount.STEP`](step/DG5F_Seed_Fingertip_Mount.STEP) contains the mounting adapter CAD matching [`render/dg5f_link_tip_render.glb`](render/dg5f_link_tip_render.glb).
+
+The mounting adapter STEP is distributed under the [Creative Commons Attribution 4.0 International License (CC-BY-4.0)](step/LICENSE), with attribution to Meta Platforms, Inc. and affiliates. This license applies only to the STEP file.
+
+The STEP coordinates are in millimeters. To align them with the physical mount-link frame, use `(x, y, z) = (STEP_z, STEP_x, STEP_y - 11)`, then convert to meters for SuperDex.

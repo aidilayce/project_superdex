@@ -804,7 +804,7 @@ void SparseMatrix<Scalar, CRIdx, Ptr, Storage>::TransposeApply(MatrixIn const& X
           auto const aval = Load<SimdT>(&vrow[j]);
           auto const rhs = aval * xval;
           for (int k = 0; k < SimdT::kSize; ++k) {
-            AtX(idxTmp[j + k], 0) += Get(rhs, k);
+            AtX(idxTmp[j + k], 0) += rhs[k];
           }
         }
       }

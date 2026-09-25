@@ -791,8 +791,10 @@ void mochi::FindPointContactsMapped(
     DynamicArray<ColliderJacDofs>* outDofsJac) {
   // Cull points based on collider bounds. The culled points are in collider space.
   auto const colliderFromPoints = Invert(pointsFromCollider);
-  DynamicArray<Real3> pointsCulled(points.size());
-  DynamicArray<int> indsCulled(points.size());
+  DynamicArray<Real3> pointsCulled;
+  DynamicArray<int> indsCulled;
+  pointsCulled.resize_noinit(points.size());
+  indsCulled.resize_noinit(points.size());
   auto numPointsCulled = static_cast<size_t>(
       FindPointsInAnyShape(bounds, points, colliderFromPoints, pointsCulled, indsCulled));
 
@@ -855,18 +857,17 @@ void mochi::ContactJac::CompressIndices() {
   MOCHI_FILO_STACK_ALLOCATOR(tempAlloc, 16 * 1024); // Probably more than enough
   DynamicArray<IndexGroups> indGroupsAll(&tempAlloc);
   indGroupsAll.reserve(numRows);
+  int maxGroups = 0;
   for (int i = 0; i < numRows; i++) {
-    indGroupsAll.emplace_back(CreateIndexGroups(Inds(i), forceTriplets, &tempAlloc));
+    auto groups = CreateIndexGroups(Inds(i), forceTriplets, &tempAlloc);
+    maxGroups = Max(maxGroups, isize(groups));
+    indGroupsAll.emplace_back(std::move(groups));
   }
 
   // Create final storage. Use the maximum group count across all contacts, since different
-  // contacts may have different numbers of index groups (e.g., rod visual mesh contact where
+  // contacts may have different numbers of index groups (e.g., rod surface contact where
   // skinning connectivity varies per contact). Per-contact group counts are stored so that
   // IndGroups(i) returns only the valid entries for each contact.
-  int maxGroups = 0;
-  for (int i = 0; i < numRows; i++) {
-    maxGroups = Max(maxGroups, isize(indGroupsAll[i]));
-  }
   _data.indGroups.clear();
   _data.indGroups.resize_noinit(numRows * maxGroups);
   _data.indGroupCounts.resize_noinit(numRows);

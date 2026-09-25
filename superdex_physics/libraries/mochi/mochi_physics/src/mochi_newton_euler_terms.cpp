@@ -46,6 +46,11 @@ NewtonEulerTermsImpl::NewtonEulerTermsImpl(Actor* robot, Error& error) {
   MOCHI_ERROR_RETURN(error);
   _scene = assert_cast<SceneImpl*>(_robot->GetScene());
 
+  // Newton-Euler terms exclude contact forces.
+  _scene->EnableActorContactAsymmetric(
+      _robot->GetHandle(), _robot->GetHandle(), /*enable*/ false, IncludeNestedActors::Yes, error);
+  MOCHI_ERROR_RETURN(error);
+
   // Set solver configuration/settings
   experimental::EnableNewtonEulerInertia(_robot, true, ErrorAssert{});
 }
@@ -82,6 +87,7 @@ void NewtonEulerTermsImpl::Compute(
   MOCHI_ERROR_IF(isize(outJtF) != numDofs, error, "Incorrect size of the external force term");
   MOCHI_ERROR_IF(isize(outM) != numDofs * numDofs, error, "Incorrect size of the mass matrix");
   MOCHI_ERROR_RETURN(error);
+  ScopedSchedulerBinding schedulerBinding(_scene);
 
   // Set robot configuration
   _robot->SetArticulatedPoseFromJoints(q, error);

@@ -42,7 +42,8 @@ inline constexpr int kMeshDataSpaceDim = 3;
  * @see BlendingDataView
  */
 struct BlendingData {
-  BlendingData() = default; ///< Default constructor
+  /** @brief Default constructor. */
+  BlendingData() = default;
 
   /**
    * @brief Copy from @ref BlendingDataView.
@@ -51,9 +52,22 @@ struct BlendingData {
    */
   explicit BlendingData(BlendingDataView const& src);
 
-  DynamicString sourceShape; ///< Name of the soft source shape.
-  DynamicArray<int> indices; ///< Indices for blending. Size = numNodes * 2.
-  DynamicArray<real> weights; ///< Weights for blending Size = numNodes * 2.
+  /** @brief Name of the soft source shape. */
+  DynamicString sourceShape;
+  /**
+   * @brief Nested-soft source vertex indices for each target vertex.
+   *
+   * @details Entry `i` identifies the vertex in the nested soft shape for target vertex `i`. The
+   * index is ignored when `weights[i]` is zero. The size equals the number of target vertices.
+   */
+  DynamicArray<int> indices;
+  /**
+   * @brief Nested-soft blend weights for each target vertex.
+   *
+   * @details Entry `i` is in `[0, 1]`, where zero is purely articulated and one is fully
+   * nested-soft. The size equals the number of target vertices.
+   */
+  DynamicArray<real> weights;
 
 #if MOCHI_LANGUAGE_CPP20
   bool operator==(BlendingData const& other) const = default;
@@ -68,8 +82,7 @@ struct BlendingData {
 };
 
 /**
- * @brief A non-owning view of the data blending data for one source shape within a soft skinned
- * mesh.
+ * @brief Non-owning view of blending data for one source shape within a soft skinned mesh.
  *
  * @see BlendingData
  */
@@ -83,9 +96,12 @@ struct BlendingDataView {
    */
   BlendingDataView(BlendingData const& src);
 
-  std::string_view sourceShape; ///< Name of the soft source shape
-  Span<int const> indices; ///< Indices for blending. Size = numNodes * 2.
-  Span<real const> weights; ///< Weights for blending Size = numNodes * 2.
+  /** @brief See @ref BlendingData::sourceShape. */
+  std::string_view sourceShape;
+  /** @brief See @ref BlendingData::indices. */
+  Span<int const> indices;
+  /** @brief See @ref BlendingData::weights. */
+  Span<real const> weights;
 
 #if MOCHI_LANGUAGE_CPP20
   bool operator==(BlendingDataView const& other) const = default;

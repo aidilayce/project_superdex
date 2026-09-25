@@ -56,9 +56,12 @@
     - MOCHI_ARCH_GPU        Compiling for GPU (CUDA GPU device code)
     - MOCHI_ARCH_ARM        Compiling for an ARM CPU (64-bit ARMv8 or newer)
     - MOCHI_ARCH_ARM_NEON   Compiling for an ARM CPU with NEON (mandatory for ARMv8 or newer)
+    - MOCHI_ARCH_ARM_NEON_FP16_ARITHMETIC
+                            Compiling with the ARM FP16 vector arithmetic feature enabled
     - MOCHI_ARCH_ARM_SVE    Compiling for an ARM CPU with SVE (mandatory for ARMv9 or newer)
     - MOCHI_ARCH_ARM_SME    Compiling for an ARM CPU with SME (scalable matrix extension)
     - MOCHI_ARCH_X64        Compiling for an x64 CPU (64-bit x86, also called x86_64)
+    - MOCHI_ARCH_X64_AVX512 Compiling for an x64 CPU with AVX-512 F, CD, BW, DQ, and VL
     - MOCHI_ARCH_X64_AVX2   Compiling for an x64 CPU with AVX2 vector extension
     - MOCHI_ARCH_X64_FMA    Compiling for an x64 CPU with FMA (fused multiply add) extension
     - MOCHI_ARCH_X64_SVML   Compiling for an x64 CPU with SVML (small vector math library) extension
@@ -90,6 +93,12 @@
 #define MOCHI_ARCH_ARM_NEON 0
 #endif
 
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+#define MOCHI_ARCH_ARM_NEON_FP16_ARITHMETIC 1
+#else
+#define MOCHI_ARCH_ARM_NEON_FP16_ARITHMETIC 0
+#endif
+
 // NOTE: The Unreal Engine build system has its own macros.
 #define MOCHI_UNREAL_ARCH_AVX2 0
 
@@ -117,7 +126,15 @@
 #define MOCHI_ARCH_X64 0
 #endif
 
-#if MOCHI_ARCH_CPU && MOCHI_ARCH_X64 && (defined(__AVX2__) || MOCHI_UNREAL_ARCH_AVX2)
+#if MOCHI_ARCH_CPU && MOCHI_ARCH_X64 && defined(__AVX512F__) && defined(__AVX512CD__) && \
+    defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VL__)
+#define MOCHI_ARCH_X64_AVX512 1
+#else
+#define MOCHI_ARCH_X64_AVX512 0
+#endif
+
+#if MOCHI_ARCH_CPU && MOCHI_ARCH_X64 && \
+    (MOCHI_ARCH_X64_AVX512 || defined(__AVX2__) || MOCHI_UNREAL_ARCH_AVX2)
 #define MOCHI_ARCH_X64_AVX2 1
 #else
 #define MOCHI_ARCH_X64_AVX2 0
@@ -442,7 +459,10 @@
   MOCHI_SIMD_REGISTER_COUNT       Number of floating-point SIMD registers.
   MOCHI_SIMD_REGISTER_SIZE_BYTES  Size (in bytes) of each floating-point SIMD register.
 */
-#if MOCHI_ARCH_X64_AVX2
+#if MOCHI_ARCH_X64_AVX512
+#define MOCHI_SIMD_REGISTER_COUNT 32
+#define MOCHI_SIMD_REGISTER_SIZE_BYTES 64
+#elif MOCHI_ARCH_X64_AVX2
 #define MOCHI_SIMD_REGISTER_COUNT 16
 #define MOCHI_SIMD_REGISTER_SIZE_BYTES 32
 #elif MOCHI_ARCH_ARM_NEON
@@ -454,18 +474,32 @@
 #endif
 
 /**************************************************************************************************
- Memory Cache:
-  MOCHI_CACHE_LINE_SIZE           Size of a data cache line in bytes. Used to align memory buffers.
-  MOCHI_CACHE_ALIGN               Short for alignas(MOCHI_CACHE_LINE_SIZE)
+ Memory Cache
 */
 
-#ifndef MOCHI_CACHE_LINE_SIZE
-// All currently supported CPUs have a common cache line size.
-// If future CPUs differ, then adjust this number to achieve the intended performance.
-#define MOCHI_CACHE_LINE_SIZE 64
+/**
+ * @brief Conservative upper limit for the size (and alignment) of a data cache line.
+ *
+ * @details Cache line size is a property of the CPU, so it is not known at compile time.
+ * This conservative value can be used when compile-time alignment is needed. For a more
+ * accurate runtime value use @ref GetCacheLineInfo.
+ *
+ * @see MOCHI_CONSERVATIVE_CACHE_ALIGN, GetCacheLineInfo
+ */
+#ifndef MOCHI_CONSERVATIVE_CACHE_LINE_SIZE
+#define MOCHI_CONSERVATIVE_CACHE_LINE_SIZE 256
 #endif
 
-#define MOCHI_CACHE_ALIGN alignas(MOCHI_CACHE_LINE_SIZE)
+/**
+ * @brief Aligns the memory of a variable so it starts at the beginning of a cache line.
+ *
+ * @details Cache line size is a property of the CPU, so it is not known at compile time. This
+ * conservative value will waste some memory on most systems, but that is usually acceptable for
+ * static variables and temporary variables.
+ *
+ * @see MOCHI_CONSERVATIVE_CACHE_LINE_SIZE, GetCacheLineInfo
+ */
+#define MOCHI_CONSERVATIVE_CACHE_ALIGN alignas(MOCHI_CONSERVATIVE_CACHE_LINE_SIZE)
 
 /**************************************************************************************************
   MOCHI_NO_INIT

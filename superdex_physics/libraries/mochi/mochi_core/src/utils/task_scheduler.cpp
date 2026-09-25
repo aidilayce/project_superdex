@@ -413,7 +413,7 @@ void TaskScheduler::TryToWakeUpMoreWorkers(int numWorkers, TimeSpan dummyTaskDur
 }
 
 int TaskScheduler::BatchEnqueueOnAvailableWorkers(
-    TaskSemaphore sem,
+    TaskSemaphore const& sem,
     BatchTaskFn&& task,
     int minWorkers,
     int targetWorkers,

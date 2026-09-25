@@ -189,12 +189,20 @@ static void ValidateShapeTransform(Real3 const& scale, TransformRT const& rt, Er
       "Invalid shape scale. Scale must be non-zero on all 3 axes.");
 }
 
+// The path component of a file cache key. Normalizing it lets different spellings of one file
+// (mixed separators, "a/../b") share a cache entry, and lets ClearFileFromCache evict a file it
+// was given under a different spelling than the load used. Case is deliberately not folded: that
+// would be wrong on a case-sensitive filesystem.
+static std::string NormalizeFileCachePath(std::string_view path) {
+  return std::filesystem::path(path).lexically_normal().generic_string();
+}
+
 // Format a key for lookup in the file cache.
 static std::string
 GetFileCacheKey(std::string_view path, Real3 const& scale, TransformRT const& transform) {
   return Format(
       "%s:%s:%s:%s",
-      std::string(path).c_str(),
+      NormalizeFileCachePath(path).c_str(),
       SReflect::ToJsonString(scale).c_str(),
       SReflect::ToJsonString(transform.GetRotation()).c_str(),
       SReflect::ToJsonString(transform.GetTranslation()).c_str());
@@ -277,6 +285,7 @@ ShapeHandle ContextImpl::LoadShapeFromFile(
   ValidateShapeTransform(bakeScale, bakeTransform, error);
   MOCHI_ERROR_IF(filePath.empty(), error, "Invalid file path");
   MOCHI_ERROR_RETURN(error, {});
+  ScopedSchedulerBinding schedulerBinding(GetTaskScheduler());
 
   auto doLoad = [&](Error& err) {
     // Load the file (any supported format)
@@ -307,11 +316,9 @@ ShapeHandle ContextImpl::LoadShapeFromFile(
 }
 
 // Experimental API
-MOCHI_API ShapeHandle experimental::CreateDeepFlowShape(
+ShapeHandle experimental::CreateDeepFlowShape(
     Context* context,
     DeepModelParams const& params, // Parameters of a deep model
-    NeuralComputeType computeType,
-    int preallocMemSize, // Amount of preallocated GPU memory. Only used if computeType is TorchGpu
     Error& error) {
   MOCHI_ERROR_IF(!context, error, "Invalid context");
   MOCHI_ERROR_IF(
@@ -325,8 +332,6 @@ MOCHI_API ShapeHandle experimental::CreateDeepFlowShape(
       params.scale,
       Real3(params.shiftX, params.shiftY, params.shiftZ),
       params.numDof,
-      computeType,
-      preallocMemSize,
       error);
   MOCHI_ERROR_RETURN(error, {});
 
@@ -334,7 +339,7 @@ MOCHI_API ShapeHandle experimental::CreateDeepFlowShape(
 }
 
 // Experimental API
-MOCHI_API ShapeHandle experimental::CreatePolylineShape(
+ShapeHandle experimental::CreatePolylineShape(
     Context* context,
     Span<Real3 const> nodes,
     Span<Real3 const> elementFrameAxes,
@@ -376,6 +381,7 @@ ShapeHandle ContextImpl::LoadShapeFromBytes(
   ValidateShapeTransform(bakeScale, bakeTransform, error);
   MOCHI_ERROR_IF(fileData.empty(), error, "No data");
   MOCHI_ERROR_RETURN(error, {});
+  ScopedSchedulerBinding schedulerBinding(GetTaskScheduler());
 
   // Load the file from memory (any supported format)
   ModelData model = model::LoadFromBytes(fileData, format, error);
@@ -560,16 +566,11 @@ void ContextImpl::ClearFileCache() {
 
 void ContextImpl::ClearFileFromCache(std::string_view filePath) {
   std::lock_guard lock(_mutex);
-  // Non-articulated shapes are cached with key = "<filePath>:<scale>:<rotation>:<translation>".
-  // Articulated shapes are cached with key = "<filePath>".
-  // Remove all keys that match these patterns.
-  std::string keyPrefix;
-  keyPrefix.reserve(filePath.length() + 1);
-  keyPrefix.assign(filePath);
+  // Keys are "<normalized path>:<scale>:<rotation>:<translation>" (see GetFileCacheKey), so every
+  // bake variant of this file is matched by the normalized path plus the separator.
+  std::string keyPrefix = NormalizeFileCachePath(filePath);
   keyPrefix.push_back(':');
-  std::erase_if(_fileCache, [&](auto const& pair) {
-    return pair.first == filePath || pair.first.starts_with(keyPrefix);
-  });
+  std::erase_if(_fileCache, [&](auto const& pair) { return pair.first.starts_with(keyPrefix); });
 }
 
 Scene* ContextImpl::CreateScene(std::string_view name) {
@@ -824,32 +825,82 @@ int ContextImpl::GetNumThreads() const {
 }
 
 // Static API Method
-MOCHI_API bool Context::IsLogChannelEnabled(LogChannel channel) {
+bool Context::IsLogChannelEnabled(LogChannel channel) {
   return mochi::IsLogChannelEnabled(channel);
 }
 
 // Static API Method
-MOCHI_API void Context::EnableLogChannelInternal(LogChannel channel, bool enable) {
+void Context::EnableLogChannelInternal(LogChannel channel, bool enable) {
   mochi::EnableLogChannel(channel, enable);
 }
 
 // Static API Method
-MOCHI_API LogFn Context::GetLogCallback() {
+LogFn Context::GetLogCallback() {
   return mochi::GetLogCallback();
 }
 
 // Static API Method
-MOCHI_API void Context::SetLogCallbackInternal(LogFn callback) {
+void Context::SetLogCallbackInternal(LogFn callback) {
   mochi::SetLogCallback(callback);
 }
 
 // Static API Method
-MOCHI_API OnAssertFn Context::GetAssertionFailureCallback() {
+OnAssertFn Context::GetAssertionFailureCallback() {
   return mochi::GetAssertionFailureCallback();
 }
 
+namespace {
+
+struct AuxiliaryMeshData {
+  std::unique_ptr<TriangularMesh> mesh;
+  std::unique_ptr<LinearMeshEmbedding> embedding;
+};
+
+AuxiliaryMeshData CreateAuxiliaryMeshData(std::optional<MeshData> const& data) {
+  if (!data) {
+    return {};
+  }
+  auto mesh = std::make_unique<TriangularMesh>(
+      Unflatten<Real3 const>(MakeConstSpan(data->coordinates)),
+      Unflatten<Int3 const>(MakeConstSpan(data->connectivity)));
+  if (!data->skinning) {
+    return {std::move(mesh), {}};
+  }
+  auto embedding = std::make_unique<LinearMeshEmbedding>(
+      data->skinning->weightsPerNode,
+      MakeConstSpan(data->skinning->indices),
+      MakeConstSpan(data->skinning->weights));
+  return {std::move(mesh), std::move(embedding)};
+}
+
+struct RodSurfaceData {
+  std::shared_ptr<TriangularMesh const> mesh;
+  std::shared_ptr<RodSurfaceEmbeddingData const> embedding;
+};
+
+RodSurfaceData CreateRodSurfaceData(
+    std::optional<MeshData>& data,
+    Span<Real3 const> rodNodes,
+    Span<Real3 const> elementFrameAxes,
+    bool isClosedLoop) {
+  if (!data) {
+    return {};
+  }
+  auto mesh = std::make_shared<TriangularMesh const>(
+      DynamicArray<Real3>{Unflatten<Real3>(data->coordinates)},
+      DynamicArray<Int3>{Unflatten<Int3>(data->connectivity)});
+  if (!data->skinning) {
+    return {std::move(mesh), {}};
+  }
+  auto embedding = std::make_shared<RodSurfaceEmbeddingData const>(ComputeRodSurfaceEmbedding(
+      rodNodes, elementFrameAxes, *mesh, std::move(*data->skinning), isClosedLoop));
+  return {std::move(mesh), std::move(embedding)};
+}
+
+} // namespace
+
 // Static API Method
-MOCHI_API void Context::SetAssertionFailureCallbackInternal(OnAssertFn callback) {
+void Context::SetAssertionFailureCallbackInternal(OnAssertFn callback) {
   mochi::SetAssertionFailureCallback(callback);
 }
 
@@ -890,14 +941,6 @@ ShapePtr ContextImpl::CreateShapeFromModelData(
         std::make_unique<ConstrainedNodesData>(std::move(*model.constrainedNodes));
   }
 
-  std::unique_ptr<TriangularMesh> visMesh;
-  if (model.visualMesh) {
-    // TODO: Move data instead of copying
-    visMesh = std::make_unique<TriangularMesh>(
-        Unflatten<Real3 const>(MakeConstSpan(model.visualMesh->coordinates)),
-        Unflatten<Int3 const>(MakeConstSpan(model.visualMesh->connectivity)));
-  }
-
   std::shared_ptr<GridSdf> gridSdf;
   if (model.sdf) {
     gridSdf = std::make_shared<GridSdf>(GridSdf::Create(std::move(*model.sdf)));
@@ -918,17 +961,11 @@ ShapePtr ContextImpl::CreateShapeFromModelData(
 
   if (model.mesh->nodesPerElement == 4) {
     // TODO: Move data instead of copying
+    auto visualSurface = CreateAuxiliaryMeshData(model.visualMesh);
+    auto contactSurface = CreateAuxiliaryMeshData(model.contactSkinMesh);
     auto tetMesh = std::make_unique<TetrahedralMesh>(
         Unflatten<Real3 const>(MakeConstSpan(model.mesh->coordinates)),
         Unflatten<Int4 const>(MakeConstSpan(model.mesh->connectivity)));
-
-    std::unique_ptr<LinearMeshEmbedding> visEmbedding;
-    if (model.visualMesh && model.visualMesh->skinning) {
-      visEmbedding = std::make_unique<LinearMeshEmbedding>(
-          model.visualMesh->skinning->weightsPerNode,
-          MakeConstSpan(model.visualMesh->skinning->indices),
-          MakeConstSpan(model.visualMesh->skinning->weights));
-    }
 
     std::unique_ptr<PerElementSoftMaterialData> material;
     if (model.material) {
@@ -940,8 +977,10 @@ ShapePtr ContextImpl::CreateShapeFromModelData(
         std::move(skinning),
         std::move(constrainedNodesData),
         std::move(shapeBlending),
-        std::move(visMesh),
-        std::move(visEmbedding),
+        std::move(visualSurface.mesh),
+        std::move(visualSurface.embedding),
+        std::move(contactSurface.mesh),
+        std::move(contactSurface.embedding),
         std::move(gridSdf),
         std::move(experimental.romData),
         std::move(experimental.sampleMeshes),
@@ -949,27 +988,22 @@ ShapePtr ContextImpl::CreateShapeFromModelData(
         std::move(material));
   } else if (model.mesh->nodesPerElement == 3) {
     // TODO: Move data instead of copying
+    auto visualSurface = CreateAuxiliaryMeshData(model.visualMesh);
+    auto contactSurface = CreateAuxiliaryMeshData(model.contactSkinMesh);
     auto triMesh = std::make_unique<TriangularMesh>(
         Unflatten<Real3 const>(MakeConstSpan(model.mesh->coordinates)),
         Unflatten<Int3 const>(MakeConstSpan(model.mesh->connectivity)));
-
-    std::unique_ptr<LinearMeshEmbedding> visEmbedding;
-    if (model.visualMesh && model.visualMesh->skinning) {
-      visEmbedding = std::make_unique<LinearMeshEmbedding>(
-          model.visualMesh->skinning->weightsPerNode,
-          MakeConstSpan(model.visualMesh->skinning->indices),
-          MakeConstSpan(model.visualMesh->skinning->weights));
-    }
 
     return std::make_shared<TriangularMeshShape>(
         std::move(triMesh),
         std::move(skinning),
         std::move(constrainedNodesData),
         std::move(shapeBlending),
-        std::move(visMesh),
-        std::move(visEmbedding),
+        std::move(visualSurface.mesh),
+        std::move(visualSurface.embedding),
+        std::move(contactSurface.mesh),
+        std::move(contactSurface.embedding),
         std::move(gridSdf));
-
   } else if (model.mesh->nodesPerElement == 2) {
     // TODO: Move data instead of copying
     auto nodes = DynamicArray<Real3>{Unflatten<Real3>(model.mesh->coordinates)};
@@ -978,26 +1012,23 @@ ShapePtr ContextImpl::CreateShapeFromModelData(
         ? DynamicArray<Real3>{Unflatten<Real3>(*model.elementFrameAxes)}
         : mochi::GenerateDiscreteBishopFrame(nodes, isClosedLoop);
 
-    std::shared_ptr<TriangularMesh const> polylineVisMesh;
-    std::shared_ptr<RodVisualMeshEmbeddingData> polylineEmbedding;
-
-    if (model.visualMesh && model.visualMesh->skinning) {
-      polylineVisMesh = std::make_shared<TriangularMesh const>(
-          DynamicArray<Real3>{Unflatten<Real3>(model.visualMesh->coordinates)},
-          DynamicArray<Int3>{Unflatten<Int3>(model.visualMesh->connectivity)});
-      polylineEmbedding = ComputeRodVisualMeshEmbedding(
-          nodes, frameAxes, *polylineVisMesh, std::move(*model.visualMesh->skinning), isClosedLoop);
-    }
+    auto visualSurface = CreateRodSurfaceData(
+        model.visualMesh, MakeConstSpan(nodes), MakeConstSpan(frameAxes), isClosedLoop);
+    auto contactSurface = CreateRodSurfaceData(
+        model.contactSkinMesh, MakeConstSpan(nodes), MakeConstSpan(frameAxes), isClosedLoop);
 
     return std::make_shared<PolylineShape>(
         std::move(nodes),
         std::move(frameAxes),
-        std::move(polylineVisMesh),
-        std::move(polylineEmbedding),
+        std::move(visualSurface.mesh),
+        std::move(visualSurface.embedding),
+        std::move(contactSurface.mesh),
+        std::move(contactSurface.embedding),
         isClosedLoop);
   } else {
     MOCHI_ERROR_SET(
-        error, "Mesh element size must be 3 for triangle mesh or 4 for tetrahedral mesh.");
+        error,
+        "Mesh element size must be 2 for polyline, 3 for triangle, or 4 for tetrahedral mesh.");
     return {};
   }
 }
@@ -1027,7 +1058,7 @@ ShapeHandle ContextImpl::RegisterShape(ConstShapePtr newShape, Error& error) {
   return newHandle;
 }
 
-MOCHI_API ConstShapePtr ContextImpl::GetShapeSharedPtr(ShapeHandle shapeHandle) const {
+ConstShapePtr ContextImpl::GetShapeSharedPtr(ShapeHandle shapeHandle) const {
   std::lock_guard lock(_mutex);
   auto it = _shapes.find(shapeHandle.value);
   return (it == _shapes.end()) ? ConstShapePtr{} : it->second;
@@ -1039,6 +1070,24 @@ static MeshDataView MakeMeshDataView(MeshPtr const& mesh) {
   view.nodesPerElement = mesh->GetNumNodesPerElement();
   view.coordinates = Flatten(mesh->GetNodeCoordinates());
   view.connectivity = mesh->GetFlatConnectivity();
+  return view;
+}
+
+static MeshDataView MakeAuxiliaryMeshDataView(
+    TriangularMesh const* mesh,
+    MeshEmbedding const* embedding) {
+  if (!mesh) {
+    return {};
+  }
+
+  auto view = MakeMeshDataView(mesh);
+  if (auto const* linearEmbedding = dynamic_cast<LinearMeshEmbedding const*>(embedding)) {
+    view.skinning.emplace();
+    view.skinning->weightsPerNode =
+        static_cast<int>(linearEmbedding->GetNumSkinningWeightsPerEntry());
+    view.skinning->indices = linearEmbedding->GetIndices();
+    view.skinning->weights = linearEmbedding->GetWeights();
+  }
   return view;
 }
 
@@ -1089,6 +1138,29 @@ MeshDataView ContextImpl::GetShapeSurfaceMesh(ShapeHandle shape, Error& error) c
   return shapePtr->GetSurfaceMeshData();
 }
 
+MeshDataView ContextImpl::GetShapeContactSkinMesh(ShapeHandle shape, Error& error) const {
+  MOCHI_ERROR_RETURN(error, {});
+
+  ConstShapePtr shapePtr = GetShapeSharedPtr(shape);
+  MOCHI_ERROR_IF_NOT(shapePtr, error, "Cannot get shape contact skin. Invalid shape handle.");
+  MOCHI_ERROR_RETURN(error, {});
+
+  TriangularMesh const* contactSkinPtr = nullptr;
+  MeshEmbedding const* embeddingPtr = nullptr;
+
+  if (auto const* tetmesh = dynamic_cast<TetrahedralMeshShape const*>(shapePtr.get())) {
+    contactSkinPtr = tetmesh->GetContactSkin().get();
+    embeddingPtr = tetmesh->GetContactSkinEmbedding().get();
+  } else if (auto const* trimesh = dynamic_cast<TriangularMeshShape const*>(shapePtr.get())) {
+    contactSkinPtr = trimesh->GetContactSkin().get();
+    embeddingPtr = trimesh->GetContactSkinEmbedding().get();
+  } else if (auto const* polyline = dynamic_cast<PolylineShape const*>(shapePtr.get())) {
+    contactSkinPtr = polyline->GetContactSkin().get();
+  }
+
+  return MakeAuxiliaryMeshDataView(contactSkinPtr, embeddingPtr);
+}
+
 MeshDataView ContextImpl::GetShapeVisualMesh(ShapeHandle shape, Error& error) const {
   MOCHI_ERROR_RETURN(error, {});
 
@@ -1107,25 +1179,10 @@ MeshDataView ContextImpl::GetShapeVisualMesh(ShapeHandle shape, Error& error) co
     embeddingPtr = trimesh->GetVisualEmbedding().get();
   } else if (auto const* polyline = dynamic_cast<PolylineShape const*>(shapePtr.get())) {
     visualMeshPtr = polyline->GetVisualMesh().get();
-    // Rod visual mesh embedding is nonlinear and incompatible with SkinningDataView.
+    // Polyline visual mesh embeddings are nonlinear and are not exposed by this view.
   }
 
-  if (!visualMeshPtr) {
-    // Shape doesn't have a visual mesh.
-    return {};
-  }
-
-  auto view = MakeMeshDataView(visualMeshPtr);
-  if (auto const* linearEmbedding = dynamic_cast<LinearMeshEmbedding const*>(embeddingPtr)) {
-    view.skinning.emplace();
-    view.skinning->weightsPerNode =
-        static_cast<int>(linearEmbedding->GetNumSkinningWeightsPerEntry());
-    view.skinning->indices = linearEmbedding->GetIndices();
-    view.skinning->weights = linearEmbedding->GetWeights();
-  }
-  // LinearMeshEmbedding is the only MeshEmbedding type.
-
-  return view;
+  return MakeAuxiliaryMeshDataView(visualMeshPtr, embeddingPtr);
 }
 
 Aabb ContextImpl::GetShapeAabb(ShapeHandle shape, Error& error) const {
@@ -1196,7 +1253,7 @@ DebugServer const& ContextImpl::GetDebugServer() const {
   return *_debugServer;
 }
 
-MOCHI_API Context* CreateContext(int numWorkerThreads) {
+Context* CreateContext(int numWorkerThreads) {
   auto* mochiPhysics = new ContextImpl;
   if (numWorkerThreads >= 0) {
     mochiPhysics->SetNumWorkerThreads(numWorkerThreads);
@@ -1205,7 +1262,7 @@ MOCHI_API Context* CreateContext(int numWorkerThreads) {
   return mochiPhysics;
 }
 
-MOCHI_API void DestroyContext(Context* mochiPhysicsInstance) {
+void DestroyContext(Context* mochiPhysicsInstance) {
   if (mochiPhysicsInstance) {
     auto* impl = assert_cast<ContextImpl*>(mochiPhysicsInstance);
     impl->PreShutDown();

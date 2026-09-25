@@ -325,7 +325,7 @@ void mochi::soft::AssembleBody(
     ecs::OptionalTag<TagUseInertia> hasInertiaTag,
     ecs::OptionalTag<TagUseStress> hasStressTag,
     ecs::OptionalTag<TagRomActor> isRom,
-    [[maybe_unused]] ecs::OptionalTag<TagSoftSkinnedActor> isSkinned,
+    [[maybe_unused]] ecs::OptionalTag<TagNestedSoftActor> isNestedSoft,
     CSkinnedEnergy const& skinnedEnergy,
     CLocal2GlobalMap const& l2g,
     CNodalBasedStructure const& nbs,
@@ -350,10 +350,10 @@ void mochi::soft::AssembleBody(
       "Please update logic below if RomProjectionStrategy enum changes");
 
   if (!hasGravity && !hasInertia && !hasStress) {
-    // Only soft-skinned actors may reach here. Note their Dresidual in this case must NOT be
+    // Only nested soft actors may reach here. Note their Dresidual in this case must NOT be
     // modified in AssembleBodyImpl to prevent race conditions with skinned::EntityAssembleBody.
     MOCHI_ASSERT_VERBOSE(
-        isSkinned, "Only soft-skinned actors can assemble with no unposed body terms.");
+        isNestedSoft, "Only nested soft actors can assemble with no unposed body terms.");
     return;
   } else if (
       isRom &&
@@ -388,7 +388,7 @@ void mochi::soft::AssembleAsyncContact(
     entt::entity e,
     ecs::Included<TagSoftActor, TagUseContact>,
     ecs::OptionalTag<TagRomActor> isRom,
-    ecs::Excluded<TagSoftSkinnedActor>,
+    ecs::Excluded<TagNestedSoftActor>,
     ecs::OptionalTag<TagQueryActiveContacts> queryActiveContacts,
     ecs::CtxGlobal<CSimulationParams const> simParams,
     CTimeIntegratorState const& intState,
@@ -783,12 +783,12 @@ void mochi::soft::SetMaterialParamsField(
   std::visit(
       [&](auto const& baseP) {
         using P = std::decay_t<decltype(baseP)>;
-        auto const homogeneous = materials::BuildPerElementParams(baseP);
         auto& c = soft::details::GetMatchingPerElementParams<P>(outMaterial);
         auto const& p = soft::details::GetTypedMaterialParams<P>(materialParams);
 
         if constexpr (materials::kIsLameMaterial<P>) {
           if (isize(c) < numElements) {
+            auto const homogeneous = materials::BuildPerElementParams(baseP);
             c.mu.resize(numElements, homogeneous.mu[0]);
             c.lambda.resize(numElements, homogeneous.lambda[0]);
           }
@@ -798,11 +798,13 @@ void mochi::soft::SetMaterialParamsField(
           c.lambda[elementIndex] = lam;
         } else if constexpr (std::is_same_v<P, ArapMaterialParams>) {
           if (isize(c) < numElements) {
+            auto const homogeneous = materials::BuildPerElementParams(baseP);
             c.stiffness.resize(numElements, homogeneous.stiffness[0]);
           }
           c.stiffness[elementIndex] = p.stiffness;
         } else if constexpr (std::is_same_v<P, ActiveShapeTargetingArapMaterialParams>) {
           if (isize(c) < numElements) {
+            auto const homogeneous = materials::BuildPerElementParams(baseP);
             int const oldSize = isize(c);
             c.stiffness.resize(numElements, homogeneous.stiffness[0]);
             c.shapeTargetTensor.resize_noinit(numElements * 6);
@@ -816,6 +818,7 @@ void mochi::soft::SetMaterialParamsField(
         } else {
           static_assert(std::is_same_v<P, ActiveNeoHookeanMaterialParams>);
           if (isize(c) < numElements) {
+            auto const homogeneous = materials::BuildPerElementParams(baseP);
             c.lame.mu.resize(numElements, homogeneous.lame.mu[0]);
             c.lame.lambda.resize(numElements, homogeneous.lame.lambda[0]);
             c.aniso.alpha.resize(numElements, homogeneous.aniso.alpha[0]);
@@ -946,7 +949,7 @@ void mochi::soft::UpdateSoftMass(
   deformable::ComputeLumpedMassMatrix(sparsity, outMassMatrix, outLumpedMass);
 }
 
-MOCHI_API void mochi::soft::RecenterSolutionUsingRigidTransformEval(
+void mochi::soft::RecenterSolutionUsingRigidTransformEval(
     ecs::RequiredTag<TagSoftActor>,
     ecs::Excluded<TagRomActor>,
     CRecenteringParams const& params,
@@ -960,8 +963,7 @@ MOCHI_API void mochi::soft::RecenterSolutionUsingRigidTransformEval(
     CVelocitySlice<real, TimeStep::Previous>& prevVel,
     CIntegrationVelocitySlices<DisplacementLayer::Default>& intVels,
     CRigidTransformEval& pivotEval,
-    CBoundingVolume<TimeStep::Current>* currBounds,
-    CBoundingVolume<TimeStep::Previous>* prevBounds) {
+    CBoundingVolume* bounds) {
   MOCHI_PROFILE_SCOPE();
   if (!params.useRecentering) {
     return;
@@ -1017,11 +1019,8 @@ MOCHI_API void mochi::soft::RecenterSolutionUsingRigidTransformEval(
   }
 
   // Update the local bounding volume (an Obb for soft actors)
-  if (currBounds) {
-    currBounds->localShape = TransformShape(newLocalFromOldLocal, currBounds->localShape);
-  }
-  if (prevBounds) {
-    prevBounds->localShape = TransformShape(newLocalFromOldLocal, prevBounds->localShape);
+  if (bounds) {
+    bounds->localShape = TransformShape(newLocalFromOldLocal, bounds->localShape);
   }
 }
 
@@ -1049,25 +1048,6 @@ static void EvaluateDisplacements(
   *gradientOut = x.DEval(dofValues);
 }
 
-void mochi::SetZeroDisplacements(entt::registry& reg, entt::entity e, Error& error) {
-  MOCHI_ERROR_RETURN(error);
-  MOCHI_PROFILE_SCOPE();
-
-  auto* currDispl = reg.try_get<CDisplacementSlice<real, TimeStep::Current>>(e);
-  MOCHI_ERROR_IF(
-      currDispl == nullptr, error, "CDisplacementSlice<real, TimeStep::Current> required.");
-  auto* prevDispl = reg.try_get<CDisplacementSlice<real, TimeStep::Previous>>(e);
-  MOCHI_ERROR_IF(
-      prevDispl == nullptr, error, "CDisplacementSlice<real, TimeStep::Previous> required.");
-  MOCHI_ERROR_RETURN(error);
-
-  currDispl->value.SetZero();
-  prevDispl->value.SetZero();
-
-  // External state changes invalidate step history.
-  InvalidateActorStepHistory(reg, e);
-}
-
 void mochi::SetNodePositionsLocal(
     entt::registry& reg,
     entt::entity e,
@@ -1077,9 +1057,9 @@ void mochi::SetNodePositionsLocal(
   MOCHI_PROFILE_SCOPE();
 
   MOCHI_ERROR_IF(
-      reg.any_of<TagSoftSkinnedActor>(e),
+      reg.any_of<TagNestedSoftActor>(e),
       error,
-      "SetNodePositionsLocal is not supported for soft-skinned actors.");
+      "SetNodePositionsLocal is not supported for nested soft actors.");
   auto* currDispl = reg.try_get<CDisplacementSlice<real, TimeStep::Current>>(e);
   MOCHI_ERROR_IF(
       currDispl == nullptr, error, "CDisplacementSlice<real, TimeStep::Current> required.");
@@ -1107,32 +1087,6 @@ void mochi::SetNodePositionsLocal(
   InvalidateActorStepHistory(reg, e);
 }
 
-void mochi::SetZeroVelocities(entt::registry& reg, entt::entity e, Error& error) {
-  MOCHI_ERROR_RETURN(error);
-  MOCHI_PROFILE_SCOPE();
-  auto* prevVel = reg.try_get<CVelocitySlice<real, TimeStep::Previous>>(e);
-  MOCHI_ERROR_IF(prevVel == nullptr, error, "Requires CVelocitySlice<real, TimeStep::Previous>.");
-  MOCHI_ERROR_RETURN(error);
-  prevVel->value.SetZero();
-  auto* currVel = reg.try_get<CVelocitySlice<real, TimeStep::Current>>(e);
-  MOCHI_ERROR_IF(currVel == nullptr, error, "Requires CVelocitySlice<real, TimeStep::Current>.");
-  MOCHI_ERROR_RETURN(error);
-  currVel->value.SetZero();
-
-  // Zero skinned velocity layers if they exist (soft-skinned actors).
-  if (auto* prevVelSkinned =
-          reg.try_get<CVelocitySlice<real, TimeStep::Previous, DisplacementLayer::Skinned>>(e)) {
-    prevVelSkinned->value.SetZero();
-  }
-  if (auto* currVelSkinned =
-          reg.try_get<CVelocitySlice<real, TimeStep::Current, DisplacementLayer::Skinned>>(e)) {
-    currVelSkinned->value.SetZero();
-  }
-
-  // External state changes invalidate step history.
-  InvalidateActorStepHistory(reg, e);
-}
-
 void mochi::SetNodeVelocitiesLocal(
     entt::registry& reg,
     entt::entity e,
@@ -1142,9 +1096,9 @@ void mochi::SetNodeVelocitiesLocal(
   MOCHI_PROFILE_SCOPE();
 
   MOCHI_ERROR_IF(
-      reg.any_of<TagSoftSkinnedActor>(e),
+      reg.any_of<TagNestedSoftActor>(e),
       error,
-      "SetNodeVelocitiesLocal is not supported for soft-skinned actors.");
+      "SetNodeVelocitiesLocal is not supported for nested soft actors.");
   auto* prevVel = reg.try_get<CVelocitySlice<real, TimeStep::Previous>>(e);
   MOCHI_ERROR_IF(prevVel == nullptr, error, "Requires CVelocitySlice<real, TimeStep::Previous>.");
   MOCHI_ERROR_IF(
@@ -1415,12 +1369,12 @@ void mochi::soft::ComputeTransformAtEvalPoint(
   }
 }
 
-MOCHI_API void soft::UpdateRigidVelocity(
+void soft::UpdateRigidVelocity(
     ecs::Included<TagSoftActor>,
     ecs::Excluded<TagRomActor>,
     ecs::CtxGlobal<CSceneTime const> time,
     CRootTransform const& root,
-    CBoundingVolume<TimeStep::Current> const& bounds,
+    CBoundingVolume const& bounds,
     CPrevRigidVelocity& outRigidVel) {
   // Approximate the center-of-mass using the center-of-volume.
   // Then compute velocity of that point based on the change in root transform.

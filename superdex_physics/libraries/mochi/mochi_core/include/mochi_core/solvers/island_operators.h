@@ -23,7 +23,9 @@
 #include <mochi_core/mochi_platform.h>
 #include <mochi_core/solvers/actor_preconditioner.h>
 #include <mochi_core/solvers/interaction_matrix_info.h>
+#include <mochi_core/solvers/per_actor_preconditioner.h>
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <numeric>
@@ -34,77 +36,6 @@
 #include <vector>
 
 namespace mochi {
-
-// Forward declaration.
-template <typename T>
-struct IslandOperators;
-
-template <typename T>
-struct ActorPrecApplyer {
-  int offset;
-  int size;
-  std::reference_wrapper<ActorPreconditioner<T>> prec;
-
-  void operator()(ColumnVectorView<T const> x, ColumnVectorView<T> y) const {
-    prec.get().Solve(x.MiddleRows(offset, size), y.MiddleRows(offset, size));
-  }
-
-  void ConcurrentSolve(
-      ColumnVectorView<T const> x,
-      ColumnVectorView<T> Px,
-      ParallelWorkerInfo const& data) const {
-    MOCHI_ASSERT_VERBOSE(data.rBegin >= 0 && data.rBegin <= data.rEnd, "Invalid row range.");
-    if ((offset < data.rEnd) && (data.rBegin < offset + size)) {
-      prec.get().ConcurrentSolve(
-          x.MiddleRows(offset, size),
-          Px.MiddleRows(offset, size),
-          ParallelWorkerInfo{
-              .workerId = data.workerId,
-              .numWorkers = data.numWorkers,
-              .rBegin = Max(data.rBegin - offset, 0),
-              .rEnd = Min(data.rEnd - offset, size),
-              .barrier = data.barrier});
-    }
-  }
-};
-
-template <typename T>
-struct PerActorPrec final : Preconditioner<T> {
-  static constexpr auto kType = PreconditionerType::PerActor;
-
-  std::vector<ActorPrecApplyer<T>> actorPrecs;
-
-  explicit PerActorPrec(std::vector<ActorPrecApplyer<T>>&& actorPrecs)
-      : actorPrecs(std::move(actorPrecs)) {}
-
-  void Solve(ColumnVectorView<T const> x, ColumnVectorView<T> y) const override {
-    // TODO[T175051452]: Introduce efficient parallelization.
-    for (auto const& prec : actorPrecs) {
-      prec(x, y);
-    }
-  }
-
-  void ConcurrentSolve(
-      ColumnVectorView<T const> x,
-      ColumnVectorView<T> Px,
-      ParallelWorkerInfo const& data) const override {
-    MOCHI_ASSERT_VERBOSE(data.rBegin >= 0 && data.rBegin <= data.rEnd, "Invalid row range.");
-    for (auto const& prec : actorPrecs) {
-      if ((prec.offset < data.rEnd) && (data.rBegin < prec.offset + prec.size)) {
-        prec.ConcurrentSolve(x, Px, data);
-      }
-    }
-  }
-
-  void Update(IslandOperators<T> const& A) {
-    // Note that MakePerActorPrec updates the actor preconditioners if they already exist.
-    *this = std::move(A.MakePerActorPrec());
-  }
-
-  constexpr PreconditionerType GetType() const override {
-    return kType;
-  }
-};
 
 /*******************************************************************
   IslandOperators
@@ -195,8 +126,9 @@ struct IslandOperators {
 #endif // MOCHI_ASSERT_VERBOSE_ENABLED
   }
 
-  // Construct or update the per-actor preconditioner.
-  auto MakePerActorPrec() const {
+  // Construct missing actor preconditioners, update existing ones, and return each
+  // preconditioner with its island-wide row offset and row count.
+  auto MakePerActorPreconditionerEntries() const {
     auto const numActors = isize(_actorMatrices);
     MOCHI_ASSERT(
         _actorPreconditioners.size() == numActors,
@@ -245,15 +177,15 @@ struct IslandOperators {
       }
     });
 
-    // Construct the per-actor preconditioner.
-    std::vector<ActorPrecApplyer<T>> actorPrecApplyiers;
-    actorPrecApplyiers.reserve(numActors);
+    std::vector<ActorPreconditionerEntry<T>> actorPreconditionerEntries;
+    actorPreconditionerEntries.reserve(numActors);
     for (int aIndex = 0; aIndex < numActors; ++aIndex) {
       auto const& [offset, A] = _actorMatrices[aIndex];
-      actorPrecApplyiers.push_back({offset, GetNumRows(A), *_actorPreconditioners[aIndex].get()});
+      actorPreconditionerEntries.push_back(
+          {offset, GetNumRows(A), *_actorPreconditioners[aIndex].get()});
     }
 
-    return PerActorPrec<T>{std::move(actorPrecApplyiers)};
+    return actorPreconditionerEntries;
   }
 
   // Return the number of rows of the global system.
@@ -300,6 +232,12 @@ struct IslandOperators {
   template <typename InVector, typename OutVector, typename Idx>
   void ApplyToRange(InVector const& x, OutVector&& Ax, Idx rowBegin, Idx rowEnd) const;
 };
+
+template <typename T>
+void PerActorPrec<T>::Update(IslandOperators<T> const& A) {
+  _actorPrecs = A.MakePerActorPreconditionerEntries();
+  _concurrentSolvePlan.reset();
+}
 
 template <typename T>
 int IslandOperators<T>::Rows() const {

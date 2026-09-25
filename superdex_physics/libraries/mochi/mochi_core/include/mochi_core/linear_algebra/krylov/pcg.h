@@ -40,19 +40,20 @@ namespace mochi::krylov {
  * @param[in] b The right-hand side vector of \f$ A x = b\f$.
  * @param[in,out] x Vector containing the initial guess at input and the solution at output.
  * @param[in] prec The preconditioner application functor.
- * @param[in] maxIter Maximum number of iterations.
+ * @param[in] maxIter Maximum number of iterations. Must be positive.
  * @param[in,out] statusCheck A functor called at each iteration to check the stop criteria.
  * @param[in] abortIfNotSpd Boolean to abort the solve if the matrix is detected not to be symmetric
  * positive definite. Default is false.
  * @param[in] verbosity Verbosity level for logging output.
  * @param[in] usePolakRibiere Boolean for using the Polak-Ribiere definition of beta
  * as opposed to the Fletcher-Reeves formula (default = true)
+ * @param[in] initialGuessHint Indicates whether @p x is known to be zero. The zero hint skips the
+ * initial matrix-vector product and requires @p x to be exactly zero.
  * @param[in] dot The dot operator. Must also handle a matrix-vector operation.
  * @param[in] vectorFactory Factory to create vectors of a given type.
  *
- * @return Linear solver status. Contains the number of iterations and the achieved absolute and
- * relative residuals. "maxIter+1" is used to indicate that the maximum number of iterations was
- * reached without convergence.
+ * @return Linear solver status. Contains the convergence status, number of iterations, and achieved
+ * absolute and relative residuals.
  *
  * @note It uses left preconditioning.
  * @note The norm used in the stop criteria is specified by the object 'statusCheck'.
@@ -76,6 +77,7 @@ LinearSolverStatus PCG(
     bool abortIfNotSpd = false,
     VerbosityLevel verbosity = VerbosityLevel::Warning,
     bool usePolakRibiere = true,
+    InitialGuessHint initialGuessHint = InitialGuessHint::Unknown,
     Dot dot = {},
     VectorFactory vectorFactory = {}) {
   auto r = vectorFactory.GetCopy(b);
@@ -93,18 +95,29 @@ LinearSolverStatus PCG(
   constexpr bool kNeedPrecResidual =
       std::is_same_v<StopCriterion, StatusPreconditionedResidualL2<Dot, Scalar>> ||
       std::is_same_v<StopCriterion, StatusResidualPreconditionerInduced<Dot, Scalar>>;
-  constexpr bool kCheckStatusComputesRTz =
+  // The criterion owns a separate Dot. Reusing its rTz is safe only when both instances produce
+  // identical results. UsualDot guarantees this.
+  constexpr bool kCanReuseCriterionRTz = std::is_same_v<Dot, UsualDot> &&
       std::is_same_v<StopCriterion, StatusResidualPreconditionerInduced<Dot, Scalar>>;
+  MOCHI_ASSERT_VERBOSE(maxIter > 0, "Maximum number of iterations must be positive.");
+  MOCHI_ASSERT_VERBOSE(
+      initialGuessHint != InitialGuessHint::Zero || dot(x, x) == 0,
+      "InitialGuessHint::Zero requires an exactly zero initial guess.");
 
   statusCheck.SetScaling(r, prec, z);
 
-  Apply(A, x, Ap);
-  r -= Ap;
+  if (initialGuessHint != InitialGuessHint::Zero) {
+    Apply(A, x, Ap);
+    r -= Ap;
+  }
 
   IterationStatus myStatus{};
 
   if constexpr (kNeedPrecResidual) {
-    Solve(prec, r, z); // z_0 = Prec^{-1} r_0
+    // With x_0 = 0, r_0 = b, so SetScaling() already computed z_0 = Prec^{-1} r_0.
+    if (initialGuessHint != InitialGuessHint::Zero) {
+      Solve(prec, r, z); // z_0 = Prec^{-1} r_0
+    }
     //--- p and Ap will not be stored when iter = 0
     myStatus = statusCheck.CheckStatus(0, r, z, p, Ap);
   } else {
@@ -121,12 +134,13 @@ LinearSolverStatus PCG(
         .numIterDone = 0,
         .residualNorm = static_cast<double>(statusCheck.GetLatestResidualNorm()),
         .relativeResidualNorm = static_cast<double>(statusCheck.GetLatestRelativeResidualNorm()),
-        .converged = IsConverged(myStatus)};
+        .convergence = IsConverged(myStatus) ? LinearSolverConvergenceStatus::Converged
+                                             : LinearSolverConvergenceStatus::Diverged};
   }
 
   p = z;
   Scalar rTz_current{}; // r_0^T z_0
-  if constexpr (kCheckStatusComputesRTz) {
+  if constexpr (kCanReuseCriterionRTz) {
     rTz_current = statusCheck.GetLatestResidualNormSqr();
   } else {
     rTz_current = dot(r, z);
@@ -150,7 +164,7 @@ LinearSolverStatus PCG(
               .residualNorm = static_cast<double>(statusCheck.GetLatestResidualNorm()),
               .relativeResidualNorm =
                   static_cast<double>(statusCheck.GetLatestRelativeResidualNorm()),
-              .converged = false};
+              .convergence = LinearSolverConvergenceStatus::Diverged};
         }
       }
 
@@ -187,11 +201,12 @@ LinearSolverStatus PCG(
           .numIterDone = iter,
           .residualNorm = static_cast<double>(statusCheck.GetLatestResidualNorm()),
           .relativeResidualNorm = static_cast<double>(statusCheck.GetLatestRelativeResidualNorm()),
-          .converged = IsConverged(myStatus)};
+          .convergence = IsConverged(myStatus) ? LinearSolverConvergenceStatus::Converged
+                                               : LinearSolverConvergenceStatus::Diverged};
     }
 
     auto const rTz_old = rTz_current;
-    if constexpr (kCheckStatusComputesRTz) {
+    if constexpr (kCanReuseCriterionRTz) {
       rTz_current = statusCheck.GetLatestResidualNormSqr();
     } else {
       rTz_current = dot(r, z);
@@ -208,7 +223,7 @@ LinearSolverStatus PCG(
             .residualNorm = static_cast<double>(statusCheck.GetLatestResidualNorm()),
             .relativeResidualNorm =
                 static_cast<double>(statusCheck.GetLatestRelativeResidualNorm()),
-            .converged = false};
+            .convergence = LinearSolverConvergenceStatus::Diverged};
       }
 
     beta = (rTz_current - beta) / rTz_old;
@@ -216,10 +231,10 @@ LinearSolverStatus PCG(
   } // for (int iter = 1; iter <= maxIter; ++iter)
 
   return LinearSolverStatus{
-      .numIterDone = maxIter + 1,
+      .numIterDone = maxIter,
       .residualNorm = statusCheck.GetLatestResidualNorm(),
       .relativeResidualNorm = statusCheck.GetLatestRelativeResidualNorm(),
-      .converged = false};
+      .convergence = LinearSolverConvergenceStatus::Stopped};
 }
 
 } // namespace mochi::krylov

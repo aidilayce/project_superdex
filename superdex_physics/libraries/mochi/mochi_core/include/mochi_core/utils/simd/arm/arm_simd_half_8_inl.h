@@ -113,8 +113,7 @@ class Simd<Half, 8> {
 
   // IEEE 754 float equality: +0 == -0, NaN != NaN (matches Simd<float> behavior)
   [[nodiscard]] MOCHI_FORCE_INLINE bool operator==(Simd rhs) const {
-    uint16x8_t cmp = vceqq_f16(raw, rhs.raw);
-    return vminvq_u16(cmp) == 0xFFFF;
+    return AllTrue<kSize>(Equal(*this, rhs));
   }
 
   [[nodiscard]] MOCHI_FORCE_INLINE bool operator!=(Simd rhs) const {
@@ -122,7 +121,17 @@ class Simd<Half, 8> {
   }
 
   [[nodiscard]] static MOCHI_FORCE_INLINE Simd Equal(Simd a, Simd b) {
+#if MOCHI_ARCH_ARM_NEON_FP16_ARITHMETIC
     return vreinterpretq_f16_u16(vceqq_f16(a.raw, b.raw));
+#else
+    // Baseline ARMv8-A lacks FP16 vector comparison. Widen exactly to FP32, then narrow
+    // the comparison masks back to the same 16-bit lane representation as vceqq_f16.
+    uint16x4_t const low =
+        vmovn_u32(vceqq_f32(vcvt_f32_f16(vget_low_f16(a.raw)), vcvt_f32_f16(vget_low_f16(b.raw))));
+    uint16x4_t const high = vmovn_u32(
+        vceqq_f32(vcvt_f32_f16(vget_high_f16(a.raw)), vcvt_f32_f16(vget_high_f16(b.raw))));
+    return vreinterpretq_f16_u16(vcombine_u16(low, high));
+#endif
   }
 
   [[nodiscard]] static MOCHI_FORCE_INLINE Simd NotEqual(Simd a, Simd b) {
@@ -165,17 +174,17 @@ class Simd<Half, 8> {
         static_cast<uint16_t>(vgetq_lane_u16(vreinterpretq_u16_f16(v.raw), i)));
   }
 
-  [[nodiscard]] static MOCHI_FORCE_INLINE Scalar Get(Simd v, int i) {
+  [[nodiscard]] MOCHI_FORCE_INLINE Scalar operator[](int i) const {
     MOCHI_ASSERT_VERBOSE(i >= 0 && i < kSize, "Index out of range.");
     switch (i) { // clang-format off
-      case 0: return Get<0>(v);
-      case 1: return Get<1>(v);
-      case 2: return Get<2>(v);
-      case 3: return Get<3>(v);
-      case 4: return Get<4>(v);
-      case 5: return Get<5>(v);
-      case 6: return Get<6>(v);
-      case 7: return Get<7>(v);
+      case 0: return Get<0>(*this);
+      case 1: return Get<1>(*this);
+      case 2: return Get<2>(*this);
+      case 3: return Get<3>(*this);
+      case 4: return Get<4>(*this);
+      case 5: return Get<5>(*this);
+      case 6: return Get<6>(*this);
+      case 7: return Get<7>(*this);
       MOCHI_UNLIKELY default: return Scalar{};
     } // clang-format on
   }

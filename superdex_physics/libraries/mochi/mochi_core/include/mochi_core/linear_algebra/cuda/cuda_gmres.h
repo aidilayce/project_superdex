@@ -67,16 +67,15 @@ std::tuple<int, double, double, IterationStatus> CudaGMRes_impl(
  * @param[in] b The right-hand side vector b of \f$ A x = b\f$.
  * @param[in,out] x Vector containing the initial guess at input and the solution at output.
  * @param[in] P The preconditioner application functor.
- * @param[in] iterMax Maximum number of iterations.
+ * @param[in] iterMax Maximum number of iterations. Must be positive.
  * @param[in] aTol Absolute tolerance
  * @param[in] rTol Relative tolerance
  * @param[in] dTol Divergence tolerance
  * @param[in] restartSize Size of Krylov space triggering a restart (default = 0 = no restart)
  * @param[in] verbosity Verbosity level for logging output.
  *
- * @return Linear solver status. Contains the number of iterations and the achieved absolute and
- * relative residuals. "iterMax+1" is used to indicate that the maximum number of iterations was
- * reached without convergence.
+ * @return Linear solver status. Contains the convergence status, number of iterations, and achieved
+ * absolute and relative residuals.
  *
  * @note
  * It uses right preconditioning.
@@ -104,6 +103,9 @@ LinearSolverStatus CudaGMRes(
     [[maybe_unused]] VerbosityLevel verbosity = VerbosityLevel::Warning) {
   using Scalar = std::remove_pointer_t<decltype(b.Data())>;
   using NonConstScalar = std::remove_const_t<Scalar>;
+  MOCHI_ASSERT_VERBOSE(iterMax > 0, "Maximum number of iterations must be positive.");
+  MOCHI_ASSERT(((b.Cols() == x.Cols()) && (x.Cols() == 1)), "Incompatible number of columns");
+
   //--- Represent the operator A with a function to "hide the type" of A.
   auto Afunc = [&](mochi::CudaVectorView<NonConstScalar> const& v,
                    mochi::CudaVectorView<NonConstScalar>& Av) { Apply(A, v, Av); };
@@ -113,7 +115,6 @@ LinearSolverStatus CudaGMRes(
   restartSize = mochi::Min<int>(b.Rows(), (restartSize <= 0) ? iterMax : restartSize, iterMax);
 
   //--- Convert to CudaVectorView
-  MOCHI_ASSERT(((b.Cols() == x.Cols()) && (x.Cols() == 1)), "Incompatible number of columns");
   mochi::CudaVectorView<Scalar> bv(b.Data(), b.Rows());
   mochi::CudaVectorView<NonConstScalar> xv(x.Data(), x.Rows());
   //--- Check whether the right hand side is the zero vector.
@@ -121,17 +122,24 @@ LinearSolverStatus CudaGMRes(
   if (bNorm == 0) {
     SetZero(x);
     return LinearSolverStatus{
-        .numIterDone = 0, .residualNorm = 0.0, .relativeResidualNorm = 0.0, .converged = true};
+        .numIterDone = 0,
+        .residualNorm = 0.0,
+        .relativeResidualNorm = 0.0,
+        .convergence = LinearSolverConvergenceStatus::Converged};
   }
   //--- Run the GMRes algorithm
   auto info = CudaGMRes_impl<NonConstScalar>(
       Afunc, bv, bNorm, xv, prec, iterMax, aTol, rTol, dTol, restartSize);
+  auto const iterationStatus = std::get<3>(info);
   //
   return LinearSolverStatus{
       .numIterDone = std::get<0>(info),
       .residualNorm = std::get<1>(info),
       .relativeResidualNorm = std::get<2>(info),
-      .converged = IsConverged(std::get<3>(info)),
+      .convergence = iterationStatus == IterationStatus::Active
+          ? LinearSolverConvergenceStatus::Stopped
+          : (IsConverged(iterationStatus) ? LinearSolverConvergenceStatus::Converged
+                                          : LinearSolverConvergenceStatus::Diverged),
   };
 }
 

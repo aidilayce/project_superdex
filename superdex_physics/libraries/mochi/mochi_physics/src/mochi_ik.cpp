@@ -16,6 +16,7 @@
 
 #include "mochi_ik.h"
 #include "mochi_articulated_body.h"
+#include "mochi_contact_pair_params.h"
 #include "mochi_context.h"
 #include "mochi_scene.h"
 
@@ -24,25 +25,26 @@
 
 using namespace mochi;
 
-namespace {
-struct IKSolverHandle {
-  IKSolverImpl* handle = nullptr;
-};
-} // namespace
-
 IKSolverImpl::IKSolverImpl(Scene* scene, Error& error) {
   MOCHI_ERROR_IF(scene == nullptr, error, "Cannot create an IKSolver without a Scene");
   MOCHI_ERROR_RETURN(error);
-  _scene = assert_cast<SceneImpl*>(scene);
+  auto* const sceneImpl = assert_cast<SceneImpl*>(scene);
 
   // Check to ensure that we only have articulated or rigid actors
-  _scene->ForEachActor([&](Actor* actor) {
+  sceneImpl->ForEachActor([&](Actor* actor) {
     MOCHI_ERROR_IF(
         actor->GetType() != ActorType::Articulated && actor->GetType() != ActorType::Rigid,
         error,
         "Cannot create an IKSolver with non-articulated or non-rigid actors");
   });
   MOCHI_ERROR_RETURN(error);
+
+  // AsyncScene and IKSolver both destroy their owned Scene, so ownership must be exclusive.
+  MOCHI_ERROR_IF_NOT(sceneImpl->TryClaimOwnership(), error, "Scene is already owned.");
+  MOCHI_ERROR_RETURN(error);
+
+  // Assign _scene only after error checks. ~IKSolverImpl destroys it.
+  _scene = sceneImpl;
 
   // Use default solver params
   SetSolverParams(experimental::IKSolverParams{});
@@ -53,15 +55,14 @@ IKSolverImpl::IKSolverImpl(Scene* scene, Error& error) {
   // Force use single island, so that collisions in another island will not be missed.
   _scene->SetForceSingleIsland(true);
 
-  // Let the scene know that there is an IKSolver attached to it.
+  // Disable contact dissipation on all actors
   auto& reg = _scene->GetRegistry();
-  reg.set<IKSolverHandle>(this);
-
-  // Disable friction on all actors
   reg.view<ContactParams>().each([](ContactParams& params) {
     params.coulombFrictionCoefficient = 0_r;
     params.viscousFrictionCoefficient = 0_r;
+    params.normalViscousDampingCoefficient = 0_r;
   });
+  reg.ctx<CContactPairParamsOverrideTable>().DisableDissipation();
 
   // Disable joint friction and inertia by zeroing them via the setters. The components are
   // always present on articulated actors, so zeroing (rather than removing them) keeps that
@@ -148,10 +149,6 @@ Constraint* IKSolverImpl::CreatePositionTarget(
   MOCHI_ERROR_IF(weight < 0_r, error, "Weight must not be negative");
   MOCHI_ERROR_RETURN(error, {});
 
-  ClearPositionTarget(actor, error);
-  MOCHI_ERROR_RETURN(error, {});
-
-  // Recreate
   RigidPivotPositionConstraintParams conParams;
   conParams.localPosition = localPosition;
   conParams.targetPosition = targetPosition;
@@ -160,6 +157,7 @@ Constraint* IKSolverImpl::CreatePositionTarget(
   auto* con = _scene->CreateRigidPivotPositionConstraint(conParams, error);
   MOCHI_ERROR_RETURN(error, {});
 
+  ClearPositionTarget(actor, ErrorAssert{});
   _positionTargets[actor] = con;
   return con;
 }
@@ -185,10 +183,6 @@ Constraint* IKSolverImpl::CreateRotationTarget(
   MOCHI_ERROR_IF(weight < 0_r, error, "Weight must not be negative");
   MOCHI_ERROR_RETURN(error, {});
 
-  ClearRotationTarget(actor, error);
-  MOCHI_ERROR_RETURN(error, {});
-
-  // Recreate
   RigidPivotRotationConstraintParams conParams;
   conParams.localRotation = localRotation;
   conParams.targetRotation = targetRotation;
@@ -197,6 +191,7 @@ Constraint* IKSolverImpl::CreateRotationTarget(
   auto* con = _scene->CreateRigidPivotRotationConstraint(conParams, error);
   MOCHI_ERROR_RETURN(error, {});
 
+  ClearRotationTarget(actor, ErrorAssert{});
   _rotationTargets[actor] = con;
   return con;
 }

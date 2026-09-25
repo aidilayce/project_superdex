@@ -44,29 +44,25 @@ struct BlendingDataSourceMesh {
    Data structure for mesh blending stored from the point-of-view of the target mesh.
 */
 struct BlendingDataTargetMesh {
-  // For every node of the target mesh, two node indices in the source meshes. If a weight is zero,
-  // the corresponding index is irrelevant.
+  // Source node index for every target node. The index is irrelevant when its weight is zero.
   DynamicArray<int> indices;
-  // For every node of the target mesh, the weights of the two source nodes.
+  // Nested-soft weight for every target node.
   DynamicArray<real> weights;
 
-  // This function extracts the blending data for one of the source meshes. It requires as input the
-  // number of nodes in the source mesh.
-  template <int sourceId>
+  // Converts target-oriented blending data to source-oriented data.
   BlendingDataSourceMesh GetSourceBlendingData(int sourceNodes) const {
-    static_assert(sourceId >= 0 && sourceId <= 1);
     DynamicArray<int> outNodesSource;
     outNodesSource.reserve(sourceNodes);
     DynamicArray<real> outWeights(sourceNodes, 0_r);
     DynamicArray<int> outMappingSourceToTarget(sourceNodes, -1);
-    DynamicArray<int> outMappingTargetToSource(indices.size() / 2, -1);
-    for (int i = sourceId; i < indices.size(); i += 2) {
+    DynamicArray<int> outMappingTargetToSource(indices.size(), -1);
+    for (int i = 0; i < isize(indices); ++i) {
       if (weights[i] > 0_r) {
         MOCHI_ASSERT(indices[i] >= 0 && indices[i] < sourceNodes, "Wrong node index");
         outNodesSource.emplace_back(indices[i]);
         outWeights[indices[i]] = weights[i];
-        outMappingSourceToTarget[indices[i]] = i / 2;
-        outMappingTargetToSource[i / 2] = indices[i];
+        outMappingSourceToTarget[indices[i]] = i;
+        outMappingTargetToSource[i] = indices[i];
       }
     }
     return {

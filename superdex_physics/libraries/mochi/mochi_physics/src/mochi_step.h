@@ -27,6 +27,10 @@ namespace mochi {
   ECS Simulation Step
 */
 
+// Recompute the maximum world-space geometry speed for every dynamic geometry owner. Current rigid
+// velocities must have clean vsym; PreStepEcs prepares it before calling this function.
+void UpdateMaxGeometrySpeeds(entt::registry& reg);
+
 /**
  * @brief Runs the scene-wide pre-step pipeline to prepare all scene entities for the next
  * simulation step.
@@ -37,10 +41,10 @@ namespace mochi {
  *
  * @see CSceneTime
  */
-MOCHI_API void PreStepEcs(entt::registry& reg);
+void PreStepEcs(entt::registry& reg);
 
-MOCHI_API void StepEcs(entt::registry& reg);
-MOCHI_API void PostStepEcs(entt::registry& reg);
+void StepEcs(entt::registry& reg);
+void PostStepEcs(entt::registry& reg);
 
 void PreStepIslandAsync(entt::registry& reg, CIslandDescendants const& descendants);
 

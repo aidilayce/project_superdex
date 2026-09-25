@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include <mochi_core/ai/compute_type.h>
 #include <mochi_core/geometry/base_map.h>
 #include <mochi_core/utils/dynamic_array.h>
 #include <mochi_core/utils/error.h>
@@ -66,12 +65,6 @@ gradient computation produces a vector of size gradSize = sizeof(Dref_i/Ddef) + 
 */
 class DeepFlow {
  public:
-  // Size of expected largest query, to preallocate GPU memory and avoid memory leaks
-  static constexpr int kMochiDemoPrealloc =
-      100000; // Mochi Demo on an RTX 3080 seems to accept 200,000
-  static constexpr int kMochiSamplesPrealloc =
-      400000; // Mochi Samples on an RTX 3080 accepts 400,000
-
   DeepFlow(int numDofs_, real scale_, Real3 shift_, bool computeGradient_)
       : numDofs(numDofs_),
         objFromLocalScale(scale_),
@@ -137,7 +130,6 @@ class DeepFlowMap : public BaseMap {
  public:
   std::shared_ptr<DeepFlow> flow = nullptr;
 
-#if MOCHI_USE_TORCH
   DeepFlowMap(std::shared_ptr<DeepFlow> flowIn, real scale)
       : flow(flowIn), _scale(scale), _deformationDescriptor(flow->numDofs) {
     _numDoFs = flow->numDofs;
@@ -152,13 +144,13 @@ class DeepFlowMap : public BaseMap {
       DynamicArray<VMatrix3x3r>* outMapJac,
       DynamicArray<ColliderJacDofs>* outDofsJac) const override;
 
-  void UpdateMap(Span<real const> positions) override;
+  void UpdateMap(Span<real const> dofs) override;
 
  private:
   void TransformResult(
       Span<real const> result,
       DynamicArray<Real3>& outPoints,
-      DynamicArray<VMatrix3x3r>* outDRefDDefT,
+      DynamicArray<VMatrix3x3r>* outMapJac,
       DynamicArray<ColliderJacDofs>* outDofsJac) const;
 
   // The scale of the object from its default reference frame to the world. This is used for scaling
@@ -167,7 +159,6 @@ class DeepFlowMap : public BaseMap {
 
   // Deformation
   DynamicArray<real> _deformationDescriptor;
-#endif // MOCHI_USE_TORCH
 };
 
 // Create a DeepFlowMap given the DeepFlow implementation.
@@ -179,27 +170,26 @@ class DeepFlowMap : public BaseMap {
 std::unique_ptr<DeepFlowMap>
 CreateDeepFlowMap(std::shared_ptr<DeepFlow> flow, real scaleDofs, Error& error);
 
-// Load a DeepFlow from a pytorch module file. Requires MOCHI_USE_TORCH==1.
-// TODO: Points sampled outside the training sphere may produce incorrect results.
-//
-// Arguments:
-//    torchFilePath: Path to a pytorch (.pt) file containing the learned network
-//    scale: Scale (from local to object frame) due to normalization of the flow's training data.
-//    shift: Shift (from local to object frame) due to recentering of the flow's training data.
-//    numDofs: Size of the deformation descriptor or zero if not deformable
-//    computeType: Compute type for deep flow evaluation, e.g. MochiCpu, TorchCpu, TorchGpu.
-//    computeGradient: Only false for performance measurements
-//    preallocMemSize: Memory preallocation to avoid runtime LibTorch memory leak. Only used if
-//    computeType is TorchGpu. Some possible values are DeepFlow::kMochiDemoPrealloc and
-//    DeepFlow::kMochiSamplesPrealloc.
-//
+/**
+ * @brief Loads a @ref DeepFlow from a Mochi HDF5 model file.
+ *
+ * @param[in] h5FilePath Path to the HDF5 file containing the learned network.
+ * @param[in] scale Scale from the network's local frame to the object's frame.
+ * @param[in] shift Shift from the network's local frame to the object's frame.
+ * @param[in] numDofs Size of the deformation descriptor, or zero if not deformable.
+ * @param[out] error Error status. Check Error::IsOK() for success.
+ * @param[in] computeGradient Whether to compute output gradients.
+ * @return The loaded deep flow, or null on failure.
+ *
+ * @warning Requires `MOCHI_USE_HDF5=1`.
+ *
+ * @todo Points sampled outside the training sphere may produce incorrect results.
+ */
 std::shared_ptr<DeepFlow> LoadDeepFlow(
-    char const* torchFilePath,
+    char const* h5FilePath,
     real scale,
     Real3 shift,
     int numDofs,
-    NeuralComputeType computeType,
-    int preallocMemSize,
     Error& error,
     bool computeGradient = true);
 

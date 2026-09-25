@@ -19,6 +19,7 @@
 #include <superdex_robotics/utils/file_utils.h>
 
 #include <mochi_core/utils/json_utils.h>
+#include <mochi_physics/utils/mochi_model_utils.h>
 
 using namespace mochi;
 using namespace superdex::robotics;
@@ -125,6 +126,11 @@ ShapeHandle FileBotLoader::LoadShape(
     Error& error) const {
   MOCHI_ERROR_RETURN(error, {});
   return context->LoadShapeFromFile(path, bakeScale, bakeTransform, error);
+}
+
+ModelData IBotLoader::LoadModelData(std::string_view path, Error& error) const {
+  MOCHI_ERROR_RETURN(error, {});
+  return mochi::model_utils::LoadFromFile(path, error);
 }
 
 BotPrefab superdex::robotics::LoadBotPrefab(

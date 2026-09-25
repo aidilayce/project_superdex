@@ -18,6 +18,7 @@
 
 #include <mochi_core/linear_algebra/krylov_interop.h>
 #include <mochi_core/linear_algebra/ldlt.h>
+#include <mochi_core/utils/defer.h>
 #include <mochi_core/utils/string_utils.h>
 #include <mochi_physics/mochi_physics.h>
 #include <mochi_physics/mochi_physics_experimental.h>
@@ -55,7 +56,11 @@ class NewtonEulerTest : public test::MochiSceneTestBase {
   }
 
  protected:
-  static Actor* CreateFr3Actor(Context* mochiContext, Scene* scene) {
+  static Actor* CreateFr3Actor(
+      Context* mochiContext,
+      Scene* scene,
+      ColliderType colliderType = ColliderType::None,
+      bool collapseLinks = false) {
     // Load the prefab
     auto const prefabPath = test::GetAssetPath("franka_arm/fr3/fr3.mochi_prefab");
     auto const assetsDir = test::GetAssetPath("");
@@ -67,10 +72,23 @@ class NewtonEulerTest : public test::MochiSceneTestBase {
     actorPrefab.joints[0].type = ArticulatedJointType::Hard;
 
     for (auto& link : actorPrefab.links) {
-      link.colliderType = ColliderType::None;
+      link.colliderType = colliderType;
       link.layer = "Object";
-      link.density = 1000_r;
       link.boundaryElementType = ActorBoundaryElementType::P1Q6;
+      if (collapseLinks) {
+        link.parentJointFromLink = {};
+        link.density.reset();
+        link.mass = 1_r;
+        link.centerOfMass = Real3{};
+        link.momentOfInertia = Real6{1_r, 0_r, 0_r, 1_r, 0_r, 1_r};
+      } else {
+        link.density = 1000_r;
+      }
+    }
+    if (collapseLinks) {
+      for (auto& joint : actorPrefab.joints) {
+        joint.parentLinkFromJoint = {};
+      }
     }
 
     // Remove pose-tracking controllers. NewtonEulerTerms uses prefab export/import to clone the
@@ -85,8 +103,6 @@ class NewtonEulerTest : public test::MochiSceneTestBase {
     auto actors = result.Filter(ActorType::Articulated);
     MOCHI_ASSERT(actors.size() == 1, "Expected one articulated actor");
     auto* actor = actors[0];
-
-    scene->EnableLayerContactSymmetric("Object", "Object", false, test::ExpectOK{});
 
     EnableNewtonEulerInertia(actor, true, test::ExpectOK{});
     return actor;
@@ -149,6 +165,8 @@ class NewtonEulerTest : public test::MochiSceneTestBase {
   NewtonEulerTerms* _newtonEuler = nullptr;
 };
 
+} // namespace
+
 // Verify that stepping with NewtonEulerTerms + LDLT matches Mochi's built-in implicit integrator.
 TEST_IF_F(MOCHI_HDF5_AND_DOUBLE_AND_NOT_DEBUG, NewtonEulerTest, CompareWithMochiStep) {
   auto* robot = CreateFr3Actor(_mochiContext, _scene);
@@ -197,4 +215,52 @@ TEST_IF_F(MOCHI_HDF5_AND_DOUBLE_AND_NOT_DEBUG, NewtonEulerTest, CompareWithMochi
     EXPECT_NEAR_TOL(result1.dq.Norm() / result2.dq.Norm(), 0_r, 1e-2_r);
   }
 }
-} // namespace
+
+TEST_IF_F(MOCHI_USE_HDF5, NewtonEulerTest, ComputeIgnoresContact) {
+  auto* referenceRobot = CreateFr3Actor(_mochiContext, _scene, ColliderType::None, true);
+  auto* referenceTerms =
+      experimental::CreateNewtonEulerTerms(referenceRobot, _mochiContext, test::ExpectOK{});
+  MOCHI_DEFER(
+      experimental::DestroyNewtonEulerTerms(referenceTerms, _mochiContext, test::ExpectOK{}));
+
+  auto* colliderRobot = CreateFr3Actor(_mochiContext, _scene, ColliderType::Box, true);
+  auto* colliderTerms =
+      experimental::CreateNewtonEulerTerms(colliderRobot, _mochiContext, test::ExpectOK{});
+  MOCHI_DEFER(
+      experimental::DestroyNewtonEulerTerms(colliderTerms, _mochiContext, test::ExpectOK{}));
+
+  auto const referenceLinks = referenceRobot->GetNestedLinkActors(test::ExpectOK{});
+
+  int const numDofs = referenceRobot->GetNumDofs();
+  int const numLinks = isize(referenceLinks);
+  ColumnVector<real> q(numDofs);
+  ColumnVector<real> dq(numDofs);
+  referenceRobot->GetArticulatedPose(q, test::ExpectOK{});
+  for (int i = 0; i < numDofs; ++i) {
+    dq[i] = .01_r * static_cast<real>(i + 1);
+  }
+
+  struct Terms {
+    Matrix<real> M;
+    ColumnVector<real> C;
+    ColumnVector<real> J;
+    ColumnVector<real> JtF;
+  };
+  auto compute = [&](NewtonEulerTerms* terms) {
+    Terms result{
+        Matrix<real>(numDofs, numDofs),
+        ColumnVector<real>(numDofs),
+        ColumnVector<real>(numLinks * numDofs * RigidSize::kDAll),
+        ColumnVector<real>(numDofs)};
+    terms->Compute(1_r / 200_r, q, dq, result.M, result.C, result.J, result.JtF, test::ExpectOK{});
+    return result;
+  };
+
+  auto const reference = compute(referenceTerms);
+  auto const collider = compute(colliderTerms);
+  EXPECT_GT(reference.M.Norm(), 0_r);
+  EXPECT_TRUE(test::NearEqualMatrices(reference.M, collider.M));
+  EXPECT_TRUE(test::NearEqualMatrices(reference.C, collider.C));
+  EXPECT_TRUE(test::NearEqualMatrices(reference.J, collider.J));
+  EXPECT_TRUE(test::NearEqualMatrices(reference.JtF, collider.JtF));
+}

@@ -95,8 +95,42 @@ void mochi::UpdateQueryNodePositions(
   // Compute reference positions + displacements.
   ArrayAdd(MakeSpan(outQuery.nodePositions), referencePositions, displacements);
 }
+void mochi::UpdateLinearEmbeddedNodePositionsFromDisplacements(
+    LinearMeshEmbedding const& embedding,
+    Span<Real3 const> embeddedReferencePositions,
+    Span<Real3 const> displacements,
+    Span<int const> outputNodeIndices,
+    Span<Real3> outPositions) {
+  MOCHI_PROFILE_SCOPE();
+
+  int const weightsPerNode = static_cast<int>(embedding.GetNumSkinningWeightsPerEntry());
+  Span<int const> const indices = embedding.GetIndices();
+  Span<real const> const weights = embedding.GetWeights();
+  int const numEmbeddedNodes = isize(indices) / weightsPerNode;
+  int const numOutputNodes =
+      outputNodeIndices.empty() ? numEmbeddedNodes : isize(outputNodeIndices);
+  MOCHI_ASSERT_VERBOSE(isize(outPositions) == numOutputNodes);
+  MOCHI_ASSERT_VERBOSE(isize(embeddedReferencePositions) == numEmbeddedNodes);
+
+  int constexpr kMinPerTask = 128;
+  ParallelForN(
+      "UpdateLinearEmbeddedNodePositions", numOutputNodes, kMinPerTask, [&](int outputNode) {
+        int const embeddedNode =
+            outputNodeIndices.empty() ? outputNode : outputNodeIndices[outputNode];
+        MOCHI_ASSERT_VERBOSE(embeddedNode >= 0 && embeddedNode < numEmbeddedNodes);
+        Real3 position = embeddedReferencePositions[embeddedNode];
+        for (int influence = 0; influence < weightsPerNode; ++influence) {
+          int const embeddingIndex = embeddedNode * weightsPerNode + influence;
+          int const sourceNode = indices[embeddingIndex];
+          MOCHI_ASSERT_VERBOSE(sourceNode >= 0 && sourceNode < isize(displacements));
+          position += weights[embeddingIndex] * displacements[sourceNode];
+        }
+        outPositions[outputNode] = position;
+      });
+}
 
 void mochi::UpdateQuerySurfaceNodePositions(
+    ecs::Excluded<TagRodActor>,
     CSurfaceMesh const& simplicial,
     CFinalDisplacementRef<TimeStep::Current> const* currSol,
     ecs::OptionalTag<TagRigidActor> isRigid,
@@ -112,6 +146,16 @@ void mochi::UpdateQuerySurfaceNodePositions(
       Span<real const> refPositions = Flatten(simplicial.mesh->GetActiveNodeCoordinates());
       outQuery.nodePositions.assign(refPositions.begin(), refPositions.end());
     }
+  } else if (simplicial.embedding) {
+    MOCHI_ASSERT_VERBOSE(currSol != nullptr, "Embedded surface requires displacements.");
+    Span<int const> const activeNodes = mesh->GetActiveNodes();
+    outQuery.nodePositions.resize(kSpaceDim3 * activeNodes.size());
+    UpdateLinearEmbeddedNodePositionsFromDisplacements(
+        *simplicial.embedding,
+        simplicial.mesh->GetNodeCoordinates(),
+        Unflatten<Real3 const>(currSol->value.GetConstSpan()),
+        activeNodes,
+        Unflatten<Real3>(MakeSpan(outQuery.nodePositions)));
   } else {
     auto displacementsVolume = currSol->value.GetConstSpan();
 

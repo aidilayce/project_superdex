@@ -32,10 +32,8 @@
 #include <mochi_core/geometry/obb.h>
 #include <mochi_core/geometry/sphere.h>
 #include <mochi_core/materials/material_params.h>
-#include <mochi_core/solvers/nonlinear_solver_params.h>
 #include <mochi_core/utils/error.h>
 #include <mochi_core/utils/nd_array.h>
-#include <mochi_core/utils/simd.h>
 #include <mochi_core/utils/span.h>
 #include <mochi_core/utils/transform_rt.h>
 

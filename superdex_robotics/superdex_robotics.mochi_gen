@@ -197,11 +197,22 @@ struct bots::BotPrefab [no_reflection] {
   // instantiation time. Link references (mochi::ArticulatedCycleJointParams::parentLink /
   // mochi::ArticulatedCycleJointParams::childLink) are int indices into @ref links.
   DynamicArray<ArticulatedCycleJointParams> cycles;
+  // @brief Optional deformable skin skinned over the articulation's links, acting as a contact
+  // collidee. When present, produces the mochi::ArticulatedActorParams::skin at instantiation time.
+  Optional<prefab::ArticulatedSkinPrefab> skin;
   // @brief [Internal] The number of DOFs; computed at runtime by RebuildBotData; DO NOT TOUCH!
   int _numDofs [no_python] = 0;
   // @brief [Internal] Joint indices that are DOFS; computed at runtime by RebuildBotData; DO NOT
   // TOUCH!
   DynamicArray<int> _dofIndices [no_python];
+  // @brief [Internal] For a bot with a skin, the composed link name each skin bone index binds to
+  // (_skinBoneLinks[b] = link name for skin bone b). Empty means identity (bone b -> link b). Set
+  // by ApplyMod when a skin (or skinned sub-bot) is attached so the skin's baked bone indices can
+  // be remapped onto the reordered composed skeleton at instantiation time. Unlike
+  // _numDofs/_dofIndices this is NOT recomputed by RebuildBotData -- it captures composition
+  // history that cannot be reconstructed from a flattened bot, so it is serialized. Populated by
+  // ApplyMod only; DO NOT set by hand.
+  DynamicArray<String> _skinBoneLinks [no_python];
 }
 
 // @brief Load bot parameters from a .superdex_bot file using the default file-based loader.

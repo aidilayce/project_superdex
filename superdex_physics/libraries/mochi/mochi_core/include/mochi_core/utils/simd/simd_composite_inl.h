@@ -23,21 +23,45 @@
 
 namespace mochi {
 
+namespace details {
+
+template <class T, int N, int Candidate>
+[[nodiscard]] constexpr int FindCompositeFirstSize() {
+  if constexpr (Candidate <= 0) {
+    return 0;
+  } else if constexpr (Candidate >= N) {
+    return FindCompositeFirstSize<T, N, Candidate / 2>();
+  } else if constexpr (
+      !Simd<T, Candidate>::kIsComposite && Simd<T, Candidate>::kIsSupported &&
+      Simd<T, N - Candidate>::kIsSupported) {
+    return Candidate;
+  } else {
+    return FindCompositeFirstSize<T, N, Candidate / 2>();
+  }
+}
+
+template <class T, int N>
+inline constexpr int kCompositeFirstSize = FindCompositeFirstSize<T, N, kSimdDefaultSize<T>>();
+
+template <class V, size_t... Is>
+[[nodiscard]] MOCHI_ANY MOCHI_FORCE_INLINE V MakeSimdSequence(std::index_sequence<Is...>) {
+  return V{static_cast<typename V::Scalar>(Is)...};
+}
+
+} // namespace details
+
 /**
   Simd partial specialization for larger values of N.
   Supports any N as long as it can be composed of smaller supported Simd objects.
 */
 template <class T, int N>
-class Simd<
-    T,
-    N,
-    std::enable_if_t<(N > kSimdDefaultSize<T> && Simd<T>::kIsSupported), SimdConcept>> {
+class Simd<T, N, std::enable_if_t<(details::kCompositeFirstSize<T, N> > 0), SimdConcept>> {
  public:
   using Scalar = T;
 
   // Data storage is split into two parts
-  using NativeType = Simd<T, kSimdDefaultSize<T>>; // Native size
-  using First = NativeType; // First part
+  using NativeType = Simd<T, details::kCompositeFirstSize<T, N>>;
+  using First = NativeType; // Largest native size that leaves a supported remainder
   using Second = Simd<T, N - First::kSize>; // What's left
   First first;
   Second second;
@@ -48,9 +72,6 @@ class Simd<
   static constexpr bool kIsSupported = First::kIsSupported && Second::kIsSupported;
   static constexpr bool kIsComposite = true;
   static constexpr bool kIsEmulated = First::kIsEmulated || Second::kIsEmulated;
-  static_assert(
-      kSizeFirst == 2 || kSizeFirst == 4 || kSizeFirst == 8,
-      "Some functions may need to be updated to support other SIMD sizes");
   static_assert(
       !kIsSupported || (First::kIsEmulated == Second::kIsEmulated),
       "Inconsistent SIMD emulation flags");
@@ -64,15 +85,34 @@ class Simd<
   // Construct from Simd parts
   MOCHI_ANY MOCHI_FORCE_INLINE Simd(First const& p0, Second const& p1) : first(p0), second(p1) {}
 
-  // Construct from composite halves (currently just Simd<T, 8> from two Simd<T, 4> composites)
-  template <class Half, MOCHI_CONCEPT(Half::kIsComposite && (Half::kSize * 2 == kSize))>
+  // Construct from halves, independent of this type's composite tree shape.
+  template <
+      class Half,
+      MOCHI_CONCEPT(
+          (IsSimd<Half> && std::is_same_v<Scalar, typename Half::Scalar> &&
+           (Half::kSize * 2 == kSize)))>
   MOCHI_ANY MOCHI_FORCE_INLINE Simd(Half const& a, Half const& b) {
-    static_assert(std::is_same_v<Scalar, typename Half::Scalar>, "Type mismatch");
-    static_assert(kSizeFirst == 2 && Half::kSize == 4 && kSize == 8, "Unsupported size");
-    first = a.first;
-    second.first = a.second;
-    second.second.first = b.first;
-    second.second.second = b.second;
+    if constexpr (Half::kIsComposite && Second::kIsComposite) {
+      using SecondTail = typename Second::Second;
+      if constexpr (SecondTail::kIsComposite) {
+        if constexpr (
+            std::is_same_v<First, typename Half::First> &&
+            std::is_same_v<typename Second::First, typename Half::Second> &&
+            std::is_same_v<typename SecondTail::First, typename Half::First> &&
+            std::is_same_v<typename SecondTail::Second, typename Half::Second>) {
+          first = a.first;
+          second.first = a.second;
+          second.second.first = b.first;
+          second.second.second = b.second;
+          return;
+        }
+      }
+    }
+    alignas(First) Scalar values[kSize];
+    Half::Store(values, a);
+    Half::Store(values + Half::kSize, b);
+    first = First::Load(values);
+    second = Second::Load(values + kSizeFirst);
   }
 
   // Construct by broadcasting a scalar
@@ -124,7 +164,12 @@ class Simd<
   }
 
   // Construct from 8 or more scalars. Any unspecified values are zero.
-  template <typename... MoreScalars>
+  template <
+      class... MoreScalars,
+      MOCHI_CONCEPT(
+          (sizeof...(MoreScalars) + 8 <= kSize) &&
+          (kSizeFirst != 16 || sizeof...(MoreScalars) + 8 <= 16) &&
+          (std::is_convertible_v<MoreScalars, Scalar> && ...))>
   MOCHI_ANY MOCHI_FORCE_INLINE Simd(
       Scalar a,
       Scalar b,
@@ -141,7 +186,7 @@ class Simd<
     } else if constexpr (kSizeFirst == 4) {
       first = First{a, b, c, d};
       second = Second{e, f, g, h, args...};
-    } else {
+    } else if constexpr (kSizeFirst == 8) {
       first = First{a, b, c, d, e, f, g, h};
       static constexpr auto kNumArgs = sizeof...(args);
       if constexpr (kNumArgs == 0) {
@@ -151,6 +196,48 @@ class Simd<
       } else {
         second = Second{args...};
       }
+    } else if constexpr (sizeof...(args) + 8 <= kSizeFirst) {
+      first = First{a, b, c, d, e, f, g, h, args...};
+      second = {};
+    } else {
+      alignas(First) Scalar lanes[kSize] = {a, b, c, d, e, f, g, h, static_cast<Scalar>(args)...};
+      first = First::Load(lanes);
+      second = Second::Load(lanes + kSizeFirst);
+    }
+  }
+
+  // Construct from 16 or more scalars. Any unspecified values are zero.
+  template <
+      class... MoreScalars,
+      MOCHI_CONCEPT(
+          (kSizeFirst == 16) && (sizeof...(MoreScalars) + 16 <= kSize) &&
+          (std::is_convertible_v<MoreScalars, Scalar> && ...))>
+  MOCHI_ANY MOCHI_FORCE_INLINE Simd(
+      Scalar a,
+      Scalar b,
+      Scalar c,
+      Scalar d,
+      Scalar e,
+      Scalar f,
+      Scalar g,
+      Scalar h,
+      Scalar i,
+      Scalar j,
+      Scalar k,
+      Scalar l,
+      Scalar m,
+      Scalar n,
+      Scalar o,
+      Scalar p,
+      MoreScalars... args) {
+    first = First{a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p};
+    static constexpr auto kNumArgs = sizeof...(args);
+    if constexpr (kNumArgs == 0) {
+      second = Second{};
+    } else if constexpr (kNumArgs == 1) {
+      second = Second{args..., Scalar(0)};
+    } else {
+      second = Second{args...};
     }
   }
 
@@ -160,24 +247,15 @@ class Simd<
 
   template <int i>
   [[nodiscard]] static MOCHI_ANY MOCHI_FORCE_INLINE Scalar Get(Simd a) {
-    if constexpr (i < kSizeFirst) {
-      return First::template Get<i>(a.first);
-    } else {
-      return Second::template Get<i - kSizeFirst>(a.second);
-    }
-  }
-
-  [[nodiscard]] static MOCHI_ANY MOCHI_FORCE_INLINE Scalar Get(Simd a, int i) {
-    if (i < kSizeFirst) {
-      return First::Get(a.first, i);
-    } else {
-      return Second::Get(a.second, i - kSizeFirst);
-    }
+    static_assert(i >= 0 && i < kSize, "Index out of range");
+    return a[i];
   }
 
   template <int i>
   [[nodiscard]] static MOCHI_ANY MOCHI_FORCE_INLINE auto GetHalf(Simd a) {
     using Half = Simd<Scalar, N / 2>;
+    static_assert(i == 0 || i == 1, "Half index out of range");
+    static_assert(N % 2 == 0, "Vector size must be even");
     static_assert(Half::kIsSupported);
     if constexpr (kSizeFirst == kSizeSecond) {
       if constexpr (i == 0) {
@@ -186,13 +264,25 @@ class Simd<
         return a.second;
       }
     } else {
-      static_assert(
-          Half::kIsComposite && kSize == 8 && kSizeFirst == 2, "Not yet supported for other sizes");
-      if constexpr (i == 0) {
-        return Half{a.first, a.second.first};
-      } else {
-        return Half{a.second.second.first, a.second.second.second};
+      if constexpr (Half::kIsComposite && Second::kIsComposite) {
+        using SecondTail = typename Second::Second;
+        if constexpr (SecondTail::kIsComposite) {
+          if constexpr (
+              std::is_same_v<First, typename Half::First> &&
+              std::is_same_v<typename Second::First, typename Half::Second> &&
+              std::is_same_v<typename SecondTail::First, typename Half::First> &&
+              std::is_same_v<typename SecondTail::Second, typename Half::Second>) {
+            if constexpr (i == 0) {
+              return Half{a.first, a.second.first};
+            } else {
+              return Half{a.second.second.first, a.second.second.second};
+            }
+          }
+        }
       }
+      alignas(First) Scalar values[kSize];
+      Store(values, a);
+      return Half::Load(values + i * Half::kSize);
     }
   }
 
@@ -220,24 +310,25 @@ class Simd<
   }
 
   [[nodiscard]] static MOCHI_ANY MOCHI_FORCE_INLINE Simd Sequence() {
-    alignas(First)
-        Scalar constexpr kSequence[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
-    static_assert(
-        std::size(kSequence) >= First::kSize,
-        "Vector size is too large. Size of kSequence must be increased.");
-    auto first = First::Load(kSequence);
-    Second second MOCHI_NO_INIT;
-    if constexpr (std::is_same_v<First, Second>) {
-      second = first;
-    } else if constexpr (Second::kIsComposite) {
-      second = Second::Sequence();
+    if constexpr (IsHalf<Scalar>) {
+      return details::MakeSimdSequence<Simd>(std::make_index_sequence<kSize>{});
     } else {
-      static_assert(
-          std::size(kSequence) >= Second::kSize,
-          "Vector size is too large. Size of kSequence must be increased.");
-      second = Second::Load(kSequence);
+      alignas(First) Scalar constexpr kSequence[] = {0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10,
+                                                     11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+                                                     22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
+      static_assert(First::kSize <= 32, "Vector size is too large");
+      auto first = First::Load(kSequence);
+      Second second MOCHI_NO_INIT;
+      if constexpr (std::is_same_v<First, Second>) {
+        second = first;
+      } else if constexpr (Second::kIsComposite) {
+        second = Second::Sequence();
+      } else {
+        static_assert(Second::kSize <= 32, "Vector size is too large");
+        second = Second::Load(kSequence);
+      }
+      return Simd{first, second + Second{static_cast<T>(First::kSize)}};
     }
-    return Simd{first, second + Second{static_cast<T>(First::kSize)}};
   }
 
   template <int x = 0, int y = 1, int z = 2, int w = 3>
@@ -544,7 +635,8 @@ class Simd<
   }
 
   [[nodiscard]] MOCHI_ANY MOCHI_FORCE_INLINE Scalar operator[](int i) const {
-    return Get(*this, i); /* return by value */
+    MOCHI_ASSERT_VERBOSE(i >= 0 && i < kSize, "Index out of range");
+    return i < kSizeFirst ? first[i] : second[i - kSizeFirst];
   }
 
   [[nodiscard]] MOCHI_ANY MOCHI_FORCE_INLINE Simd operator<<(int i) const {
@@ -686,6 +778,11 @@ template <
     int FromN,
     MOCHI_CONCEPT((Simd<FromT, FromN>::kIsComposite) && To::kIsComposite)>
 [[nodiscard]] MOCHI_ANY MOCHI_FORCE_INLINE To ReinterpretCast(Simd<FromT, FromN> const& a) {
+  using From = Simd<FromT, FromN>;
+  static_assert(sizeof(typename To::Scalar) * To::kSize == sizeof(FromT) * FromN, "Size mismatch");
+  static_assert(
+      sizeof(typename To::Scalar) * To::kSizeFirst == sizeof(FromT) * From::kSizeFirst,
+      "Component size mismatch");
   return {
       ReinterpretCast<typename To::First>(a.first), ReinterpretCast<typename To::Second>(a.second)};
 }

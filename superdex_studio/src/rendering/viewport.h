@@ -43,6 +43,7 @@ class IndexBuffer;
 namespace superdex::studio {
 
 class SuperDexStudio;
+class MeasureTool;
 class Renderer;
 struct SceneStage;
 
@@ -180,6 +181,11 @@ class Viewport {
   // Register a toggleable "Show" command. The viewport owns its keyboard shortcut and lists it in
   // the top-left "Show" dropdown.
   void RegisterShowCommand(ShowCommand command);
+  // The viewport's Measure tool (never null). Every viewport has one and registers its Ctrl+M
+  // toggle; editors give it geometry to pick via MeasureTool::SetTargetProvider.
+  MeasureTool* GetMeasureTool() const {
+    return _measureTool.get();
+  }
 
  private:
   Viewport(SuperDexStudio* studio, mochi_renderer::SceneViewSettings const& viewSettings);
@@ -196,6 +202,11 @@ class Viewport {
   void ShowDebugText(ImVec2 contentOrigin, float logicalWidth, float logicalHeight);
   void ShowShowMenu();
   void HandleShowCommandShortcuts();
+  // Feeds the Measure tool the cursor ray for this frame (hover preview, and a pick on click), and
+  // switches the tool off if the editor has withdrawn it. Called every frame the viewport is drawn.
+  // @p renderHeight is the framebuffer height, needed for the bottom-origin pixel convention
+  // Filament's picking uses.
+  void HandleMeasureToolInput(bool canPick, int renderHeight, float fbScale);
   void DrawDebug();
   // Lazily creates, and resizes to (width, height), the highlight overlay target + view and the
   // fullscreen composite view. Called each frame a highlight is present.
@@ -257,6 +268,9 @@ class Viewport {
   mutable mochi::Real3 _gizmoPrevScale{1.0f, 1.0f, 1.0f};
   // Registered "Show" toggle commands (keyboard bindings + top-left dropdown).
   std::vector<ShowCommand> _showCommands;
+  // Modal vertex/face measurement tool, owned per viewport so its selection and recorded
+  // measurements are per-editor. Created in the constructor and never null.
+  std::unique_ptr<MeasureTool> _measureTool;
   // Ground grid: per-viewport visibility (Show menu / G), seeded from the app settings at creation
   // and drawn at the scene's lowest point. Its appearance is app-wide -- see
   // AppSettings::viewport::groundGrid.

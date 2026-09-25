@@ -87,6 +87,22 @@ struct ColoredSSORPrec<BlockSparseMatrix<Scalar, kBlockSize, CRIdx, Ptr, Storage
     return kType;
   }
 
+  /// @brief Return the number of colors.
+  [[nodiscard]] int NumColors() const {
+    return _colorToBlock.size();
+  }
+
+  /// @brief Return the maximum number of block rows in one color.
+  [[nodiscard]] int MaxBlockRowsPerColor() const {
+    return _maxBlockRowsPerColor;
+  }
+
+  /// @brief Return how many times each worker waits on @c data.barrier in one
+  /// @ref ConcurrentSolve call.
+  [[nodiscard]] int NumConcurrentSolveBarriers() const {
+    return 2 + 2 * NumColors() + (UsesScalingPhase() ? 1 : 0);
+  }
+
   /// @brief Update the numerical values of the preconditioner
   /// @param[in] A Input matrix for updated values
   ///
@@ -107,6 +123,11 @@ struct ColoredSSORPrec<BlockSparseMatrix<Scalar, kBlockSize, CRIdx, Ptr, Storage
       NonConstIdx bBegin,
       NonConstIdx bEnd,
       OutputType& y) const;
+
+  [[nodiscard]] bool UsesScalingPhase() const {
+    return Abs(_omega_s * _ratio_s - Scalar(1)) >
+        2 * std::numeric_limits<NonConstScalar>::epsilon();
+  }
 
   template <typename InputType, typename OutputType>
   void CopyToColored(InputType const& x, NonConstIdx bBegin, NonConstIdx bEnd, OutputType& coloredY)
@@ -130,6 +151,7 @@ struct ColoredSSORPrec<BlockSparseMatrix<Scalar, kBlockSize, CRIdx, Ptr, Storage
   NonConstScalar _omega_s = 1;
   NonConstScalar _ratio_s = 1;
   Graph<int, int> _colorToBlock = {};
+  int _maxBlockRowsPerColor = 0; // Cached so that MaxBlockRowsPerColor() runs in constant time.
   DynamicArray<NonConstIdx> _initToColored = {};
   mutable Matrix<NonConstScalar> _workSpace = {};
 };
@@ -306,10 +328,11 @@ ColoredSSORPrec<BlockSparseMatrix<Scalar, kBlockSize, CRIdx, Ptr, Storage>>::Col
   //--- Color the graph
   _colorToBlock = GreedyColoring(AsGraphView(A));
   NonConstIdx count = 0;
-  for (int ic = 0; ic < _colorToBlock.size(); ++ic) {
-    MOCHI_ASSERT_VERBOSE(_colorToBlock.EdgeCount(ic) > 0, "Colors must not be empty.");
-    auto bList = _colorToBlock[ic];
-    for (auto b : bList) {
+  for (auto const color : _colorToBlock) {
+    auto const blockRows = color.targets;
+    MOCHI_ASSERT_VERBOSE(!blockRows.empty(), "Colors must not be empty.");
+    _maxBlockRowsPerColor = Max(_maxBlockRowsPerColor, isize(blockRows));
+    for (auto b : blockRows) {
       _initToColored[b] = count++;
     }
   }
@@ -569,7 +592,7 @@ void ColoredSSORPrec<BlockSparseMatrix<Scalar, kBlockSize, CRIdx, Ptr, Storage>>
     pos += n;
   } // for (int c = 0; c < _colorToNode.size(); ++c)
   //
-  if (Abs(_omega_s * _ratio_s - Scalar(1)) > 2 * std::numeric_limits<Scalar>::epsilon()) {
+  if (UsesScalingPhase()) {
     t *= (_omega_s * _ratio_s);
   }
   //
@@ -610,10 +633,8 @@ void ColoredSSORPrec<BlockSparseMatrix<Scalar, kBlockSize, CRIdx, Ptr, Storage>>
   //
   Preconditioner<NonConstScalar>::ValidateInputOutput(_coloredL.Rows(), x, Px);
   //
-  if ((_workSpace.Rows() < x.Rows()) || (_workSpace.Cols() < 2 * x.Cols())) {
-    if (iWorker == 0) {
-      _workSpace.Reset(x.Rows(), 2 * x.Cols());
-    }
+  if (iWorker == 0 && ((_workSpace.Rows() < x.Rows()) || (_workSpace.Cols() < 2 * x.Cols()))) {
+    _workSpace.Reset(x.Rows(), 2 * x.Cols());
   }
   data.BarrierWait();
   //
@@ -638,7 +659,7 @@ void ColoredSSORPrec<BlockSparseMatrix<Scalar, kBlockSize, CRIdx, Ptr, Storage>>
     data.BarrierWait();
   } // for (int c = 0; c < _colorToNode.size(); ++c)
   //
-  if (Abs(_omega_s * _ratio_s - Scalar(1)) > 2 * std::numeric_limits<Scalar>::epsilon()) {
+  if (UsesScalingPhase()) {
     if (bBegin < bEnd) {
       t.MiddleRows(bBegin * kBlockSize, (bEnd - bBegin) * kBlockSize) *= (_omega_s * _ratio_s);
     }
@@ -960,10 +981,8 @@ void ColoredSSORPrec<SparseMatrix<Scalar, CRIdx, Ptr, Storage>>::ConcurrentSolve
   //
   Preconditioner<NonConstScalar>::ValidateInputOutput(_coloredL.Rows(), x, Px);
   //
-  if ((_workSpace.Rows() < x.Rows()) || (_workSpace.Cols() < 2 * x.Cols())) {
-    if (iWorker == 0) {
-      _workSpace.Reset(x.Rows(), 2 * x.Cols());
-    }
+  if (iWorker == 0 && ((_workSpace.Rows() < x.Rows()) || (_workSpace.Cols() < 2 * x.Cols()))) {
+    _workSpace.Reset(x.Rows(), 2 * x.Cols());
   }
   data.BarrierWait();
   //

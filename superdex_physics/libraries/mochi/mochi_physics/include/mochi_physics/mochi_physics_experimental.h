@@ -27,7 +27,6 @@
 
 #include <mochi_physics/mochi_physics.h>
 
-#include <mochi_core/ai/compute_type.h>
 #include <mochi_core/articulated_body/articulated_body_params.h>
 #include <mochi_core/contact/contact_params.h>
 #include <mochi_core/rom/rom_hyper_reduction_params.h>
@@ -42,12 +41,18 @@
 #include <any>
 #include <functional>
 #include <optional>
+#include <string_view>
 #include <variant>
 
 namespace mochi {
 // Forwards
 struct QPSolverParams;
 struct NewtonSolverParams;
+
+namespace prefab {
+struct AddToSceneResult;
+struct PrefabParams;
+} // namespace prefab
 
 /**
  * @brief Default finite-difference epsilon used by @ref BackPropagationSolverParams::epsFiniteDiff.
@@ -420,6 +425,14 @@ struct RomParams {
   MOCHI_STRUCT_END()
 };
 
+MOCHI_API prefab::AddToSceneResult AddToScene(
+    std::string_view prefabPath,
+    std::string_view rootPath,
+    Scene* scene,
+    prefab::PrefabParams const& params,
+    RomParams const& romParams,
+    Error& error);
+
 struct DeepModelParams {
   // Path of the file containing the deep model.
   DynamicString deepModelPath;
@@ -494,6 +507,10 @@ struct PointCloudColliderParams {
    * per element, whose spacing scales roughly like (element size) / (quadrature points per
    * element)^(1/d), where `d` is the parametric dimension of the collider geometry (`d = 2` for
    * surfaces such as shell, `d = 1` for curves such as rods).
+   *
+   * @note Must be finite and strictly positive. Its sum with the effective contact threshold in
+   * @ref ContactParams, including @ref ContactParams::penaltyThresholdExtraPadding, must also be
+   * finite and strictly positive.
    *
    * @note This value also serves as the length scale for dimensional correction of the contact
    * penalty coefficient on the collider side. The effective penalty stiffness is scaled by
@@ -573,6 +590,7 @@ struct ShellActorParams {
   PointCloudColliderParams pointCloudCollider = {};
   bool hasGravity = true;
   ActorBoundaryElementType contactElementType = ActorBoundaryElementType::Default;
+  bool useContactSkin = false;
 
   MOCHI_STRUCT_BEGIN(mochi::experimental::ShellActorParams)
   MOCHI_FIELD(name)
@@ -585,6 +603,7 @@ struct ShellActorParams {
   MOCHI_FIELD(pointCloudCollider)
   MOCHI_FIELD(hasGravity)
   MOCHI_FIELD(contactElementType)
+  MOCHI_FIELD(useContactSkin)
   MOCHI_STRUCT_END()
 };
 
@@ -646,8 +665,8 @@ struct RodActorParams {
   ColliderType colliderType = ColliderType::None;
   PointCloudColliderParams pointCloudCollider = {};
   bool hasGravity = true;
-  bool useVisualMeshContact = false;
-  ActorBoundaryElementType visualMeshContactElementType = ActorBoundaryElementType::Default;
+  bool useContactSkin = false;
+  ActorBoundaryElementType contactSkinElementType = ActorBoundaryElementType::Default;
 
   MOCHI_STRUCT_BEGIN(mochi::experimental::RodActorParams)
   MOCHI_FIELD(name)
@@ -660,8 +679,8 @@ struct RodActorParams {
   MOCHI_FIELD(colliderType)
   MOCHI_FIELD(pointCloudCollider)
   MOCHI_FIELD(hasGravity)
-  MOCHI_FIELD(useVisualMeshContact)
-  MOCHI_FIELD(visualMeshContactElementType)
+  MOCHI_FIELD(useContactSkin)
+  MOCHI_FIELD(contactSkinElementType)
   MOCHI_STRUCT_END()
 };
 
@@ -866,16 +885,18 @@ MOCHI_API void ConstrainNodesByPosition(
     std::function<bool(int, Real3 const&)> callback,
     Error& error);
 
-// Create a shape defined by a flow map, where the map is approximated by a neural network.
-// WARNING: Requires MOCHI_ENABLE_DEEP_FLOW_ACTORS=1.
-// WARNING: Requires libtorch (see MOCHI_USE_TORCH in mochi_config.h) if the compute type is Torch.
-[[nodiscard]] MOCHI_API ShapeHandle CreateDeepFlowShape(
-    Context* context,
-    DeepModelParams const& params, // Parameters of a deep model
-    NeuralComputeType computeType, // Compute type, e.g. MochiCpu, TorchCpu, TorchGpu
-    int preallocMemSize, // Amount of preallocated GPU memory. Only used if computeType is
-                         // TorchGpu
-    Error& error);
+/**
+ * @brief [Experimental] Creates a shape whose flow map is approximated by a neural network.
+ *
+ * @param[in] context Context that owns the shape.
+ * @param[in] params Deep flow model and normalization parameters.
+ * @param[out] error Error status. Check Error::IsOK() for success.
+ * @return A valid shape handle on success, or an invalid handle on failure.
+ *
+ * @warning Requires `MOCHI_ENABLE_DEEP_FLOW_ACTORS=1` and `MOCHI_USE_HDF5=1`.
+ */
+[[nodiscard]] MOCHI_API ShapeHandle
+CreateDeepFlowShape(Context* context, DeepModelParams const& params, Error& error);
 
 /**
  * @brief [Experimental] Additional parameters for creating a soft actor.
@@ -1022,12 +1043,12 @@ MOCHI_API Actor* CreateRodActor(Scene* scene, RodActorParams const& params, Erro
     bool isClosedLoop,
     Error& error);
 
-// Generate a @ref ModelData with a polyline simulation mesh and a tubular visual mesh for use
+// Generate a @ref ModelData with a polyline simulation mesh and a tubular contact skin for use
 // with rod actors. The returned @ref ModelData can be passed to @ref Context::CreateModelShape.
 // @param[in] nodes Node positions [m] defining the polyline centerline. Must have at least 2.
 // @param[in] elementFrameAxes Unit vectors perpendicular to each element's tangent direction.
 //            If empty, these will be auto-generated using parallel transport.
-// @param[in] radius Radius [m] of the tubular visual mesh cross-section. Must be positive.
+// @param[in] radius Radius [m] of the tubular contact-skin cross-section. Must be positive.
 // @param[in] numCrossSectionSegments Number of segments around the tube circumference (>= 3).
 // @param[in] isClosedLoop If true, the polyline forms a closed loop.
 // @param[in,out] error Error status. Check @ref Error::IsOK for success.

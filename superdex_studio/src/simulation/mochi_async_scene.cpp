@@ -15,6 +15,7 @@
  */
 
 #include "simulation/mochi_async_scene.h"
+#include "app/app.h"
 #include "ui/imgui_widgets.h"
 
 #include <imguios/fonts/icons_font_awesome5.h>
@@ -29,6 +30,8 @@
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -285,13 +288,17 @@ void MochiAsyncScene::CreateScene(std::string_view name, bool startPaused) {
   _asyncScene->QueueCommand([this,
                              addGroundPlane = _settings.studio.groundPlane,
                              groundHeight = _groundPlaneHeight](mochi::Scene* physicsScene) {
+    _groundPlaneActor = {};
     if (addGroundPlane) {
       mochi::ErrorLog planeError;
       mochi::RigidActorParams groundParams;
       groundParams.isStatic = true;
       groundParams.name = "StudioGroundPlane";
       groundParams.shape = _context->CreatePlaneShape({0.0f, 0.0f, 1.0f}, groundHeight, planeError);
-      physicsScene->CreateRigidActor(groundParams, planeError);
+      mochi::Actor* groundActor = physicsScene->CreateRigidActor(groundParams, planeError);
+      if (groundActor) {
+        _groundPlaneActor = groundActor->GetHandle();
+      }
     }
     if (createPhysicsActors) {
       createPhysicsActors(physicsScene);
@@ -455,7 +462,7 @@ void MochiAsyncScene::DrawDebug(
       auto r = data.debugSpheres.radii[i];
       auto const& c = data.debugSpheres.colors[i];
       auto pf = ToFilament<float>(converter.TranslationToOutput(p));
-      debugDraw->DrawSphere(
+      debugDraw->DrawSolidSphere(
           pf, float(r), {c[0] / 255.0f, c[1] / 255.0f, c[2] / 255.0f, c[3] / 255.0f});
     }
   }
@@ -468,6 +475,30 @@ float MochiAsyncScene::GetStepsPerSecond() const {
 void MochiAsyncScene::SetFixedTimeStepSeconds(double seconds) {
   _settings.scene.fixedTimeStepSeconds = seconds;
   ApplySceneSettings();
+}
+
+void MochiAsyncScene::ExportPrefab(
+    std::string_view exportName,
+    std::string_view outputDir,
+    mochi::Error& error) {
+  MOCHI_ERROR_RETURN(error);
+  MOCHI_ERROR_IF_NOT(IsSimulating(), error, "Cannot export a prefab while the scene is stopped.");
+  MOCHI_ERROR_RETURN(error);
+  // AsyncScene exposes no Scene*: the scene may only be touched from the simulation thread, so the
+  // export is queued there and waited on. The wait is what makes capturing `error` by reference
+  // safe, and keeps _groundPlaneActor single-threaded.
+  _asyncScene->QueueCommand([&](mochi::Scene* scene) {
+    // The ground plane is a studio convenience, never part of the asset.
+    mochi::ActorHandle const excluded = _groundPlaneActor;
+    mochi::prefab::ExportSceneExcluding(
+        scene,
+        exportName,
+        outputDir,
+        excluded.IsValid() ? mochi::MakeSingletonSpan(excluded)
+                           : mochi::Span<mochi::ActorHandle const>{},
+        error);
+  });
+  _asyncScene->WaitForQueuedCommands();
 }
 
 void MochiAsyncScene::ShowPhysicsSettingsWindow(
@@ -588,6 +619,23 @@ void MochiAsyncScene::ShowPlayToolbarOverViewport() {
     ImGui::SetTooltip("Stop (Esc)");
   }
   ImGui::EndDisabled(); // !simulating
+}
+
+void MochiAsyncScene::ShowExportSimulationPrefabMenuItem(std::string_view exportName) {
+  bool const simulating = IsSimulating();
+  ImGui::BeginDisabled(!simulating);
+  if (ImGui::MenuItem("Export Simulation Prefab")) {
+    auto const outputDir =
+        SuperDexStudio::GetFolderDialogPath("Export Simulation Prefab - Select Output Directory");
+    if (!outputDir.IsEmpty()) {
+      mochi::ErrorLog error;
+      ExportPrefab(exportName, outputDir.ToString(), error);
+    }
+  }
+  if (!simulating && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+    ImGui::SetTooltip("Start the simulation to export its current state.");
+  }
+  ImGui::EndDisabled();
 }
 
 void MochiAsyncScene::HandleHotkeys() {

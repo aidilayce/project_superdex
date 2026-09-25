@@ -228,6 +228,12 @@ class RigidBodyVel {
     return {_omega, _vsym};
   }
 
+  // Transposed world-space finite-step rotational velocity gradient.
+  VMatrix3x3r GetFiniteRotationVelocityGradientT() const {
+    MOCHI_ASSERT_VERBOSE(!_isVSymDirty, "vsym needs to be updated");
+    return SimdSymToFull(_vsym) - Skew3(_omega);
+  }
+
   void SetVCom(Vec4r vcom) {
     _vcom = vcom;
   }

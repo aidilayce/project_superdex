@@ -29,6 +29,7 @@
 
 #define MOCHI_SIMD_BENCHMARK_VEC2D(fn, ...) BENCHMARK_TEMPLATE(fn, __VA_ARGS__)
 #define MOCHI_SIMD_BENCHMARK_VEC4D(fn, ...) BENCHMARK_TEMPLATE(fn, __VA_ARGS__)
+#define MOCHI_SIMD_BENCHMARK_VEC8D(fn, ...) BENCHMARK_TEMPLATE(fn, __VA_ARGS__)
 #define MOCHI_SIMD_BENCHMARK_VEC4F(fn, ...) BENCHMARK_TEMPLATE(fn, __VA_ARGS__)
 #define MOCHI_SIMD_BENCHMARK_VEC4I(fn, ...) BENCHMARK_TEMPLATE(fn, __VA_ARGS__)
 #define MOCHI_SIMD_BENCHMARK_VEC8F(fn, ...) BENCHMARK_TEMPLATE(fn, __VA_ARGS__)
@@ -58,6 +59,7 @@ namespace mochi_benchmark {
 
 using Vec2d = mochi::Vec2d;
 using Vec4d = mochi::Vec4d;
+using Vec8d = mochi::Vec8d;
 using Vec4f = mochi::Vec4f;
 using Vec4i = mochi::Vec4i;
 using Vec8f = mochi::Vec8f;
@@ -642,6 +644,8 @@ template <class V>
 static void VDot(benchmark::State& state) {
   V a = {}, b = {}, d = {};
   for (auto x : state) {
+    benchmark::DoNotOptimize(a);
+    benchmark::DoNotOptimize(b);
     d = mochi::VDot(a, b);
     MOCHI_NO_DISCARD_IN_LOOP(d);
   }
@@ -651,8 +655,57 @@ static void VDot(benchmark::State& state) {
 }
 MOCHI_SIMD_BENCHMARK_VEC2D(VDot, Vec2d);
 MOCHI_SIMD_BENCHMARK_VEC4D(VDot, Vec4d);
+MOCHI_SIMD_BENCHMARK_VEC8D(VDot, Vec8d);
 MOCHI_SIMD_BENCHMARK_VEC4F(VDot, Vec4f);
 MOCHI_SIMD_BENCHMARK_VEC8F(VDot, Vec8f);
+
+/****************************************************************************************
+  HMin
+*/
+template <class V>
+static void HMin(benchmark::State& state) {
+  V a = {};
+  typename V::Scalar s = {};
+  for (auto x : state) {
+    benchmark::DoNotOptimize(a);
+    s = mochi::HMin(a);
+    MOCHI_NO_DISCARD_IN_LOOP(s);
+  }
+  benchmark::DoNotOptimize(s);
+}
+MOCHI_SIMD_BENCHMARK_VEC8D(HMin, Vec8d);
+
+/****************************************************************************************
+  HMax
+*/
+template <class V>
+static void HMax(benchmark::State& state) {
+  V a = {};
+  typename V::Scalar s = {};
+  for (auto x : state) {
+    benchmark::DoNotOptimize(a);
+    s = mochi::HMax(a);
+    MOCHI_NO_DISCARD_IN_LOOP(s);
+  }
+  benchmark::DoNotOptimize(s);
+}
+MOCHI_SIMD_BENCHMARK_VEC8D(HMax, Vec8d);
+
+/****************************************************************************************
+  HProd
+*/
+template <class V>
+static void HProd(benchmark::State& state) {
+  V a = {1};
+  typename V::Scalar s = {};
+  for (auto x : state) {
+    benchmark::DoNotOptimize(a);
+    s = mochi::HProd(a);
+    MOCHI_NO_DISCARD_IN_LOOP(s);
+  }
+  benchmark::DoNotOptimize(s);
+}
+MOCHI_SIMD_BENCHMARK_VEC8D(HProd, Vec8d);
 
 /****************************************************************************************
   HSum
@@ -662,6 +715,7 @@ static void HSum(benchmark::State& state) {
   V a = {};
   typename V::Scalar s = {};
   for (auto x : state) {
+    benchmark::DoNotOptimize(a);
     s = mochi::HSum(a);
     MOCHI_NO_DISCARD_IN_LOOP(s);
   }
@@ -671,6 +725,7 @@ static void HSum(benchmark::State& state) {
 }
 MOCHI_SIMD_BENCHMARK_VEC2D(HSum, Vec2d);
 MOCHI_SIMD_BENCHMARK_VEC4D(HSum, Vec4d);
+MOCHI_SIMD_BENCHMARK_VEC8D(HSum, Vec8d);
 MOCHI_SIMD_BENCHMARK_VEC4F(HSum, Vec4f);
 MOCHI_SIMD_BENCHMARK_VEC8F(HSum, Vec8f);
 

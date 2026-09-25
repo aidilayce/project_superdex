@@ -38,6 +38,61 @@
 
 using namespace mochi;
 
+namespace {
+
+// Gather a new SkinningData for a subset/reordering of nodes: one weightsPerNode-sized row per
+// entry of nodeIndices, copied verbatim from the corresponding source node.
+SkinningData GatherSkinningNodes(SkinningDataView const& src, Span<int const> nodeIndices) {
+  MOCHI_ASSERT_VERBOSE(
+      isize(src.weights) == isize(src.indices),
+      "SkinningDataView indices and weights must be the same length");
+  int const w = src.weightsPerNode;
+  int const count = isize(nodeIndices);
+  SkinningData out;
+  out.weightsPerNode = w;
+  out.indices.resize_noinit(count * w);
+  out.weights.resize_noinit(count * w);
+  for (int i = 0; i < count; ++i) {
+    int const node = nodeIndices[i];
+    MOCHI_ASSERT_VERBOSE(
+        node >= 0 && (node + 1) * w <= isize(src.indices), "node index out of range");
+    for (int j = 0; j < w; ++j) {
+      out.indices[i * w + j] = src.indices[node * w + j];
+      out.weights[i * w + j] = src.weights[node * w + j];
+    }
+  }
+  return out;
+}
+
+} // namespace
+
+namespace mochi::details {
+
+std::shared_ptr<SkinningData const> MakeSurfaceSkinning(
+    std::shared_ptr<SkinningData const> const& meshSkinning,
+    TriangularMesh const& surfaceMesh) {
+  if (!meshSkinning) {
+    return {};
+  }
+  // Both branches below require one weightsPerNode-sized row per full-mesh node: the pass-through
+  // hands those rows out as surface-aligned, and the gather indexes them by full-mesh node index.
+  // Checked here rather than in the loop so it holds for both, and with MOCHI_ASSERT because this
+  // runs once per shape construction, not in a hot path.
+  MOCHI_ASSERT(
+      isize(meshSkinning->indices) == isize(meshSkinning->weights),
+      "Skinning indices and weights must be the same length");
+  MOCHI_ASSERT(
+      isize(meshSkinning->indices) == surfaceMesh.GetNumNodes() * meshSkinning->weightsPerNode,
+      "Skinning must have one weightsPerNode-sized row per full-mesh node");
+  if (surfaceMesh.GetNumActiveNodes() == surfaceMesh.GetNumNodes()) {
+    return meshSkinning;
+  }
+  return std::make_shared<SkinningData const>(
+      GatherSkinningNodes(SkinningDataView{*meshSkinning}, surfaceMesh.GetActiveNodes()));
+}
+
+} // namespace mochi::details
+
 ModelData ImplicitRigidShape::GetModelData(Error& error) const {
   MOCHI_ERROR_RETURN(error, {});
   ModelData outData;
@@ -61,12 +116,12 @@ GridSdfShape::~GridSdfShape() {
   _gridSdfSem.Wait();
 }
 
-MOCHI_API std::shared_ptr<GridSdf const> GridSdfShape::GetGridSdf() const {
+std::shared_ptr<GridSdf const> GridSdfShape::GetGridSdf() const {
   std::lock_guard lock(_gridSdfMutex);
   return _gridSdf;
 }
 
-MOCHI_API std::shared_ptr<GridSdf const> GridSdfShape::RequestGridSdf(
+std::shared_ptr<GridSdf const> GridSdfShape::RequestGridSdf(
     GridSdfParams const& params,
     bool* outIsPending) const {
   *outIsPending = false;
@@ -121,6 +176,40 @@ MOCHI_API std::shared_ptr<GridSdf const> GridSdfShape::RequestGridSdf(
   return {};
 }
 
+static SkinningData ToSkinningData(LinearMeshEmbedding const& embedding) {
+  SkinningData data;
+  data.weightsPerNode = static_cast<int>(embedding.GetNumSkinningWeightsPerEntry());
+  data.indices = embedding.GetIndices();
+  data.weights = embedding.GetWeights();
+  return data;
+}
+
+static SkinningData ToSkinningData(RodSurfaceEmbeddingData const& embedding) {
+  SkinningData data;
+  data.weightsPerNode = embedding.weightsPerNode;
+  data.indices = embedding.elementIndices;
+  data.weights = embedding.weights;
+  return data;
+}
+
+template <typename EmbeddingT>
+static void ExportAuxiliaryMesh(
+    std::shared_ptr<TriangularMesh const> const& mesh,
+    EmbeddingT const* embedding,
+    std::optional<MeshData>& outData) {
+  if (!mesh) {
+    return;
+  }
+
+  outData.emplace();
+  outData->nodesPerElement = 3;
+  outData->coordinates = Flatten(mesh->GetNodeCoordinates());
+  outData->connectivity = mesh->GetFlatConnectivity();
+  if (embedding) {
+    outData->skinning = ToSkinningData(*embedding);
+  }
+}
+
 template <typename ShapeT>
 ModelData GetModelDataImpl(ShapeT const& shape, Error& error) {
   bool constexpr kIsTetShape = std::is_same_v<ShapeT, TetrahedralMeshShape>;
@@ -140,20 +229,12 @@ ModelData GetModelDataImpl(ShapeT const& shape, Error& error) {
     outData.mesh->skinning = *meshSkinningData;
   }
 
-  if (auto const visualMesh = shape.GetVisualMesh()) {
-    outData.visualMesh.emplace();
-    outData.visualMesh->nodesPerElement = 3;
-    outData.visualMesh->coordinates = Flatten(visualMesh->GetNodeCoordinates());
-    outData.visualMesh->connectivity = visualMesh->GetFlatConnectivity();
-    if (auto const* linearEmbedding =
-            dynamic_cast<LinearMeshEmbedding const*>(shape.GetVisualEmbedding().get())) {
-      outData.visualMesh->skinning.emplace();
-      outData.visualMesh->skinning->weightsPerNode =
-          static_cast<int>(linearEmbedding->GetNumSkinningWeightsPerEntry());
-      outData.visualMesh->skinning->indices = linearEmbedding->GetIndices();
-      outData.visualMesh->skinning->weights = linearEmbedding->GetWeights();
-    }
-  }
+  ExportAuxiliaryMesh(
+      shape.GetVisualMesh(),
+      dynamic_cast<LinearMeshEmbedding const*>(shape.GetVisualEmbedding().get()),
+      outData.visualMesh);
+  ExportAuxiliaryMesh(
+      shape.GetContactSkin(), shape.GetContactSkinEmbedding().get(), outData.contactSkinMesh);
 
   if (auto const blending = shape.GetMeshBlending()) {
     MOCHI_ASSERT(blending->sourceShapes.size() == blending->perSourceShapeIndices.size());
@@ -432,24 +513,31 @@ PolylineShape::PolylineShape(
     DynamicArray<Real3> nodes,
     DynamicArray<Real3> elementFrameAxes,
     bool isClosedLoop)
-    : PolylineShape(std::move(nodes), std::move(elementFrameAxes), nullptr, nullptr, isClosedLoop) {
-}
+    : PolylineShape(
+          std::move(nodes),
+          std::move(elementFrameAxes),
+          nullptr,
+          nullptr,
+          nullptr,
+          nullptr,
+          isClosedLoop) {}
 
 PolylineShape::PolylineShape(
     DynamicArray<Real3> nodes,
     DynamicArray<Real3> elementFrameAxes,
     std::shared_ptr<TriangularMesh const> visualMesh,
-    std::shared_ptr<RodVisualMeshEmbeddingData const> rodVisualEmbedding,
+    std::shared_ptr<RodSurfaceEmbeddingData const> rodVisualEmbedding,
+    std::shared_ptr<TriangularMesh const> contactSkin,
+    std::shared_ptr<RodSurfaceEmbeddingData const> rodContactSkinEmbedding,
     bool isClosedLoop)
     : _nodes(std::move(nodes)),
       _elementFrameAxes(std::move(elementFrameAxes)),
       _isClosedLoop(isClosedLoop),
       _connectivity(MakeSequentialPolylineConnectivity(isize(_nodes), isClosedLoop)),
       _visualMesh(std::move(visualMesh)),
-      _rodVisualEmbedding(std::move(rodVisualEmbedding)) {
-  MOCHI_ASSERT(
-      static_cast<bool>(_visualMesh) == static_cast<bool>(_rodVisualEmbedding),
-      "Visual mesh and rod visual embedding must be both provided or both null.");
+      _rodVisualEmbedding(std::move(rodVisualEmbedding)),
+      _contactSkin(std::move(contactSkin)),
+      _rodContactSkinEmbedding(std::move(rodContactSkinEmbedding)) {
   // Validate polyline geometry defensively so direct callers of this constructor cannot trigger
   // a division by zero or undefined parallel-transport rotation in GenerateDiscreteBishopFrame
   // below. Factory paths (e.g. CreatePolylineShape, CreateShapeFromModelData) validate upstream
@@ -479,16 +567,8 @@ ModelData PolylineShape::GetModelData(Error& error) const {
     outData.elementFrameAxes = DynamicArray<real>{Flatten(MakeConstSpan(_elementFrameAxes))};
   }
 
-  if (_visualMesh) {
-    outData.visualMesh.emplace();
-    outData.visualMesh->nodesPerElement = 3;
-    outData.visualMesh->coordinates = Flatten(_visualMesh->GetNodeCoordinates());
-    outData.visualMesh->connectivity = _visualMesh->GetFlatConnectivity();
-    outData.visualMesh->skinning.emplace();
-    outData.visualMesh->skinning->weightsPerNode = _rodVisualEmbedding->weightsPerNode;
-    outData.visualMesh->skinning->indices = _rodVisualEmbedding->elementIndices;
-    outData.visualMesh->skinning->weights = _rodVisualEmbedding->weights;
-  }
+  ExportAuxiliaryMesh(_visualMesh, _rodVisualEmbedding.get(), outData.visualMesh);
+  ExportAuxiliaryMesh(_contactSkin, _rodContactSkinEmbedding.get(), outData.contactSkinMesh);
 
   return outData;
 }

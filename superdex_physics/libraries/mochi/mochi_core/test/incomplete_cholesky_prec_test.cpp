@@ -129,196 +129,267 @@ static RowMatrix<real, 5, 5> U{
     1.61721508012528_r, -0.6183469424008423_r, 0.0_r, 0.0_r, 0.0_r, 0.0_r,
     1.271867547672921_r};
 
+[[nodiscard]] static Graph<int, int> MakeClosedDistanceTwoGraph(int numVertices) {
+  std::vector<std::vector<int>> rows(numVertices);
+  for (int row = 0; row < numVertices; ++row) {
+    for (int offset = -2; offset <= 2; ++offset) {
+      int const col = (row + offset + numVertices) % numVertices;
+      rows[row].push_back(col);
+    }
+  }
+  return MakeSparsityGraph(std::move(rows), numVertices);
+}
+
+template <typename Preconditioner, typename MatrixType>
+void CheckNaturalOrderSolve(
+    Preconditioner const& preconditioner,
+    MatrixType const& matrix,
+    int seed) {
+  int const size = matrix.Rows();
+  Matrix<real> expected(size, 3), rhs(size, 3), result(size, 3);
+  expected.SetRandom(seed);
+  rhs = matrix * expected;
+  preconditioner(rhs, result);
+  auto const tolerance = 1024_r * size * std::numeric_limits<real>::epsilon();
+  EXPECT_TRUE(test::NearEqualMatrices(result, expected, tolerance));
+}
+
 template <int kBlockSize>
-class ICBSpMAccess : public mochi::krylov::IncompleteCholeskyPrec<
-                         BlockSparseMatrix<real, kBlockSize, int, int, std::vector>> {
-  using mochi::krylov::IncompleteCholeskyPrec<
-      BlockSparseMatrix<real, kBlockSize, int, int, std::vector>>::IncompleteCholeskyPrec;
-  friend class IC0B1SpMTest;
-  FRIEND_TEST(IC0B1SpMTest, Example1);
-  //
-  friend class IC0B2SpMTest;
-  FRIEND_TEST(IC0B2SpMTest, Example1);
-  //
-  friend class IC0B3SpMTest;
-  FRIEND_TEST(IC0B3SpMTest, Example1);
-};
+void CheckNaturalOrderCompletionConstructAndUpdate() {
+  int constexpr kBlocks = 8;
+  int constexpr kSize = kBlockSize * kBlocks;
+  auto dense = RowMatrix<real, kSize, kSize>::Zero();
+  for (int i = 0; i < kSize; ++i) {
+    dense(i, i) = 8_r + real(i) * 0.01_r;
+  }
+  for (int block = 0; block < kBlocks; ++block) {
+    for (int distance = 1; distance <= 2; ++distance) {
+      int const neighbor = (block + distance) % kBlocks;
+      for (int i = 0; i < kBlockSize; ++i) {
+        for (int j = 0; j < kBlockSize; ++j) {
+          real const value = -0.01_r * real(1 + i + kBlockSize * j);
+          dense(block * kBlockSize + i, neighbor * kBlockSize + j) = value;
+          dense(neighbor * kBlockSize + j, block * kBlockSize + i) = value;
+        }
+      }
+    }
+  }
 
-class IC0B1SpMTest : public testing::Test {
- protected:
-  using PrecType = ICBSpMAccess<1>;
-  void SetUp() override {
-    auto ABSp = ToBlockSparseMatrix<1>(A, /*pruneZeros*/ true);
-    _p = std::make_unique<PrecType>(ABSp, /*fillInLevel*/ 0, /*alphaShift*/ 0_r);
-    //
-    auto MBSp = ToBlockSparseMatrix<1>(M, /*pruneZeros*/ true);
-    _q = std::make_unique<PrecType>(
-        MBSp, /*fillInLevel*/ 0, /*alphaShift*/ 0.625_r); // Shift yields the matrix M + I
-  }
-  std::unique_ptr<PrecType> _p = nullptr;
-  std::unique_ptr<PrecType> _q = nullptr;
-};
+  auto sparse = ToBlockSparseMatrix<kBlockSize>(dense, /*pruneZeros*/ true);
+  using Prec = IncompleteCholeskyPrec<decltype(sparse)>;
+  Prec prec(sparse, NaturalOrderCompletion{}, /*alphaShift*/ 0_r);
+  EXPECT_EQ(PreconditionerType::IC0, prec.GetType());
+  CheckNaturalOrderSolve(prec, dense, 123);
+  auto const baselineDense = dense;
+  auto baselinePrec = prec;
 
-TEST_F(IC0B1SpMTest, Example1) {
-  //--- Check symmetry
-  int n = _p->_rChol.Rows();
-  for (int i = 0; i < n; ++i) {
-    for (int j = 0; j < i; ++j) {
-      EXPECT_NEAR_EQ(_p->_rChol(i, j), _p->_rChol(j, i));
+  for (int i = 0; i < kSize; ++i) {
+    dense(i, i) += 0.5_r;
+    sparse.SetValue(i, i, dense(i, i));
+  }
+  prec.Update(sparse);
+  CheckNaturalOrderSolve(baselinePrec, baselineDense, 124);
+  CheckNaturalOrderSolve(prec, dense, 124);
+
+  dense(0, kBlockSize + 1) = -0.1_r;
+  dense(kBlockSize + 1, 0) = -0.1_r;
+  sparse.SetValue(0, kBlockSize + 1, dense(0, kBlockSize + 1));
+  sparse.SetValue(kBlockSize + 1, 0, dense(kBlockSize + 1, 0));
+  prec.Update(sparse);
+  CheckNaturalOrderSolve(prec, dense, 125);
+
+  real constexpr kAlphaShift = 0.1_r;
+  Prec shiftedPrec(sparse, NaturalOrderCompletion{}, kAlphaShift);
+  auto checkShifted = [&](int seed) {
+    auto shiftedDense = dense;
+    real const shift = kAlphaShift * Trace(dense) / dense.Rows();
+    for (int i = 0; i < kSize; ++i) {
+      shiftedDense(i, i) += shift;
     }
-  }
-  //--- Check diagonal entries
-  for (int i = 0; i < n; ++i) {
-    EXPECT_NEAR_EQ(_p->_rChol(i, i), 1.0_r / R0(i, i));
-  }
-  //--- Check off-diagonal entries
-  for (int i = 0; i < n; ++i) {
-    for (int j = i + 1; j < _p->_rChol.Cols(); ++j) {
-      EXPECT_NEAR_EQ(_p->_rChol(i, j), R0(i, j));
-    }
-  }
-  {
-    Matrix<real> x(n, 2), Px(n, 2), R0Px(n, 2);
-    x.SetRandom(26);
-    _p->operator()(x, Px); // Px = R0^{-1} * R0^{-T} * x
-    R0Px = R0 * Px;
-    Matrix<real> y = Transpose(R0) * R0Px;
-    y -= x;
-    auto tol = std::numeric_limits<real>::epsilon() * n * 2.0_r;
-    EXPECT_LT(y.Norm(), x.Norm() * tol);
-  }
-  {
-    RowMatrix<real> x(n, 2), Px(n, 2), R0Px(n, 2);
-    x.SetRandom(26);
-    _p->operator()(x, Px); // Px = R0^{-1} * R0^{-T} * x
-    R0Px = R0 * Px;
-    RowMatrix<real> y = Transpose(R0) * R0Px;
-    y -= x;
-    auto tol = std::numeric_limits<real>::epsilon() * n * 2.0_r;
-    EXPECT_LT(y.Norm(), x.Norm() * tol);
-  }
-  //
-  n = M.Rows();
-  //--- Check symmetry
-  for (int i = 0; i < n; ++i) {
-    for (int j = 0; j < i; ++j) {
-      EXPECT_NEAR_EQ(_q->_rChol(i, j), _q->_rChol(j, i));
-    }
-  }
-  //--- Check diagonal entries
-  for (int i = 0; i < n; ++i) {
-    EXPECT_NEAR_EQ(_q->_rChol(i, i), 1.0_r / U(i, i));
-  }
-  //--- Check off-diagonal entries
-  for (int i = 0; i < n; ++i) {
-    for (int j = i + 1; j < _q->_rChol.Cols(); ++j) {
-      EXPECT_NEAR_EQ(_q->_rChol(i, j), U(i, j));
-    }
+    CheckNaturalOrderSolve(shiftedPrec, shiftedDense, seed);
+  };
+  checkShifted(126);
+  for (int update = 0; update < 2; ++update) {
+    dense(update, update) += 0.25_r;
+    sparse.SetValue(update, update, dense(update, update));
+    shiftedPrec.Update(sparse);
+    checkShifted(127 + update);
   }
 }
 
-class IC0B2SpMTest : public testing::Test {
- protected:
-  using PrecType = ICBSpMAccess<2>;
-  void SetUp() override {
-    auto ABSp = ToBlockSparseMatrix<2>(A, /*pruneZeros*/ true);
-    _p = std::make_unique<PrecType>(ABSp, /*fillInLevel*/ 0, /*alphaShift*/ 0_r);
-  }
-  std::unique_ptr<PrecType> _p = nullptr;
-};
+TEST(IncompleteCholeskyPrec, NaturalOrderCompletionConstructAndUpdate) {
+  EXPECT_EQ(0, krylov::details::CompleteCholeskyPatternNaturalOrder(Graph<int, int>{}).size());
+  int constexpr kPatternBlocks = 256;
+  auto completed = krylov::details::CompleteCholeskyPatternNaturalOrder(
+      MakeClosedDistanceTwoGraph(kPatternBlocks));
+  EXPECT_EQ(9 * kPatternBlocks - 20, completed.NumTargets());
 
-TEST_F(IC0B2SpMTest, Example1) {
-  //--- Check symmetry
-  for (int i = 0; i < _p->_rChol.Rows(); ++i) {
-    for (int j = 0; j < i; ++j) {
-      EXPECT_NEAR_EQ(_p->_rChol(i, j), _p->_rChol(j, i));
-    }
-  }
-  //--- Here the factorization is exact
-  //--- Check diagonal entries
-  for (int i = 0; i < _p->_rChol.Rows(); ++i) {
-    EXPECT_NEAR_EQ(_p->_rChol(i, i), 1.0_r / R(i, i));
-  }
-  //--- Check off-diagonal entries
-  for (int i = 0; i < _p->_rChol.Rows(); ++i) {
-    for (int j = i + 1; j < _p->_rChol.Cols(); ++j) {
-      EXPECT_NEAR_EQ(_p->_rChol(i, j), R(i, j));
-    }
-  }
-  //---
-  auto tol = real(4 * A.Rows()) * std::numeric_limits<real>::epsilon();
-  {
-    Matrix<real> X(A.Rows(), 3);
-    X.SetRandom(123);
-    Matrix<real> Y(X), PY(X);
-    Y = A * X;
-    _p->operator()(Y, PY);
-    //--- PY should match X
-    PY -= X;
-    EXPECT_LT(PY.Norm(), tol * X.Norm());
-  }
-  {
-    RowMatrix<real> X(A.Rows(), 3);
-    X.SetRandom(123);
-    RowMatrix<real> Y(X), PY(X);
-    Y = A * X;
-    _p->operator()(Y, PY);
-    //--- PY should match X
-    PY -= X;
-    EXPECT_LT(PY.Norm(), tol * X.Norm());
+  CheckNaturalOrderCompletionConstructAndUpdate<1>();
+  CheckNaturalOrderCompletionConstructAndUpdate<2>();
+  CheckNaturalOrderCompletionConstructAndUpdate<3>();
+  CheckNaturalOrderCompletionConstructAndUpdate<4>();
+  CheckNaturalOrderCompletionConstructAndUpdate<5>();
+
+  int constexpr kChordalBlockSize = 2;
+  auto chordal = A;
+  auto chordalSparse = ToBlockSparseMatrix<kChordalBlockSize>(chordal, /*pruneZeros*/ true);
+  using ChordalPrec = IncompleteCholeskyPrec<decltype(chordalSparse)>;
+  ChordalPrec chordalPrec(chordalSparse, NaturalOrderCompletion{}, /*alphaShift*/ 0_r);
+  CheckNaturalOrderSolve(chordalPrec, chordal, 127);
+
+  chordal(0, kChordalBlockSize + 1) = -0.08_r;
+  chordal(kChordalBlockSize + 1, 0) = -0.08_r;
+  chordalSparse.SetValue(0, kChordalBlockSize + 1, chordal(0, kChordalBlockSize + 1));
+  chordalSparse.SetValue(kChordalBlockSize + 1, 0, chordal(kChordalBlockSize + 1, 0));
+  chordalPrec.Update(chordalSparse);
+  CheckNaturalOrderSolve(chordalPrec, chordal, 128);
+}
+
+template <int kBlockSize>
+using BlockPrec = mochi::krylov::IncompleteCholeskyPrec<BlockSparseMatrix<real, kBlockSize>>;
+
+template <typename MatrixType, int kBlockSize>
+void CheckMultiRhsMatchesColumnSolves(
+    BlockPrec<kBlockSize> const& prec,
+    int size,
+    int seed,
+    real tolerance) {
+  MatrixType x(size, 3), result(size, 3);
+  x.SetRandom(seed);
+  prec(x, result);
+  for (int column = 0; column < x.Cols(); ++column) {
+    ColumnVector<real> xColumn(size), expected(size);
+    xColumn = x.Col(column);
+    prec(xColumn, expected);
+    EXPECT_TRUE(mochi::test::NearEqualMatrices(result.Col(column), expected, tolerance));
   }
 }
 
-class IC0B3SpMTest : public testing::Test {
- protected:
-  using PrecType = ICBSpMAccess<3>;
-  void SetUp() override {
-    auto ABSp = ToBlockSparseMatrix<3>(A, /*pruneZeros*/ true);
-    _p = std::make_unique<PrecType>(ABSp, /*fillInLevel*/ 0, /*alphaShift*/ 0_r);
+template <int kBlockSize>
+void CheckBlockPrecMultiRhs() {
+  constexpr int kBlocks = 4;
+  constexpr int kSize = kBlocks * kBlockSize;
+  auto dense = RowMatrix<real, kSize, kSize>::Zero();
+  for (int i = 0; i < kSize; ++i) {
+    dense(i, i) = 4.0_r + real(i) * 0.05_r;
   }
-  std::unique_ptr<PrecType> _p = nullptr;
-};
+  for (int block = 0; block < kBlocks; ++block) {
+    int const next = (block + 1) % kBlocks;
+    for (int i = 0; i < kBlockSize; ++i) {
+      dense(block * kBlockSize + i, next * kBlockSize + i) = -0.2_r;
+      dense(next * kBlockSize + i, block * kBlockSize + i) = -0.2_r;
+    }
+  }
 
-TEST_F(IC0B3SpMTest, Example1) {
-  //--- Check symmetry
-  for (int i = 0; i < _p->_rChol.Rows(); ++i) {
-    for (int j = 0; j < i; ++j) {
-      EXPECT_NEAR_EQ(_p->_rChol(i, j), _p->_rChol(j, i));
+  auto physical = ToBlockSparseMatrix<kBlockSize>(dense, /*pruneZeros*/ true);
+  auto const tolerance = real(256 * kSize) * std::numeric_limits<real>::epsilon();
+  BlockPrec<kBlockSize> prec(physical, /*fillInLevel*/ 0, /*alphaShift*/ 0_r);
+  CheckMultiRhsMatchesColumnSolves<Matrix<real>>(prec, kSize, 123, tolerance);
+  CheckMultiRhsMatchesColumnSolves<RowMatrix<real>>(prec, kSize, 124, tolerance);
+
+  for (int i = 0; i < kSize; ++i) {
+    physical.SetValue(i, i, dense(i, i) + 0.5_r);
+  }
+  prec.Update(physical);
+  CheckMultiRhsMatchesColumnSolves<Matrix<real>>(prec, kSize, 125, tolerance);
+  CheckMultiRhsMatchesColumnSolves<RowMatrix<real>>(prec, kSize, 126, tolerance);
+}
+
+TEST(IncompleteCholeskyPrec, BlockMultiRhs) {
+  CheckBlockPrecMultiRhs<1>();
+  CheckBlockPrecMultiRhs<2>();
+  CheckBlockPrecMultiRhs<3>();
+  CheckBlockPrecMultiRhs<4>();
+}
+
+TEST(IncompleteCholeskyPrec, BlockFillAndUpdateAreExact) {
+  constexpr int kBlockSize = 4;
+  constexpr int kBlockCount = 4;
+  constexpr int kSize = kBlockSize * kBlockCount;
+  constexpr real kTolerance = 8_r * kSize * std::numeric_limits<real>::epsilon();
+  ColumnVector<real> x(kSize), rhs(kSize), result(kSize);
+  x.SetRandom(123);
+
+  for (int level = 1; level <= 2; ++level) {
+    auto dense = test::Create2dLaplacianMatrix<real, kBlockSize>(2, 2);
+    for (int block = 0; block < kBlockCount; ++block) {
+      for (int row = 0; row < kBlockSize; ++row) {
+        for (int col = 0; col < kBlockSize; ++col) {
+          dense(block * kBlockSize + row, block * kBlockSize + col) += 0.05_r;
+        }
+      }
     }
-  }
-  //--- Here the factorization is exact
-  //--- Check diagonal entries
-  for (int i = 0; i < _p->_rChol.Rows(); ++i) {
-    EXPECT_NEAR_EQ(_p->_rChol(i, i), 1.0_r / R(i, i));
-  }
-  //--- Check off-diagonal entries
-  for (int i = 0; i < _p->_rChol.Rows(); ++i) {
-    for (int j = i + 1; j < _p->_rChol.Cols(); ++j) {
-      EXPECT_NEAR_EQ(_p->_rChol(i, j), R(i, j));
+    auto physical = ToBlockSparseMatrix<kBlockSize>(dense, /*pruneZeros*/ true);
+    BlockPrec<kBlockSize> prec(physical, level, /*alphaShift*/ 0_r);
+    auto checkExact = [&] {
+      rhs = dense * x;
+      prec(rhs, result);
+      result -= x;
+      EXPECT_LT(result.Norm(), x.Norm() * kTolerance);
+    };
+
+    checkExact();
+    for (int i = 0; i < kSize; ++i) {
+      dense(i, i) += 0.5_r;
+      physical.SetValue(i, i, dense(i, i));
     }
+    prec.Update(physical);
+    checkExact();
   }
-  //---
-  auto tol = real(4 * A.Rows()) * std::numeric_limits<real>::epsilon();
-  {
-    Matrix<real> X(A.Rows(), 3);
-    X.SetRandom(123);
-    Matrix<real> Y(X), PY(X);
-    Y = A * X;
-    _p->operator()(Y, PY);
-    //--- PY should match X
-    PY -= X;
-    EXPECT_LT(PY.Norm(), X.Norm() * tol);
-  }
-  {
-    RowMatrix<real> X(A.Rows(), 3);
-    X.SetRandom(123);
-    RowMatrix<real> Y(X), PY(X);
-    Y = A * X;
-    _p->operator()(Y, PY);
-    //--- PY should match X
-    PY -= X;
-    EXPECT_NEAR_RTOL(PY.Norm() / X.Norm(), 0.0_r, tol);
-  }
+}
+
+TEST(IC0B1SpMTest, Example1) {
+  auto ABSp = ToBlockSparseMatrix<1>(A, /*pruneZeros*/ true);
+  BlockPrec<1> p(ABSp, /*fillInLevel*/ 0, /*alphaShift*/ 0_r);
+  Matrix<real> x(A.Rows(), 2), Px(A.Rows(), 2), R0Px(A.Rows(), 2);
+  x.SetRandom(26);
+  p(x, Px);
+  R0Px = R0 * Px;
+  Matrix<real> y = Transpose(R0) * R0Px;
+  y -= x;
+  auto const tol = std::numeric_limits<real>::epsilon() * A.Rows() * 2.0_r;
+  EXPECT_LT(y.Norm(), x.Norm() * tol);
+
+  RowMatrix<real> rowX(A.Rows(), 2), rowPx(A.Rows(), 2), rowR0Px(A.Rows(), 2);
+  rowX.SetRandom(26);
+  p(rowX, rowPx);
+  rowR0Px = R0 * rowPx;
+  RowMatrix<real> rowY = Transpose(R0) * rowR0Px;
+  rowY -= rowX;
+  EXPECT_LT(rowY.Norm(), rowX.Norm() * tol);
+
+  auto MBSp = ToBlockSparseMatrix<1>(M, /*pruneZeros*/ true);
+  BlockPrec<1> q(MBSp, /*fillInLevel*/ 0, /*alphaShift*/ 0.625_r);
+  Matrix<real> shiftedX(M.Rows(), 2), shiftedPx(M.Rows(), 2), uPx(M.Rows(), 2);
+  shiftedX.SetRandom(27);
+  q(shiftedX, shiftedPx);
+  uPx = U * shiftedPx;
+  Matrix<real> shiftedY = Transpose(U) * uPx;
+  shiftedY -= shiftedX;
+  EXPECT_LT(shiftedY.Norm(), shiftedX.Norm() * tol);
+}
+
+template <typename MatrixType, int kBlockSize>
+void CheckExactBlockPrec() {
+  auto ABSp = ToBlockSparseMatrix<kBlockSize>(A, /*pruneZeros*/ true);
+  BlockPrec<kBlockSize> prec(ABSp, /*fillInLevel*/ 0, /*alphaShift*/ 0_r);
+  auto const tol = real(8 * A.Rows()) * std::numeric_limits<real>::epsilon();
+  MatrixType X(A.Rows(), 3), Y(A.Rows(), 3), result(A.Rows(), 3);
+  X.SetRandom(123);
+  Y = A * X;
+  prec(Y, result);
+  result -= X;
+  EXPECT_LT(result.Norm(), X.Norm() * tol);
+}
+
+TEST(IC0B2SpMTest, Example1) {
+  CheckExactBlockPrec<Matrix<real>, 2>();
+  CheckExactBlockPrec<RowMatrix<real>, 2>();
+}
+
+TEST(IC0B3SpMTest, Example1) {
+  CheckExactBlockPrec<Matrix<real>, 3>();
+  CheckExactBlockPrec<RowMatrix<real>, 3>();
 }
 
 class IC0MatAccess : public mochi::krylov::IncompleteCholeskyPrec<Matrix<real>> {

@@ -17,8 +17,10 @@
 #pragma once
 #include <superdex_physics.h>
 #include <superdex_robotics/superdex_robotics.h>
-#if MOCHI_INTERNAL
+#if SUPERDEXROBOTICS_WITH_BOT_SCENE
 #include <superdex_robotics/internal/bot_scene.h>
+#endif
+#if MOCHI_INTERNAL
 #include <superdex_robotics/internal/internal.h>
 #endif
 
@@ -415,7 +417,8 @@ MOCHI_API void MakeParamsPathAbsolute(
  * @param[in] basePath The base directory (typically the parent directory of the save file).
  * @param[in,out] error Error status. Check @ref Error::IsOK for success.
  *
- * @note Affects renderModelFile, shapeFile, and each sensor's params path in each link.
+ * @note Affects renderModelFile, shapeFile, and each sensor's params path in each link, plus the
+ * skin's shapeFile and renderModelFile when a skin is present.
  */
 MOCHI_API void MakePathsRelative(
     BotPrefab& botPrefab,
@@ -430,7 +433,8 @@ MOCHI_API void MakePathsRelative(
  * @param[in] basePath The base directory (typically the parent directory of the loaded file).
  * @param[in,out] error Error status. Check @ref Error::IsOK for success.
  *
- * @note Affects renderModelFile, shapeFile, and each sensor's params path in each link.
+ * @note Affects renderModelFile, shapeFile, and each sensor's params path in each link, plus the
+ * skin's shapeFile and renderModelFile when a skin is present.
  */
 MOCHI_API void MakePathsAbsolute(
     BotPrefab& botPrefab,
@@ -563,7 +567,7 @@ SaveToFile(ModBotPrefab const& modBotPrefab, std::string_view path, superdex::Er
 // BotScenePrefab
 // ---------------------------------------------------------------------------
 
-#if MOCHI_INTERNAL
+#if SUPERDEXROBOTICS_WITH_BOT_SCENE
 /* @brief Save bot scene prefab to a .mochi_bot_scene JSON file.
  *
  * Creates parent directories if they do not exist.
@@ -573,7 +577,7 @@ SaveToFile(ModBotPrefab const& modBotPrefab, std::string_view path, superdex::Er
  * @param[in,out] error Error status. */
 MOCHI_API void
 SaveToFile(BotScenePrefab const& scenePrefab, std::string_view path, superdex::Error& error);
-#endif // MOCHI_INTERNAL
+#endif // SUPERDEXROBOTICS_WITH_BOT_SCENE
 
 // ---------------------------------------------------------------------------
 // URDF

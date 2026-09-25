@@ -66,7 +66,7 @@ void rigid::EntityGetSolution(
   TransformToRawPose(state.value, outSolution.TopRows<RigidSize::kAll>(RigidSize::kAll));
 }
 
-MOCHI_API void rigid::RigidStateToRootTransform(
+void rigid::RigidStateToRootTransform(
     Vec4r const& comLocal,
     TransformRT const& state,
     TransformRT& worldFromLocal) {
@@ -358,7 +358,7 @@ static void HandleSolverDivergence(
   }
 }
 
-MOCHI_API void mochi::rigid::EntityIncrementStep(
+void mochi::rigid::EntityIncrementStep(
     ecs::Included<TagRigidActor>,
     ecs::Excluded<TagArticulatedLinkActor>,
     CRigidState<TimeStep::Current> const& currPose,
@@ -374,7 +374,7 @@ MOCHI_API void mochi::rigid::EntityIncrementStep(
   currVel.value.SetZero();
 }
 
-MOCHI_API void mochi::rigid::EntityPreFirstStage(
+void mochi::rigid::EntityPreFirstStage(
     ecs::Included<TagRigidActor>,
     ecs::Excluded<TagArticulatedLinkActor>,
     CTimeIntegratorState const& intState,
@@ -387,7 +387,7 @@ MOCHI_API void mochi::rigid::EntityPreFirstStage(
   ComputeVelocityAtStepStart(intState, prevVel, intVels);
 }
 
-MOCHI_API void mochi::rigid::EntityPreStage(
+void mochi::rigid::EntityPreStage(
     ecs::Included<TagRigidActor>,
     ecs::Excluded<TagArticulatedLinkActor>,
     CRigidBodyInertia const& rigidInertia,
@@ -404,7 +404,7 @@ MOCHI_API void mochi::rigid::EntityPreStage(
   ComputeVelocityAtStageStart(intState, intVels, stageStartVel);
 }
 
-MOCHI_API void mochi::rigid::EntityPostStage(
+void mochi::rigid::EntityPostStage(
     ecs::Included<TagRigidActor>,
     ecs::Excluded<TagArticulatedLinkActor>,
     CConvergenceStatus const& convergence,
@@ -430,7 +430,7 @@ MOCHI_API void mochi::rigid::EntityPostStage(
   intVels.stages[intState.currentStage].value = currVel.value;
 }
 
-MOCHI_API void mochi::rigid::EntityPostLastStage(
+void mochi::rigid::EntityPostLastStage(
     ecs::Included<TagRigidActor>,
     ecs::Excluded<TagArticulatedLinkActor>,
     CRigidBodyInertia const& rigidInertia,
@@ -1055,9 +1055,18 @@ static void InitRigidActor_Dynamic(
         }
       }
 
-      // Create BSH tree to accelerate collision detection.
-      contactSamples.bsh = activeBoundaryFaces ? MakeConstSpan(contactSamples.activePositions)
-                                               : MakeConstSpan(contactSamples.positions);
+      // Create SphereTree to accelerate collision detection.
+      // Increasing kMaxSamplePointsPerLeaf makes the spatial partitioning faster/coarser.
+      // Decreasing it makes the partitioning slower/finer. Do not decrease it too much because we
+      // don't want to have leaf nodes with only one point (might as well test the point not the
+      // sphere).
+      int constexpr kMaxSamplePointsPerLeaf = 16;
+      auto const samplePoints = activeBoundaryFaces ? MakeConstSpan(contactSamples.activePositions)
+                                                    : MakeConstSpan(contactSamples.positions);
+      contactSamples.bsh = SphereOctTree::FromPoints(samplePoints, kMaxSamplePointsPerLeaf);
+#if MOCHI_DEBUG && MOCHI_ASSERT_ENABLED
+      contactSamples.bsh->AssertTreeIsValid(samplePoints);
+#endif
     });
 
     // Emplace helper component to map stage-start and current contact results
@@ -1283,8 +1292,7 @@ void mochi::InitRigidActor(
   }
 
   // This bounding volume contains all nodes of the mesh and the shape of the collider.
-  reg.emplace<CBoundingVolume<TimeStep::Current>>(e, bv);
-  reg.emplace<CBoundingVolume<TimeStep::Previous>>(e, bv);
+  reg.emplace<CBoundingVolume>(e, bv);
 
   // Rigid velocity component
   auto& rigidVelocity = reg.emplace<CPrevRigidVelocity>(e);
@@ -1364,6 +1372,27 @@ void mochi::rigid::UpdateVSym(
     ecs::CtxGlobal<CSceneTime const> time,
     CRigidVel<TimeStep::Current>& outVel) {
   outVel.value.UpdateVSymIfDirty(static_cast<real>(time->DeltaTime()));
+}
+
+void mochi::rigid::UpdateMaxGeometrySpeed(
+    ecs::RequiredTag<TagRigidActor>,
+    ecs::Excluded<TagStaticActor>,
+    CRigidState<TimeStep::Current> const& state,
+    CRigidVel<TimeStep::Current> const& vel,
+    CRootTransform const& transform,
+    CBoundingVolume const& bounds,
+    CConservativeStepBounds& outStepBounds) {
+  Aabb const worldAabb = GetAabb(TransformShape(transform.worldFromLocal, bounds.localShape));
+  VMatrix3x3r const rotationVelocityGradientT = vel.value.GetFiniteRotationVelocityGradientT();
+
+  Vec4r const aabbCenterOffset = worldAabb.VGetCenter() - state.value.VGetTranslation();
+  Vec4r const centerVelocity =
+      vel.value.GetVCom() + DotVecMat3x3(aabbCenterOffset, rotationVelocityGradientT);
+
+  // This bounds each velocity component over the AABB, so its norm bounds every point's speed.
+  Vec4r const velocityRadius =
+      DotVecMat3x3(worldAabb.VGetHalfExtents(), Abs(rotationVelocityGradientT));
+  outStepBounds.maxGeometrySpeed = Norm<3>(Abs(centerVelocity) + velocityRadius);
 }
 
 void mochi::rigid::TransportGradient(

@@ -15,7 +15,7 @@
  */
 
 #include <superdex_robotics/core/loader.h>
-#if MOCHI_INTERNAL
+#if SUPERDEXROBOTICS_WITH_BOT_SCENE
 #include <superdex_robotics/internal/bot_scene.h>
 #endif
 #include <superdex_robotics/utils/archive_utils.h>
@@ -30,6 +30,7 @@
 
 #include <miniz.h>
 
+#include <array>
 #include <chrono>
 #include <ctime>
 #include <map>
@@ -198,9 +199,9 @@ static DynamicString GetCurrentDateString() {
 #else
   gmtime_r(&tt, &tm);
 #endif
-  char buf[32];
-  std::strftime(buf, sizeof(buf), "%Y-%m-%d", &tm);
-  return DynamicString{buf};
+  std::array<char, 32> buf{};
+  std::strftime(buf.data(), buf.size(), "%Y-%m-%d", &tm);
+  return DynamicString{buf.data()};
 }
 
 #ifdef MOCHI_BOTS_WITH_MECURIAL
@@ -214,9 +215,9 @@ static DynamicString GetSourceCommitHash() {
     return DynamicString{};
   }
   std::string out;
-  char buffer[128];
-  while (std::fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-    out += buffer;
+  std::array<char, 128> buffer{};
+  while (std::fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
+    out += buffer.data();
   }
 #ifdef _WIN32
   _pclose(pipe);
@@ -358,6 +359,30 @@ static void CollectLinkAssets(
   }
 }
 
+static void CollectSkinAssets(
+    mochi::prefab::ArticulatedSkinPrefab const& skin,
+    std::set<std::filesystem::path>& collectedFiles,
+    DynamicArray<DynamicString>& warnings,
+    Error& error) {
+  MOCHI_ERROR_RETURN(error);
+  auto const collectIfPresent = [&](DynamicString const& file, char const* what) {
+    if (file.empty()) {
+      return;
+    }
+    auto const path = NormalizeBotPath(std::string(file));
+    if (!std::filesystem::exists(path)) {
+      NoteMissingAsset(
+          warnings,
+          std::string(what) + " '" + path.generic_string() +
+              "' on skin does not exist; archived without it");
+      return;
+    }
+    collectedFiles.insert(path);
+  };
+  collectIfPresent(skin.shapeFile, "skin collision shape");
+  collectIfPresent(skin.renderModelFile, "skin render model");
+}
+
 static void CollectBotDependencies(
     std::string_view path,
     FileBotLoader const& loader,
@@ -389,6 +414,9 @@ static void CollectBotDependencies(
               [&](ReplaceLink const& m) {
                 CollectLinkAssets(m.link, collectedFiles, warnings, error);
               },
+              [&](AttachSkin const& m) {
+                CollectSkinAssets(m.skin, collectedFiles, warnings, error);
+              },
           },
           mod);
       MOCHI_ERROR_RETURN(error);
@@ -397,6 +425,10 @@ static void CollectBotDependencies(
     auto botPrefab = loader.LoadBotPrefab(path, error);
     for (auto const& link : botPrefab.links) {
       CollectLinkAssets(link, collectedFiles, warnings, error);
+      MOCHI_ERROR_RETURN(error);
+    }
+    if (botPrefab.skin.has_value()) {
+      CollectSkinAssets(*botPrefab.skin, collectedFiles, warnings, error);
       MOCHI_ERROR_RETURN(error);
     }
   }
@@ -697,7 +729,7 @@ BotArchiveMetadata superdex::robotics::ReadBotArchiveMetadata(
 // Bot scene archives (.mochi_bot_scene_archive)
 // ---------------------------------------------------------------------------
 
-#if MOCHI_INTERNAL
+#if SUPERDEXROBOTICS_WITH_BOT_SCENE
 static void CollectScenePrefabDependencies(
     std::filesystem::path const& scenePath,
     std::set<std::filesystem::path>& collectedFiles,
@@ -951,4 +983,4 @@ DynamicString superdex::robotics::GetExtractedBotSceneArchiveTarget(
   return GetExtractedArchiveTargetImpl<BotSceneArchiveMetadata>(
       extractedDir, kSceneArchiveMetadataFile, error);
 }
-#endif // MOCHI_INTERNAL
+#endif // SUPERDEXROBOTICS_WITH_BOT_SCENE

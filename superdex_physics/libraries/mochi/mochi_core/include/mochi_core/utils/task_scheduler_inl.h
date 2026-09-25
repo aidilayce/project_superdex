@@ -151,12 +151,11 @@ void ParallelForRange(
   // Schedule tasks to handle each sub-range except the last one, which this thread will handle.
   int numTasks = numPerTask ? (count - 1) / numPerTask : 0;
   int localRangeBegin = globalRangeBegin;
-  TaskSemaphore sem;
+  TaskSemaphore const sem(numTasks);
   if (numTasks > 0) {
 #if MOCHI_TASK_PROFILE_VERBOSITY == MOCHI_TASK_PROFILE_VERBOSITY_HIGH
     MOCHI_PROFILE_DESCRIPTION_F("%d items, %d tasks", count, numTasks);
 #endif
-    sem.Add(numTasks);
     for (int i = 0; i < numTasks; ++i) {
       int localRangeEnd = localRangeBegin + numPerTask;
 #if MOCHI_TASK_PROFILE_VERBOSITY == MOCHI_TASK_PROFILE_VERBOSITY_HIGH

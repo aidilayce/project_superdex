@@ -17,9 +17,11 @@
 #include "rendering/scene_stage.h"
 
 #include <mochi_renderer/mesh.h>
+#include <mochi_renderer/resource.h>
 #include <mochi_renderer/resource_manager.h>
 #include <mochi_renderer/scene.h>
 #include <mochi_renderer/scene_object.h>
+#include <mochi_renderer/type_conversions.h>
 #include <mochi_renderer/utils.h>
 
 #include "app/app.h"
@@ -52,6 +54,8 @@ namespace superdex::studio {
 struct ArticulatedData {
   std::vector<std::string> names;
   std::vector<mochi::TransformRT> transforms;
+  // Link world transforms at the ZERO/rest (bind) joint configuration, same order as `transforms`.
+  std::vector<mochi::TransformRT> bindTransforms;
 };
 
 // True if the prefab (or any nested prefab) contains at least one articulated actor.
@@ -85,10 +89,9 @@ static mochi::prefab::ScenePrefab StripArticulated(mochi::prefab::ScenePrefab co
       link.shape = {};
       link.colliderType = mochi::ColliderType::None;
     }
-    if (art.skin.has_value()) {
-      art.skin->shapeFile.clear();
-      art.skin->shape = {};
-    }
+    // Drop the skin outright rather than blanking its shape: this scratch scene exists only to read
+    // link transforms, and skin params without a shape are rejected at actor creation.
+    art.skin.reset();
   }
   for (auto& nested : out.prefabs) {
     if (nested.prefab) {
@@ -149,6 +152,10 @@ static std::string CombineNames(std::string const& path, std::string const& name
     return path;
   }
   return path + "/" + name;
+}
+
+std::string SkinStagedName(std::string_view articulatedActorName) {
+  return std::string(articulatedActorName) + " (Skin)";
 }
 
 // Recursively append staging requests for a prefab level, mirroring prefab::AddToScene's creation
@@ -262,6 +269,79 @@ static void BuildPrefabRequests(
           req.renderVisible,
           req.shapeVisible);
       out.push_back(std::move(req));
+    }
+
+    // Articulated skin: folded into the compound entity (it shares the actor's handle and is not a
+    // nested link), so it is staged as a standalone deforming mesh named
+    // SkinStagedName(<articulated actor name>). The per-step surface query (editors) and force-drag
+    // resolution (PhysicsDragController) find it by that name; its deformed surface is pushed each
+    // step via ApplySoftMeshUpdates just like a soft actor. The articulated actor name is the
+    // shared prefix of its nested link names (fk.names), which matches the runtime actor->GetName()
+    // the query uses.
+    if (art.skin.has_value() && !art.skin->shapeFile.empty() && !fk.names.empty()) {
+      mochi::Path const skinShapePath =
+          ResolvePrefabModelPath(art.skin->shapeFile, rootPath, prefabSource);
+      auto* asset = studio->GetAssetManager().LoadMochiModelAsset(skinShapePath);
+      int const skinVertexCount = asset ? asset->GetSurfaceVertexCount() : 0;
+      if (skinVertexCount > 0) {
+        std::string const& firstLink = fk.names.front();
+        auto const slash = firstLink.find_last_of('/');
+        std::string const artName =
+            slash == std::string::npos ? firstLink : firstLink.substr(0, slash);
+        StageRequest req;
+        req.name = SkinStagedName(artName);
+        // The rest surface is authored in the frame of the skin's origin link (bone 0) at the
+        // zero/bind pose -- the same convention BuildBotRequests roots a composed skin at -- so
+        // place it there rather than at the articulation root, which is generally somewhere else
+        // entirely. The bind root also cancels out of the bone matrices (see ApplySkinnedJointPose:
+        // bone_j = bindRoot^-1 * current_j * inverse(bindRoot^-1 * bind_j)), so the surface is
+        // undeformed at rest and correctly posed otherwise. Falls back to the actor's world
+        // transform if forward kinematics produced no bind pose. Overwritten each step by
+        // ApplySoftMeshUpdates once simulating.
+        TransformSRT const prefabFromActor(1_r, Normalize(art.rotation), art.translation);
+        req.worldTransform = fk.bindTransforms.empty()
+            ? (worldFromPrefab * prefabFromActor).GetTransformRT()
+            : fk.bindTransforms.front();
+        req.worldScale = Real3{1_r, 1_r, 1_r};
+        req.shapeModelFile = skinShapePath;
+        req.isSoft = true;
+        req.softVertexCount = skinVertexCount;
+        // The articulated actor's (uniform) scale bakes into the rest surface; no shape offset is
+        // supported for skins yet (see ArticulatedSkinPrefab).
+        req.softBakeScale = Real3{effectiveScale, effectiveScale, effectiveScale};
+        req.softShapeTransform = TransformRT{};
+        // Populate link transforms for ANY articulated skin so the collision skin can be posed
+        // independently of the render model. fk.transforms are the per-link world transforms in
+        // nested-link (== GLB joint) order; bindTransforms are the same at the zero/rest pose.
+        req.skinLinkWorldTransforms.assign(fk.transforms.begin(), fk.transforms.end());
+        req.skinBindLinkWorldTransforms.assign(fk.bindTransforms.begin(), fk.bindTransforms.end());
+        // Optional GPU-skinned render model: when present it renders in the Render-Model view (the
+        // collision surface still stages as the shape rep) and is posed each frame from the link
+        // FK transforms. The GLB is authored in the articulation root frame, so its root is placed
+        // at the actor world transform with no extra model offset/scale (offsets would break the
+        // skin's inverse-bind math).
+        mochi::Path const skinRenderPath =
+            ResolvePrefabModelPath(art.skin->renderModelFile, rootPath, prefabSource);
+        if (!skinRenderPath.IsEmpty()) {
+          req.renderModelFile = skinRenderPath;
+        }
+        // The collision wireframe (shape slot) always exists; the render GLB is optional. Route
+        // visibility on the real render presence so fallback mode shows the collision when no GLB.
+        ComputeStageVisibility(
+            /*hasRender=*/!req.renderModelFile.IsEmpty(),
+            /*hasShape=*/true,
+            stageType,
+            req.renderVisible,
+            req.shapeVisible);
+        if (topLevel) {
+          req.source = StagedActorSource::Articulated;
+          req.sourceActorIndex = a;
+        } else {
+          req.source = StagedActorSource::NestedPrefab;
+          req.sourceActorIndex = topLevelNestedIndex;
+        }
+        out.push_back(std::move(req));
+      }
     }
   }
 
@@ -397,6 +477,30 @@ static void ComputeArticulatedLinkTransforms(
     auto const links = actor->GetNestedLinkActors(e);
     out[i].transforms.resize(links.size());
     actor->GetArticulatedLinkTransforms(MakeSpan(out[i].transforms), e);
+    // Capture the ZERO/rest (bind) link transforms: zero all joint DoFs, re-read, then restore.
+    // This is pose-independent and matches the pose the skin surface was authored at. Captured for
+    // every articulated actor: these are throwaway scratch actors, and the skin was stripped from
+    // this scene, so there is nothing here to tell a skinned actor from an unskinned one. Left
+    // empty when the pose cannot be read, in which case the skin staging path degrades to no bind
+    // reference rather than using garbage.
+    {
+      int const numDofs = actor->GetNumDofs();
+      std::vector<real> savedPose(numDofs);
+      ErrorLog poseError;
+      actor->GetArticulatedPose(MakeSpan(savedPose), poseError);
+      if (poseError.IsOK()) {
+        out[i].bindTransforms.resize(links.size());
+        std::vector<real> const zeros(numDofs, 0_r);
+        actor->SetArticulatedPoseFromJoints(MakeConstSpan(zeros), e);
+        actor->GetArticulatedLinkTransforms(MakeSpan(out[i].bindTransforms), e);
+        // Restore only what was actually read; otherwise savedPose is uninitialized.
+        actor->SetArticulatedPoseFromJoints(MakeConstSpan(savedPose), e);
+      } else {
+        MOCHI_LOG_ERROR_ONCE(
+            "SceneStage: could not read an articulated actor's pose to capture its bind "
+            "transforms; any skin on it will not deform.");
+      }
+    }
     out[i].names.resize(links.size());
     for (int j = 0; j < isize(links); ++j) {
       Actor const* linkActor = scene->GetActor(links[j]);
@@ -442,10 +546,7 @@ static void SetStagedActorWorldTransform(
   // rotations so it scales in the actor frame rather than the rotated model frame (which would
   // swizzle axes). That product is not a single rotation/translation/scale, so compose it as a
   // matrix and decompose it back into the (transform, scale) pair the renderer accepts.
-  auto applyTo = [&](StagedActor::Instance& instance) {
-    if (!instance.sceneObject) {
-      return;
-    }
+  auto localTransformFor = [&](StagedActor::Instance const& instance) {
     VMatrix4x4r const local = Dot4x4(
         ToVMatrix4x4(worldTransform),
         Dot4x4(
@@ -453,11 +554,86 @@ static void SetStagedActorWorldTransform(
             Dot4x4(
                 ToVMatrix4x4(instance.modelTransform),
                 VDiagonalMatrix<4>(ToSimd(instance.modelScale, 1_r)))));
-    auto const [scale, rt] = DecomposeMatrixTransform(local);
+    return DecomposeMatrixTransform(local);
+  };
+  auto applyTo = [&](StagedActor::Instance& instance) {
+    if (!instance.sceneObject) {
+      return;
+    }
+    auto const [scale, rt] = localTransformFor(instance);
     instance.sceneObject->SetLocalTransform(rt, scale, &converter);
   };
   applyTo(actor.render);
   applyTo(actor.shape);
+  // A skinned skin's other surface is not held in a slot, so it would keep the identity transform
+  // and sit at the origin. A hidden object still contributes to the scene AABB, so that stray
+  // surface would drag the ground plane, the camera framing and the asset thumbnail. It is the same
+  // baked surface as the installed one and shares the shape slot's model offset/scale.
+  if (actor.shapeSkinnedSurface != nullptr || actor.shapeSimSurface != nullptr) {
+    auto const [scale, rt] = localTransformFor(actor.shape);
+    for (auto* surface : {actor.shapeSkinnedSurface, actor.shapeSimSurface}) {
+      if (surface != nullptr && surface != actor.shape.sceneObject) {
+        surface->SetLocalTransform(rt, scale, &converter);
+      }
+    }
+  }
+}
+
+// Convert a Mochi TransformRT (already in renderer space) to a Filament mat4f, composing
+// translation * rotation to match the bone matrices SetBoneMatrices expects.
+static filament::math::mat4f ToFilamentMat4(mochi::TransformRT const& t) {
+  return filament::math::mat4f::translation(mochi_renderer::ToFilament(t.GetTranslation())) *
+      filament::math::mat4f{mochi_renderer::ToFilament(t.GetRotation())};
+}
+
+// Pose a skinned skin's render-model joints from per-link WORLD transforms (Mochi space, in GLB
+// joint order): make them root-relative against the actor's current world transform (the skin
+// root), convert to renderer space, and push them to the GPU-skinned render instance AND the
+// GPU-skinned collision wireframe. No-op unless the actor has a skinned render model and transforms
+// were provided. `actor.worldTransform` must already be set to the frame the joints should be
+// relative to.
+static void ApplySkinnedJointPose(
+    StagedActor& actor,
+    mochi::Span<mochi::TransformRT const> linkWorldTransforms,
+    mochi::CoordinateSpaceConverter const& converter) {
+  using namespace mochi;
+  if ((!actor.skinnedRenderObject && !actor.skinnedCollisionMesh) || linkWorldTransforms.empty()) {
+    return;
+  }
+  TransformRT const rootInv = Invert(actor.worldTransform);
+  std::vector<TransformRT> jointTransforms(linkWorldTransforms.size());
+  for (int j = 0; j < isize(linkWorldTransforms); ++j) {
+    jointTransforms[j] = converter.TransformToOutput(rootInv * linkWorldTransforms[j]);
+  }
+  // Build renderable-local bone matrices from the ARTICULATION's own current + rest link frames:
+  // boneMatrix_j = currentRootRel_j * inverse(restRootRel_j). At rest they are identity (the baked
+  // rest surface is shown). These never reference the render GLB's baked skeleton / inverse-bind
+  // matrices, so a render GLB authored in a different bind convention than the articulation (e.g. a
+  // DCC/Unreal export whose joint frames are rotated from the link frames) still deforms correctly.
+  // The same matrices drive the GPU-skinned render GLB, its highlight clone, and the collision
+  // wireframe.
+  if (actor.skinRestBoneInverse.empty()) {
+    return;
+  }
+  int const boneCount = std::min(isize(jointTransforms), isize(actor.skinRestBoneInverse));
+  std::vector<filament::math::mat4f> boneMatrices(boneCount);
+  for (int j = 0; j < boneCount; ++j) {
+    boneMatrices[j] = ToFilamentMat4(jointTransforms[j]) * actor.skinRestBoneInverse[j];
+  }
+  auto const boneSpan = mochi::MakeConstSpan(boneMatrices);
+  if (actor.skinnedRenderObject) {
+    actor.skinnedRenderObject->SetBoneMatrices(boneSpan);
+    // The selection/hover highlight clone is a separate skinned instance, so it must be driven too
+    // or it freezes at the pose it was cloned in while the base animates.
+    if (actor.render.highlightClone) {
+      if (auto* clone = actor.render.highlightClone->AsSkinnedModelInstance()) {
+        clone->SetBoneMatrices(boneSpan);
+      }
+    }
+  }
+  if (actor.skinnedCollisionMesh) {
+    actor.skinnedCollisionMesh->SetBoneMatrices(boneSpan);
+  }
 }
 
 // Instantiate `prefab` as a shapeless temporary bot in `scene` (a scratch scene), read its
@@ -469,6 +645,7 @@ static void BuildBotRequests(
     SuperDexStudio* studio,
     superdex::robotics::BotPrefab const& prefab,
     StageType stageType,
+    bool stageSkin,
     std::vector<StageRequest>& out) {
   using namespace mochi;
 
@@ -485,6 +662,13 @@ static void BuildBotRequests(
     link.shapeFile.clear();
     link.sensors.clear();
   }
+  // The skin is not part of forward kinematics; drop it so the cheap FK-only bot does not load the
+  // skin shape. When requested, it is staged separately below as a deforming dynamic mesh.
+  prefabCopy.skin.reset();
+  // Contact overrides are irrelevant to these shapeless FK-only links and a skin<->link override
+  // still references the skin we just dropped (its party is the bot name), so it would fail to
+  // resolve in CreateBot and log a spurious warning on every restage. Drop them.
+  prefabCopy.contactOverrides.clear();
   ErrorLog e;
   auto* botsCtx = studio->GetRoboticsContext();
   // Staging re-runs on every edit, so an invalid intermediate bot (e.g. a duplicate name partway
@@ -505,6 +689,10 @@ static void BuildBotRequests(
   }
 
   out.reserve(out.size() + prefab.links.size());
+  // Per-link world transforms in nested-link order (== GLB joint order), captured for posing an
+  // optional skinned render model below.
+  std::vector<mochi::TransformRT> linkWorldTransforms;
+  linkWorldTransforms.reserve(prefab.links.size());
   for (int i = 0; i < isize(prefab.links); ++i) {
     auto const& link = prefab.links[i];
     auto* linkActor = scene->GetActor(linkActors[i]);
@@ -512,6 +700,7 @@ static void BuildBotRequests(
     StageRequest req;
     req.name = linkActor->GetName();
     req.worldTransform = linkActor->GetRootTransform();
+    linkWorldTransforms.push_back(linkActor->GetRootTransform());
     // Stage both representations (either may be absent); bot links reference model files directly.
     if (!link.renderModelFile.empty()) {
       req.renderModelFile = mochi::Path(link.renderModelFile);
@@ -530,6 +719,113 @@ static void BuildBotRequests(
         req.renderVisible,
         req.shapeVisible);
     out.push_back(std::move(req));
+  }
+
+  // Capture the ZERO/rest (bind) link world transforms in the SAME order/frame as
+  // linkWorldTransforms: zero all joint DoFs and re-read each link. The bot is a throwaway created
+  // for staging (destroyed by the MOCHI_DEFER above), so the pose need not be restored. This bind
+  // reference is pose-independent, matching the pose the skin surface was authored at.
+  std::vector<mochi::TransformRT> bindLinkWorldTransforms;
+  bindLinkWorldTransforms.reserve(prefab.links.size());
+  {
+    auto* art = bot->GetArticulatedActor();
+    std::vector<mochi::real> const zeros(art->GetNumDofs(), 0_r);
+    art->SetArticulatedPoseFromJoints(mochi::MakeConstSpan(zeros), e);
+    for (int i = 0; i < isize(prefab.links); ++i) {
+      auto* linkActor = scene->GetActor(linkActors[i]);
+      bindLinkWorldTransforms.push_back(linkActor->GetRootTransform());
+    }
+  }
+
+  // Skin (optional). The skin is a deformable surface skinned over the links; it is staged through
+  // the same deforming dynamic-mesh path as soft actors (a solid mesh in the render slot, a
+  // wireframe in the shape slot), and updated each simulation step -- matched by name -- via
+  // SceneStage::ApplySoftMeshUpdates from the articulated actor's skinned surface. The staged name
+  // is the top-level articulated actor's name plus " (Skin)": the skin is that actor's own surface
+  // (not a nested link), so BotEditor must derive _skinQuery.name identically for the match. Only
+  // the single-bot editor stages the skin (stageSkin): the bot-scene path applies simulated
+  // transforms by index and an extra staged actor would break that alignment. The skin has no baked
+  // transform (identity scale/offset); its rest surface sits in the articulation's root frame,
+  // placed by worldFromRoot.
+  if (stageSkin && prefab.skin.has_value() && !prefab.skin->shapeFile.empty()) {
+    mochi::Path const skinShapePath(prefab.skin->shapeFile);
+    auto* asset = studio->GetAssetManager().LoadMochiModelAsset(skinShapePath);
+    int const skinVertexCount = asset ? asset->GetSurfaceVertexCount() : 0;
+    if (skinVertexCount > 0) {
+      StageRequest req;
+      char const* const skinActorName = bot->GetArticulatedActor()->GetName();
+      req.name = SkinStagedName(skinActorName ? skinActorName : "");
+      // Root the rest surface at the skin's origin link (bone 0) at the zero/bind pose, the frame
+      // the surface is authored in -- matching the composed-skin branch below and the prefab path.
+      // For a natively skinned bot bone i == link i, so bone 0 is link 0. Every skinned bot
+      // authored so far has its root link at the articulation root, making this identical to
+      // worldFromRoot; it diverges only for a future skin whose origin link is offset from the
+      // root, which is exactly the case worldFromRoot places wrongly.
+      req.worldTransform =
+          bindLinkWorldTransforms.empty() ? prefab.worldFromRoot : bindLinkWorldTransforms.front();
+      req.worldScale = Real3{1_r, 1_r, 1_r};
+      req.shapeModelFile = skinShapePath;
+      req.isSoft = true;
+      req.softVertexCount = skinVertexCount;
+      req.softBakeScale = Real3{1_r, 1_r, 1_r};
+      req.softShapeTransform = TransformRT{};
+      // Populate link transforms for ANY articulated skin so the collision skin can be posed
+      // independently of the render model (see the prefab path). Current + bind (zero/rest) poses.
+      req.skinLinkWorldTransforms = linkWorldTransforms;
+      req.skinBindLinkWorldTransforms = bindLinkWorldTransforms;
+      // A composed (mod) bot adopts a sub-bot's skin whose bone indices (== GLB joint order) index
+      // the SUB-bot's links, not the merged articulation's link order. The GPU-skinned collision
+      // wireframe and render GLB carry those child-local bone indices / inverse-bind, so pose them
+      // with per-link transforms reordered into skin-bone order, and root the rest surface at the
+      // skin's origin link (skin bone 0) captured at the bind/zero pose -- the frame the skin
+      // surface and inverse-bind were authored in. `_skinBoneLinks` is empty for a natively skinned
+      // bot (bone i == link i), so that path keeps the identity ordering above.
+      if (!prefab._skinBoneLinks.empty()) {
+        std::unordered_map<std::string_view, int> linkIndexByName;
+        linkIndexByName.reserve(prefab.links.size());
+        for (int i = 0; i < isize(prefab.links); ++i) {
+          linkIndexByName.emplace(std::string_view(prefab.links[i].name), i);
+        }
+        std::vector<mochi::TransformRT> boneCurrent;
+        std::vector<mochi::TransformRT> boneBind;
+        boneCurrent.reserve(prefab._skinBoneLinks.size());
+        boneBind.reserve(prefab._skinBoneLinks.size());
+        bool resolved = true;
+        for (auto const& linkName : prefab._skinBoneLinks) {
+          auto const it = linkIndexByName.find(std::string_view(linkName));
+          if (it == linkIndexByName.end()) {
+            resolved = false;
+            break;
+          }
+          boneCurrent.push_back(linkWorldTransforms[it->second]);
+          boneBind.push_back(bindLinkWorldTransforms[it->second]);
+        }
+        if (resolved && !boneBind.empty()) {
+          req.worldTransform = boneBind.front();
+          req.skinLinkWorldTransforms = std::move(boneCurrent);
+          req.skinBindLinkWorldTransforms = std::move(boneBind);
+        } else {
+          MOCHI_LOG_ERROR_ONCE(
+              "SceneStage: composed skin bone link names do not resolve to bot links; the skin "
+              "preview will be misposed.");
+        }
+      }
+      // Optional GPU-skinned render model (see the prefab path for the rationale): the GLB renders
+      // in the Render-Model view and is posed from the link world transforms captured above (in GLB
+      // joint order). No model offset/scale is applied so its inverse-bind math stays valid.
+      if (!prefab.skin->renderModelFile.empty()) {
+        req.renderModelFile = mochi::Path(prefab.skin->renderModelFile);
+      }
+      // The collision wireframe (shape slot) always exists; the render GLB is optional. Route
+      // visibility on the real render presence so fallback mode shows the collision when no GLB.
+      ComputeStageVisibility(
+          /*hasRender=*/!req.renderModelFile.IsEmpty(),
+          /*hasShape=*/true,
+          stageType,
+          req.renderVisible,
+          req.shapeVisible);
+      out.push_back(std::move(req));
+    }
   }
 }
 
@@ -566,7 +862,7 @@ bool SceneStage::StageBot(superdex::robotics::BotPrefab const& prefab, StageType
     return false;
   }
   std::vector<StageRequest> requests;
-  BuildBotRequests(_scene, _studio, prefab, stageType, requests);
+  BuildBotRequests(_scene, _studio, prefab, stageType, /*stageSkin=*/true, requests);
   return ApplyStageRequests(requests);
 }
 
@@ -690,7 +986,7 @@ bool SceneStage::StageBotScene(
     if (!botEntry.initialPose.empty()) {
       botPrefab.defaultPose = botEntry.initialPose;
     }
-    BuildBotRequests(_scene, _studio, botPrefab, stageType, requests);
+    BuildBotRequests(_scene, _studio, botPrefab, stageType, /*stageSkin=*/false, requests);
   }
 
   return ApplyStageRequests(requests);
@@ -710,13 +1006,28 @@ bool SceneStage::ApplyStageRequests(std::vector<StageRequest> const& requests) {
   if (reuse) {
     for (size_t i = 0; i < requests.size(); ++i) {
       bool const reqIsSoft = requests[i].isSoft;
-      bool const actorIsSoft = _actors[i].dynamicSolidMesh != nullptr;
+      // A staged actor is "soft" if it has either deforming mesh: plain soft actors and the
+      // non-skinned skin keep a solid, while a skinned skin keeps only the wireframe collision
+      // mesh.
+      bool const actorIsSoft = _actors[i].dynamicSolidMesh != nullptr ||
+          _actors[i].dynamicWireframeMesh != nullptr || _actors[i].skinnedCollisionMesh != nullptr;
       // A soft/non-soft mismatch, or a soft vertex-count change (topology change), forces a
       // rebuild.
       if (_actors[i].name != requests[i].name ||
           _actors[i].render.modelFile != requests[i].renderModelFile ||
           _actors[i].shape.modelFile != requests[i].shapeModelFile || reqIsSoft != actorIsSoft ||
           (reqIsSoft && _actors[i].softMeshVertexCount != requests[i].softVertexCount)) {
+        reuse = false;
+        break;
+      }
+      // A skinned skin bakes scale/shape-offset into its GPU-skinned collision geometry, which has
+      // no in-place vertex update, so a change to those params forces a full rebuild (pose edits,
+      // the common case, keep the same params and reuse).
+      if (_actors[i].skinnedCollisionMesh != nullptr &&
+          (_actors[i].softBakeScale[0] != requests[i].softBakeScale[0] ||
+           _actors[i].softBakeScale[1] != requests[i].softBakeScale[1] ||
+           _actors[i].softBakeScale[2] != requests[i].softBakeScale[2] ||
+           !(_actors[i].softShapeTransform == requests[i].softShapeTransform))) {
         reuse = false;
         break;
       }
@@ -749,7 +1060,7 @@ bool SceneStage::ApplyStageRequests(std::vector<StageRequest> const& requests) {
     // geometry but not the vertex count (e.g. scaling a nested prefab) reuses the meshes. Re-bake
     // the reused solid + wireframe meshes via the asset so the idle pose stays correct (the rebuild
     // path below handles vertex-count changes).
-    if (reuse && req.isSoft && actor.dynamicSolidMesh) {
+    if (reuse && req.isSoft && (actor.dynamicSolidMesh || actor.dynamicWireframeMesh)) {
       // Re-fetch the asset from the AssetManager instead of trusting the cached raw pointer: the
       // manager owns assets as unique_ptr and may have evicted/reloaded this one since it was
       // staged, leaving actor.softAsset dangling. Refreshing here keeps it valid for this and later
@@ -775,7 +1086,75 @@ bool SceneStage::ApplyStageRequests(std::vector<StageRequest> const& requests) {
       // so the highlight clone can match each base's shading.
       actor.render.flatShaded = false;
       actor.shape.flatShaded = true;
-      if (req.isSoft) {
+      if (req.isSoft && !req.skinLinkWorldTransforms.empty()) {
+        // Skinned articulated skin: a GPU-skinned collision wireframe occupies the shape slot (the
+        // Collision view), GPU skinned by the articulation link transforms (via SetBoneMatrices) so
+        // it deforms at editor time and tracks physics at sim time without CPU re-baking. An
+        // optional GPU-skinned render GLB (posed each frame via SetBoneMatrices) occupies the
+        // render slot -- but the collision skin is fully independent of it and is always created
+        // here.
+        auto* asset = manager.LoadMochiModelAsset(req.shapeModelFile);
+        std::unique_ptr<mochi_renderer::WireframeMesh> wireframe;
+        int const boneCount = isize(req.skinLinkWorldTransforms);
+        if (asset) {
+          asset->CreateSkinnedCollisionWireframe(
+              req.softBakeScale, req.softShapeTransform, boneCount, wireframe);
+        }
+        actor.softAsset = asset;
+        actor.dynamicSolidMesh = nullptr;
+        // The simulation surface is built on demand by EnsureSimSurface once Mochi actually reports
+        // vertices; at edit time the blend-skinned preview is the only surface staged.
+        actor.dynamicWireframeMesh = nullptr;
+        actor.shapeSimSurface = nullptr;
+        actor.skinnedCollisionMesh = wireframe.get();
+        if (wireframe) {
+          wireframe->SetName(req.name);
+        }
+        actor.shapeSkinnedSurface =
+            wireframe ? _renderScene->AddSceneObjectToScene(std::move(wireframe)) : nullptr;
+        actor.shape.sceneObject = actor.shapeSkinnedSurface;
+        actor.shape.flatShaded = true;
+        actor.softMeshVertexCount = req.softVertexCount;
+        if (!actor.skinnedCollisionMesh) {
+          MOCHI_LOG_ERROR_ONCE(
+              "SceneStage: skin collision surface has no skinning; the Collision view will not "
+              "deform with the pose.");
+        }
+
+        // Cache the collision wireframe's inverse-bind bone matrices from the ZERO/rest (bind) link
+        // transforms (renderer space, root-relative). This is pose-independent -- it does NOT latch
+        // to the current editor pose -- so bone_j = current_j * inverse(bind_j) reproduces the
+        // authored rest surface at rest and the correct deformation when posed, matching the GLB's
+        // baked inverse-bind. `actor.worldTransform` is the articulation root (set above from
+        // req.worldTransform); it cancels between current and bind so only joint motion remains.
+        TransformRT const restRootInv = Invert(actor.worldTransform);
+        int const bindCount = std::min(boneCount, isize(req.skinBindLinkWorldTransforms));
+        actor.skinRestBoneInverse.assign(bindCount, filament::math::mat4f{});
+        for (int j = 0; j < bindCount; ++j) {
+          TransformRT const restJoint =
+              converter.TransformToOutput(restRootInv * req.skinBindLinkWorldTransforms[j]);
+          actor.skinRestBoneInverse[j] = inverse(ToFilamentMat4(restJoint));
+        }
+
+        // Optional GPU-skinned render GLB (independent of the collision skin above).
+        if (!req.renderModelFile.IsEmpty()) {
+          auto renderInstance =
+              CreateRenderInstance(manager, req.renderModelFile, /*isRenderModel=*/true);
+          actor.skinnedRenderObject =
+              renderInstance ? renderInstance->AsSkinnedModelInstance() : nullptr;
+          if (renderInstance) {
+            renderInstance->SetName(req.name);
+          }
+          actor.render.sceneObject = renderInstance
+              ? _renderScene->AddSceneObjectToScene(std::move(renderInstance))
+              : nullptr;
+          actor.render.flatShaded = false;
+          if (!actor.skinnedRenderObject) {
+            MOCHI_LOG_ERROR_ONCE(
+                "SceneStage: skin render model has no skin data; it will render undeformed.");
+          }
+        }
+      } else if (req.isSoft) {
         // Soft actors stage two deforming dynamic meshes created + colored by the MochiModelAsset:
         // a solid mesh in the `render` slot (StageType 1/2) and a wireframe mesh in the `shape`
         // slot (StageType 3). Both are flat-lit, so the highlight clone matches their shading. The
@@ -838,6 +1217,17 @@ bool SceneStage::ApplyStageRequests(std::vector<StageRequest> const& requests) {
                                                                         : nullptr;
 
     SetStagedActorWorldTransform(actor, actor.worldTransform, converter);
+
+    // Editor-time skin pose: drive the skinned render model's joints from the captured rest/default
+    // FK link transforms. Runs every stage (rebuild and reuse) so default-pose edits -- which reuse
+    // objects -- still repose the skin. During simulation the editor overrides this via
+    // ApplySkinnedPose. No-op unless this actor has a skinned render model or collision skin. The
+    // transforms are also cached so simulation-stop can restore this rest pose (see
+    // ResetWorldTransforms).
+    if (actor.skinnedRenderObject || actor.skinnedCollisionMesh) {
+      actor.skinRestLinkWorldTransforms = req.skinLinkWorldTransforms;
+      ApplySkinnedJointPose(actor, mochi::MakeConstSpan(req.skinLinkWorldTransforms), converter);
+    }
   }
 
   if (!reuse) {
@@ -865,6 +1255,12 @@ void SceneStage::Clear() {
       }
       if (actor.shape.sceneObject) {
         _renderScene->DestroySceneObject(actor.shape.sceneObject);
+      }
+      // A skinned skin owns a second surface that is not currently installed in the slot above.
+      for (auto* surface : {actor.shapeSkinnedSurface, actor.shapeSimSurface}) {
+        if (surface && surface != actor.shape.sceneObject) {
+          _renderScene->DestroySceneObject(surface);
+        }
       }
     }
   }
@@ -916,7 +1312,7 @@ void SceneStage::ResetWorldTransforms(mochi::CoordinateSpaceConverter const& con
     // the AssetManager instead of trusting the cached raw pointer, which the manager may have
     // evicted/reloaded (leaving actor.softAsset dangling); this only runs for staged soft actors,
     // so _studio is valid.
-    if (actor.dynamicSolidMesh) {
+    if (actor.dynamicSolidMesh || actor.dynamicWireframeMesh) {
       actor.softAsset = _studio->GetAssetManager().LoadMochiModelAsset(actor.shape.modelFile);
       if (actor.softAsset) {
         actor.softAsset->UpdateSoftDynamicMeshes(
@@ -926,7 +1322,15 @@ void SceneStage::ResetWorldTransforms(mochi::CoordinateSpaceConverter const& con
             actor.softShapeTransform);
       }
     }
+    // Simulation is over: hand the shape slot back to the blend-skinned surface, which tracks
+    // editor-time pose changes, and drop the simulation surface entirely so its rest geometry does
+    // not sit in the scene bounds until the next run.
+    DestroySimSurface(actor);
     SetStagedActorWorldTransform(actor, actor.defaultWorldTransform, converter);
+    // Restore the skin's render-model joint pose to its captured rest pose (worldTransform was just
+    // reset to the default above, so joints become root-relative against the default root).
+    ApplySkinnedJointPose(
+        actor, mochi::MakeConstSpan(actor.skinRestLinkWorldTransforms), converter);
   }
 }
 
@@ -939,20 +1343,49 @@ void SceneStage::ApplySoftMeshUpdates(
       continue;
     }
     auto& actor = _actors[index];
-    if (!actor.dynamicSolidMesh) {
+    // Mochi is reporting this skin's surface, so a run is under way and the simulation surface is
+    // needed; it is not staged at edit time.
+    EnsureSimSurface(actor, converter);
+    if (!actor.dynamicSolidMesh && !actor.dynamicWireframeMesh) {
       continue;
     }
     // A vertex-count mismatch means the meshes were rebuilt underneath this update; skip it.
     if (static_cast<int>(update.positions.size() / 3) != actor.softMeshVertexCount) {
       continue;
     }
-    actor.dynamicSolidMesh->Update(
-        mochi::MakeConstSpan(update.positions), mochi::MakeConstSpan(update.normals));
+    if (actor.dynamicSolidMesh) {
+      actor.dynamicSolidMesh->Update(
+          mochi::MakeConstSpan(update.positions), mochi::MakeConstSpan(update.normals));
+    }
     if (actor.dynamicWireframeMesh) {
       actor.dynamicWireframeMesh->Update(
           mochi::MakeConstSpan(update.positions), mochi::MakeConstSpan(update.normals));
     }
+    // Mochi is now reporting this surface directly, so show it in place of the blend-skinned
+    // approximation. No-op for plain soft actors, and after the first step of a run.
+    SetSimSurfaceActive(actor, true);
     SetStagedActorWorldTransform(actor, update.worldTransform, converter);
+  }
+}
+
+void SceneStage::ApplySkinnedPose(
+    mochi::Span<SkinnedPoseUpdate const> updates,
+    mochi::CoordinateSpaceConverter const& converter) {
+  using namespace mochi;
+  for (auto const& update : updates) {
+    int const index = FindIndexByName(update.name);
+    if (index < 0) {
+      continue;
+    }
+    auto& actor = _actors[index];
+    if (!actor.skinnedRenderObject && !actor.skinnedCollisionMesh) {
+      continue;
+    }
+    // The bind (inverse-rest) matrices cancel these at rest, so the joints drive the deformation
+    // delta while the SceneObject transform (kept in sync by ApplyWorldTransforms /
+    // ApplySoftMeshUpdates) places the whole skin. Drives both the render GLB and the collision
+    // skin.
+    ApplySkinnedJointPose(actor, mochi::MakeConstSpan(update.linkWorldTransforms), converter);
   }
 }
 
@@ -969,12 +1402,80 @@ int SceneStage::FindIndexByName(std::string_view name) const {
   return it == _nameToIndex.end() ? -1 : it->second;
 }
 
+void SceneStage::EnsureSimSurface(
+    StagedActor& actor,
+    mochi::CoordinateSpaceConverter const& converter) {
+  if (!actor.shapeSkinnedSurface || actor.shapeSimSurface || !_renderScene || !_studio) {
+    return;
+  }
+  // Re-fetch rather than trusting the cached pointer, which the manager may have evicted since
+  // staging (same reasoning as ResetWorldTransforms).
+  actor.softAsset = _studio->GetAssetManager().LoadMochiModelAsset(actor.shape.modelFile);
+  if (!actor.softAsset) {
+    return;
+  }
+  // Only the wireframe is wanted (a skin has no solid shape representation); the solid the asset
+  // also produces is dropped on scope exit.
+  std::unique_ptr<mochi_renderer::Mesh> unusedSolid;
+  std::unique_ptr<mochi_renderer::WireframeMesh> simWireframe;
+  actor.softAsset->CreateSoftDynamicMeshes(
+      actor.softBakeScale, actor.softShapeTransform, unusedSolid, simWireframe);
+  if (!simWireframe) {
+    return;
+  }
+  simWireframe->SetName(actor.name);
+  actor.dynamicWireframeMesh = simWireframe.get();
+  actor.shapeSimSurface = _renderScene->AddSceneObjectToScene(std::move(simWireframe));
+  if (actor.shapeSimSurface) {
+    actor.shapeSimSurface->SetVisible(false);
+  }
+  SetStagedActorWorldTransform(actor, actor.worldTransform, converter);
+}
+
+void SceneStage::DestroySimSurface(StagedActor& actor) {
+  if (!actor.shapeSkinnedSurface || !actor.shapeSimSurface) {
+    return;
+  }
+  SetSimSurfaceActive(actor, false);
+  if (_renderScene) {
+    _renderScene->DestroySceneObject(actor.shapeSimSurface);
+  }
+  actor.shapeSimSurface = nullptr;
+  actor.dynamicWireframeMesh = nullptr;
+}
+
+void SceneStage::SetSimSurfaceActive(StagedActor& actor, bool simActive) {
+  if (!actor.shapeSimSurface || !actor.shapeSkinnedSurface) {
+    return;
+  }
+  auto* const wanted = simActive ? actor.shapeSimSurface : actor.shapeSkinnedSurface;
+  if (actor.shape.sceneObject == wanted) {
+    return;
+  }
+  bool const wasSelectable = actor.sceneObject == actor.shape.sceneObject;
+  actor.shape.sceneObject = wanted;
+  // The tinted stand-in was cloned from the outgoing surface; drop it so UpdateHighlights rebuilds
+  // it from the incoming one rather than highlighting a hidden mesh.
+  if (actor.shape.highlightClone) {
+    _renderScene->DestroySceneObject(actor.shape.highlightClone);
+    actor.shape.highlightClone = nullptr;
+  }
+  // Only the installed surface follows the slot's StageType visibility.
+  actor.shapeSkinnedSurface->SetVisible(!simActive && actor.shape.visible);
+  actor.shapeSimSurface->SetVisible(simActive && actor.shape.visible);
+  // Keep the selection/picking alias pointing at whichever surface is now installed.
+  if (wasSelectable) {
+    actor.sceneObject = actor.shape.visible ? wanted : nullptr;
+  }
+}
+
 int SceneStage::GetSceneObjectIndex(SceneObject const* object) const {
   if (!object) {
     return -1;
   }
   for (int i = 0; i < static_cast<int>(_actors.size()); ++i) {
-    if (_actors[i].render.sceneObject == object || _actors[i].shape.sceneObject == object) {
+    if (_actors[i].render.sceneObject == object || _actors[i].shape.sceneObject == object ||
+        _actors[i].shapeSkinnedSurface == object || _actors[i].shapeSimSurface == object) {
       return i;
     }
   }

@@ -22,8 +22,11 @@
 
 #include <mochi_core/articulated_body/articulated_body.h>
 #include <mochi_core/utils/constants.h>
+#include <mochi_core/utils/dynamic_array.h>
 #include <mochi_physics/src/mochi_articulated_body.h>
+#include <mochi_physics/src/mochi_blended.h>
 #include <mochi_physics/src/mochi_context.h>
+#include <mochi_physics/src/mochi_discretization_components.h>
 #include <mochi_physics/src/mochi_group.h>
 #include <mochi_physics/src/mochi_rigid.h>
 #include <mochi_physics/src/mochi_shape.h>
@@ -123,6 +126,81 @@ TEST_F(ArticulatedRigidTest, ZeroDof_AllHardMultiLink_NoActorSnle) {
   EXPECT_FALSE(reg.all_of<CActorSnle>(eAC));
 
   _scene->Step(1e-2_r);
+}
+
+TEST_F(
+    ArticulatedRigidTest,
+    DestroyConstraint_ActorGeneratedConstraintsCannotBeDestroyedIndividually) {
+  ArticulatedActorParams params;
+  params.joints = {
+      {.type = ArticulatedJointType::Spherical,
+       .minLimit = Real3{-1_r, -1_r, -1_r},
+       .maxLimit = Real3{1_r, 1_r, 1_r}},
+      {.type = ArticulatedJointType::Revolute,
+       .axis = kReal3ZAxis,
+       .minLimit = Real3{0_r, 0_r, -1_r},
+       .maxLimit = Real3{0_r, 0_r, 1_r}}};
+  params.links = {
+      {.parentLink = -1, .shape = _cubeShape, .colliderType = ColliderType::Box},
+      {.parentLink = 0, .shape = _cubeShape, .colliderType = ColliderType::Box}};
+  params.cycles = {{.parentLink = 0, .childLink = 1}};
+  auto* actor = _scene->CreateArticulatedActor(params, test::ExpectOK{});
+  ActorHandle const actorHandle = actor->GetHandle();
+
+  auto const jointLimits = actor->GetArticulatedJointLimitConstraints(test::ExpectOK{});
+  ASSERT_EQ(2, isize(jointLimits));
+  ConstraintHandle const jointLimitHandle = jointLimits[0]->GetHandle();
+
+  DynamicArray<ConstraintHandle> structuralHandles;
+  ConstraintHandle cycleHandle;
+  _scene->ForEachConstraint([&](Constraint* constraint) {
+    structuralHandles.push_back(constraint->GetHandle());
+    if (constraint->GetType() == ConstraintType::RigidSphericalJoint) {
+      cycleHandle = constraint->GetHandle();
+    }
+  });
+  ASSERT_EQ(3, isize(structuralHandles));
+  ASSERT_TRUE(cycleHandle.IsValid());
+
+  actor->AddArticulatedPoseController({}, test::ExpectOK{});
+  auto const poseConstraints = actor->GetArticulatedPoseConstraints(test::ExpectOK{});
+  ASSERT_FALSE(poseConstraints.empty());
+  DynamicArray<ConstraintHandle> poseHandles;
+  poseHandles.reserve(poseConstraints.size());
+  for (auto const& constraint : poseConstraints) {
+    poseHandles.push_back(constraint.handle);
+  }
+
+  DynamicArray<ConstraintHandle> allHandles;
+  _scene->ForEachConstraint(
+      [&](Constraint* constraint) { allHandles.push_back(constraint->GetHandle()); });
+  int const numConstraints = _scene->GetNumConstraints();
+  {
+    test::ExpectLoggingInScope expectWarning(_mochiContext, LogChannel::Warning);
+    _scene->DestroyConstraint(jointLimits[0]);
+    for (ConstraintHandle handle : allHandles) {
+      if (handle != jointLimitHandle) {
+        _scene->DestroyConstraint(handle);
+      }
+    }
+  }
+
+  EXPECT_EQ(numConstraints, _scene->GetNumConstraints());
+  for (ConstraintHandle handle : allHandles) {
+    EXPECT_NE(nullptr, _scene->GetConstraint(handle));
+  }
+
+  actor->RemoveArticulatedPoseController(test::ExpectOK{});
+  for (ConstraintHandle handle : poseHandles) {
+    EXPECT_EQ(nullptr, _scene->GetConstraint(handle));
+  }
+  EXPECT_NE(nullptr, _scene->GetConstraint(jointLimitHandle));
+  EXPECT_NE(nullptr, _scene->GetConstraint(cycleHandle));
+  EXPECT_EQ(3, _scene->GetNumConstraints());
+
+  _scene->DestroyActor(actorHandle);
+  EXPECT_EQ(0, _scene->GetNumActors());
+  EXPECT_EQ(0, _scene->GetNumConstraints());
 }
 
 TEST_F(ArticulatedRigidTest, Rigid_EntitySetSolution) {
@@ -608,6 +686,41 @@ TEST_F(ArticulatedBodyTest, Articulated_LinkTransformsInSync) {
   // Compare after a step.
   _scene->Step(1e-2_r);
   runChecks();
+}
+
+// Guards link-authored pose projection from republishing off-manifold transforms.
+TEST_F(ArticulatedBodyTest, SetPoseFromLinksPublishesCanonicalPose) {
+  auto* actor = _scene->GetActor(GetActorHandle(_eAC, _scene->GetHandle()));
+  ASSERT_NE(nullptr, actor);
+
+  DynamicArray<TransformRT> baseline(4);
+  actor->GetArticulatedLinkTransforms(baseline, test::ExpectOK{});
+
+  int constexpr kRevoluteLink = 2;
+  int constexpr kParentLink = 1;
+  DynamicArray<TransformRT> requested = baseline;
+  Real3 const worldAxis = baseline[kParentLink].GetRotation() * _jointAxes[kRevoluteLink];
+  requested[kRevoluteLink].SetRotation(
+      Quaternion::FromRotationVector(0.25_r * worldAxis) * requested[kRevoluteLink].GetRotation());
+  requested[kRevoluteLink].SetTranslation(
+      requested[kRevoluteLink].GetTranslation() + Real3{0_r, 2_r, 0_r});
+
+  actor->SetArticulatedPoseFromLinks(requested, test::ExpectOK{});
+
+  DynamicArray<TransformRT> canonical(baseline.size());
+  actor->GetArticulatedLinkTransforms(canonical, test::ExpectOK{});
+  EXPECT_FALSE(NearEqual(canonical[kRevoluteLink], requested[kRevoluteLink], kTolerance));
+  EXPECT_FALSE(NearEqual(canonical[kRevoluteLink], baseline[kRevoluteLink], kTolerance));
+
+  DynamicArray<real> pose(actor->GetNumDofs());
+  actor->GetArticulatedPose(pose, test::ExpectOK{});
+  actor->SetArticulatedPoseFromJoints(pose, test::ExpectOK{});
+
+  DynamicArray<TransformRT> replayed(baseline.size());
+  actor->GetArticulatedLinkTransforms(replayed, test::ExpectOK{});
+  for (int i = 0; i < isize(canonical); ++i) {
+    EXPECT_TRUE(NearEqual(canonical[i], replayed[i], kTolerance));
+  }
 }
 
 static void Compare(MatrixView<real const> a, MatrixView<real const> b, real tol = 1e-2_r) {
@@ -2052,33 +2165,34 @@ ShapeHandle CreateUnitCubeTriMeshShapeWithSkinning(Context* context) {
   return assert_cast<ContextImpl*>(context)->RegisterShape(shape, test::ExpectOK{});
 }
 
-// Build a BlendingDataMap with identity blending (every target node = source node `t` with
-// weight 1) for a single source soft actor named `softName`. The blended pipeline reads slot
-// 1 of each per-target pair; slot 0 is unused (weight 0).
-std::shared_ptr<BlendingDataMap const> MakeIdentityBlendingMap(
-    DynamicString const& softName,
-    int numTargetNodes) {
+// Build a one-to-one blending map for one soft actor. Each target node receives `softWeight`
+// from the matching source node.
+std::shared_ptr<BlendingDataMap const>
+MakeOneToOneBlendingMap(DynamicString const& softName, int numTargetNodes, real softWeight = 1_r) {
   BlendingDataTargetMesh target;
-  target.indices.resize(numTargetNodes * 2, 0);
-  target.weights.resize(numTargetNodes * 2, 0_r);
+  target.indices.resize(numTargetNodes);
+  target.weights.resize(numTargetNodes);
   for (int t = 0; t < numTargetNodes; ++t) {
-    target.indices[2 * t + 1] = t;
-    target.weights[2 * t + 1] = 1_r;
+    target.indices[t] = t;
+    target.weights[t] = softWeight;
   }
   auto map = std::make_shared<BlendingDataMap>();
   map->perSourceShapeData.emplace(softName, std::move(target));
   return map;
 }
 
-// Build a *blended* TetrahedralMeshShape: includes single-bone skinning and an identity
+// Build a *blended* TetrahedralMeshShape with single-bone skinning and a one-to-one
 // blending map keyed by the given soft-actor name.
-ShapeHandle CreateUnitCubeTetBlendedSkinShape(Context* context, DynamicString const& softName) {
+ShapeHandle CreateUnitCubeTetBlendedSkinShape(
+    Context* context,
+    DynamicString const& softName,
+    real softWeight = 1_r) {
   auto&& [coords, connectivity] = test::CreateMinimalTetMeshUnitCube();
   auto mesh = std::make_shared<TetrahedralMesh const>(coords, connectivity);
   int const numNodes = mesh->GetNumNodes();
   auto skinning =
       std::make_shared<SkinningData const>(test::MakeSingleBoneSkinning(numNodes, /*boneIndex=*/0));
-  auto blending = MakeIdentityBlendingMap(softName, numNodes);
+  auto blending = MakeOneToOneBlendingMap(softName, numNodes, softWeight);
   auto shape = std::make_shared<TetrahedralMeshShape>(
       mesh, skinning, /*constrainedNodesData=*/nullptr, blending);
   return assert_cast<ContextImpl*>(context)->RegisterShape(shape, test::ExpectOK{});
@@ -2092,20 +2206,78 @@ ShapeHandle CreateUnitCubeTriBlendedSkinShape(Context* context, DynamicString co
   int const numNodes = mesh->GetNumNodes();
   auto skinning =
       std::make_shared<SkinningData const>(test::MakeSingleBoneSkinning(numNodes, /*boneIndex=*/0));
-  auto blending = MakeIdentityBlendingMap(softName, numNodes);
+  auto blending = MakeOneToOneBlendingMap(softName, numNodes);
   auto shape = std::make_shared<TriangularMeshShape>(
       std::move(mesh), skinning, /*constrainedNodesData=*/nullptr, blending);
   return assert_cast<ContextImpl*>(context)->RegisterShape(shape, test::ExpectOK{});
 }
 
 // Non-trivial subsampling configuration so the subsampling code path is exercised.
-BoundarySubsamplingParams MakeSubsampling() {
+BoundarySubsamplingParams MakeSubsampling(real density = 0.5_r) {
   BoundarySubsamplingParams subsampling;
-  subsampling.subsamplingDensity = 0.5_r;
+  subsampling.subsamplingDensity = density;
   return subsampling;
 }
 
+// Two Free-jointed links (each a tet-mesh Box collider) plus a tet skin. Link names are set
+// explicitly so nonCollidingLinks can target them individually. The links carry real colliders so
+// non-substituted links can keep rigid contact.
+ArticulatedActorParams MakeTwoLinkSkinnedParams(Context* context) {
+  ArticulatedActorParams params;
+  params.joints = {{.type = ArticulatedJointType::Free}, {.type = ArticulatedJointType::Free}};
+  params.links = {
+      {.name = "link_0",
+       .parentLink = -1,
+       .shape = test::CreateUnitCubeTetMeshShape(context),
+       .colliderType = ColliderType::Box},
+      {.name = "link_1",
+       .parentLink = 0,
+       .shape = test::CreateUnitCubeTetMeshShape(context),
+       .colliderType = ColliderType::Box}};
+  ArticulatedSkinParams skin;
+  skin.shape = CreateUnitCubeTetMeshShapeWithSkinning(context);
+  params.skin = skin;
+  return params;
+}
+
+[[nodiscard]] bool DisplacementsMatchTranslation(
+    Span<real const> before,
+    Span<real const> after,
+    Real3 const& translation,
+    real tolerance) {
+  if (before.empty() || before.size() != after.size() || before.size() % 3 != 0) {
+    return false;
+  }
+  DynamicArray<real> expected(before);
+  for (int i = 0; i < isize(expected); i += 3) {
+    for (int axis = 0; axis < 3; ++axis) {
+      expected[i + axis] += translation[axis];
+    }
+  }
+  return test::NearEqualSpan(expected, after, tolerance);
+}
+
 } // namespace
+
+using CreateArticulatedActorTest = test::MochiSceneTestBase;
+
+TEST_F(CreateArticulatedActorTest, InvalidLinkShapeLeavesSceneUnchanged) {
+  ShapeHandle validShape = test::CreateUnitCubeTetMeshShape(_mochiContext);
+  ShapeHandle missingShape = test::CreateUnitCubeTetMeshShape(_mochiContext);
+  _mochiContext->ReleaseShape(missingShape);
+
+  ArticulatedActorParams params;
+  params.joints = {{.type = ArticulatedJointType::Free}, {.type = ArticulatedJointType::Spherical}};
+  params.links = {
+      {.parentLink = -1, .shape = validShape, .colliderType = ColliderType::None},
+      {.parentLink = 0, .shape = missingShape, .colliderType = ColliderType::None}};
+  int const numActorsBefore = _scene->GetNumActors();
+
+  Actor const* actor = _scene->CreateArticulatedActor(params, test::ExpectNotOK{});
+
+  EXPECT_EQ(nullptr, actor);
+  EXPECT_EQ(numActorsBefore, _scene->GetNumActors());
+}
 
 class CreateSkinnedArticulatedActorTest : public test::MochiSceneTestBase {
  protected:
@@ -2125,6 +2297,76 @@ class CreateSkinnedArticulatedActorTest : public test::MochiSceneTestBase {
     return params;
   }
 };
+
+// Guards joint-pose resets from leaving skin-only public displacements stale.
+TEST_F(CreateSkinnedArticulatedActorTest, JointPosePublishesSkinBeforeStep) {
+  auto params = MakeMinimalSkinnedParams(CreateUnitCubeTetMeshShapeWithSkinning(_mochiContext));
+  auto* actor = _scene->CreateArticulatedActor(params, test::ExpectOK{});
+  ASSERT_NE(nullptr, actor);
+
+  auto const initialSpan = actor->GetDisplacements(test::ExpectOK{});
+  DynamicArray<real> const initial(initialSpan);
+  DynamicArray<TransformRT> linkTransforms(1);
+  actor->GetArticulatedLinkTransforms(linkTransforms, test::ExpectOK{});
+  Real3 const linkTranslationBefore = linkTransforms[0].GetTranslation();
+  DynamicArray<real> pose(actor->GetNumDofs());
+  actor->GetArticulatedPose(pose, test::ExpectOK{});
+  ASSERT_FALSE(pose.empty());
+  Real3 constexpr kTranslation{1_r, 0_r, 0_r};
+  pose[0] += kTranslation[0];
+
+  actor->SetArticulatedPoseFromJoints(pose, test::ExpectOK{});
+
+  actor->GetArticulatedLinkTransforms(linkTransforms, test::ExpectOK{});
+  EXPECT_TRUE(NearEqual(
+      linkTranslationBefore + kTranslation, linkTransforms[0].GetTranslation(), kTolerance));
+  EXPECT_TRUE(DisplacementsMatchTranslation(
+      initial, actor->GetDisplacements(test::ExpectOK{}), kTranslation, kTolerance));
+}
+
+TEST_F(CreateSkinnedArticulatedActorTest, NonIdentityRootKeepsRestDisplacementsLocal) {
+  auto params = MakeMinimalSkinnedParams(CreateUnitCubeTetMeshShapeWithSkinning(_mochiContext));
+  params.worldFromRoot = TransformRT{
+      Quaternion::FromRotationVector(Real3{0.2_r, -0.3_r, 0.4_r}), Real3{1_r, 2_r, 3_r}};
+
+  auto* actor = _scene->CreateArticulatedActor(params, test::ExpectOK{});
+  ASSERT_NE(nullptr, actor);
+
+  auto const displacements = actor->GetDisplacements(test::ExpectOK{});
+  DynamicArray<real> const expected(displacements.size(), 0_r);
+  EXPECT_TRUE(test::NearEqualSpan(expected, displacements, kTolerance));
+
+  DynamicArray<real> pose(actor->GetNumDofs());
+  actor->GetArticulatedPose(pose, test::ExpectOK{});
+  Real3 constexpr kTranslation{0.1_r, -0.2_r, 0.3_r};
+  for (int axis = 0; axis < 3; ++axis) {
+    pose[axis] += kTranslation[axis];
+  }
+  actor->SetArticulatedPoseFromJoints(pose, test::ExpectOK{});
+
+  EXPECT_TRUE(DisplacementsMatchTranslation(
+      expected, actor->GetDisplacements(test::ExpectOK{}), kTranslation, kTolerance));
+}
+
+TEST_F(CreateSkinnedArticulatedActorTest, EmptyActiveNodesLeaveDerivedStateUnchanged) {
+  auto params = MakeMinimalSkinnedParams(CreateUnitCubeTetMeshShapeWithSkinning(_mochiContext));
+  params.skin->boundarySubsampling = MakeSubsampling(0_r);
+  auto* actor = _scene->CreateArticulatedActor(params, test::ExpectOK{});
+  ASSERT_NE(nullptr, actor);
+
+  auto& reg = GetRegistry();
+  entt::entity const entity = GetEntity(actor);
+  ASSERT_EQ(0, reg.get<CActiveUniqueNodes const>(entity).Count());
+  auto& displacements =
+      reg.get<CDisplacementSlice<real, TimeStep::Current, DisplacementLayer::Skinned>>(entity)
+          .value;
+  displacements.SetConstant(9_r);
+  ColumnVector<real> const expectedDisplacements(displacements);
+
+  articulated::compound::UpdateDerivedStatePipeline(reg, MakeSingletonConstSpan(entity));
+
+  EXPECT_TRUE(test::NearEqualMatrices(expectedDisplacements, displacements));
+}
 
 // Create a minimal one-bone articulated actor whose skin is a tetrahedral mesh, with
 // boundary subsampling enabled. Exercises the volumetric-skin code path.
@@ -2155,6 +2397,116 @@ TEST_F(CreateSkinnedArticulatedActorTest, ZeroDofHardSkeletonWithSkinRejected) {
   EXPECT_EQ(nullptr, _scene->CreateArticulatedActor(params, test::ExpectNotOK{}));
 }
 
+TEST_F(CreateSkinnedArticulatedActorTest, InvalidSkinContactLeavesSceneUnchanged) {
+  auto params = MakeMinimalSkinnedParams(CreateUnitCubeTetMeshShapeWithSkinning(_mochiContext));
+  // Skin contact is validated after links are created but before ownership transfer.
+  params.skin->contact.penaltyCoefficient = 0_r;
+  int const numActorsBefore = _scene->GetNumActors();
+
+  Actor const* actor = _scene->CreateArticulatedActor(params, test::ExpectNotOK{});
+
+  EXPECT_EQ(nullptr, actor);
+  EXPECT_EQ(numActorsBefore, _scene->GetNumActors());
+}
+
+TEST_F(CreateSkinnedArticulatedActorTest, UnsupportedDifferentiableSkinLeavesSceneUsable) {
+  auto params = MakeMinimalSkinnedParams(CreateUnitCubeTetMeshShapeWithSkinning(_mochiContext));
+  params.joints[0].type = ArticulatedJointType::Spherical;
+  params.joints[0].minLimit = Real3{-1_r, -1_r, -1_r};
+  params.joints[0].maxLimit = Real3{1_r, 1_r, 1_r};
+
+  // Differentiability rejects skinned articulations late enough to exercise cleanup after link and
+  // joint-limit constraint creation.
+  test::SetSceneIntegrationMethod(_scene, IntegrationMethod::BackwardEuler);
+  MakeSceneDifferentiableInternal(_scene, test::ExpectOK{});
+  int const numActorsBefore = _scene->GetNumActors();
+  int const numConstraintsBefore = _scene->GetNumConstraints();
+
+  Actor const* actor = _scene->CreateArticulatedActor(params, test::ExpectNotOK{});
+
+  EXPECT_EQ(nullptr, actor);
+  EXPECT_EQ(numActorsBefore, _scene->GetNumActors());
+  EXPECT_EQ(numConstraintsBefore, _scene->GetNumConstraints());
+
+  // Step afterward to detect dangling internal simulation state that public counts would miss.
+  double constexpr kTimeStep = 1e-2;
+  _scene->Step(kTimeStep);
+  EXPECT_NEAR_EQ(kTimeStep, _scene->GetTotalSimulationTime());
+}
+
+// nonCollidingLinks naming a link that does not exist must fail validation before any actor is
+// created, leaving the scene unchanged (mirrors InvalidSkinContactLeavesSceneUnchanged).
+TEST_F(CreateSkinnedArticulatedActorTest, NonCollidingLinksRejectsUnknownLinkName) {
+  auto params = MakeMinimalSkinnedParams(CreateUnitCubeTetMeshShapeWithSkinning(_mochiContext));
+  params.skin->nonCollidingLinks = DynamicArray<DynamicString>{"does_not_exist"};
+  int const numActorsBefore = _scene->GetNumActors();
+
+  EXPECT_EQ(nullptr, _scene->CreateArticulatedActor(params, test::ExpectNotOK{}));
+  EXPECT_EQ(numActorsBefore, _scene->GetNumActors());
+}
+
+// An empty nonCollidingLinks entry is invalid (mirrors softAttachLinks validation).
+TEST_F(CreateSkinnedArticulatedActorTest, NonCollidingLinksRejectsEmptyName) {
+  auto params = MakeMinimalSkinnedParams(CreateUnitCubeTetMeshShapeWithSkinning(_mochiContext));
+  params.skin->nonCollidingLinks = DynamicArray<DynamicString>{""};
+
+  EXPECT_EQ(nullptr, _scene->CreateArticulatedActor(params, test::ExpectNotOK{}));
+}
+
+// Unset nonCollidingLinks preserves the original behavior: no link collides, so none carries a
+// rigid contact tag and the skin is the sole colliding actor.
+TEST_F(CreateSkinnedArticulatedActorTest, NonCollidingLinksUnsetMakesAllLinksNonColliding) {
+  entt::registry& reg = GetRegistry();
+  auto params = MakeTwoLinkSkinnedParams(_mochiContext);
+
+  auto* actor = _scene->CreateArticulatedActor(params, test::ExpectOK{});
+  ASSERT_NE(nullptr, actor);
+  auto const& members = reg.get<CGroupMembers const>(GetEntity(actor->GetHandle())).actors;
+  ASSERT_EQ(2, static_cast<int>(members.size()));
+  EXPECT_FALSE(reg.all_of<TagUseContact>(members[0]));
+  EXPECT_FALSE(reg.all_of<TagUseContact>(members[1]));
+}
+
+// A set nonCollidingLinks removes only the listed links from the colliding set: they drop their
+// rigid contact (the skin collides in their place) while unlisted links keep theirs.
+TEST_F(CreateSkinnedArticulatedActorTest, NonCollidingLinksKeepsRigidContactForUnlistedLink) {
+  entt::registry& reg = GetRegistry();
+  auto params = MakeTwoLinkSkinnedParams(_mochiContext);
+  params.skin->nonCollidingLinks = DynamicArray<DynamicString>{"link_0"};
+
+  auto* actor = _scene->CreateArticulatedActor(params, test::ExpectOK{});
+  ASSERT_NE(nullptr, actor);
+  auto const& members = reg.get<CGroupMembers const>(GetEntity(actor->GetHandle())).actors;
+  ASSERT_EQ(2, static_cast<int>(members.size()));
+  EXPECT_FALSE(reg.all_of<TagUseContact>(members[0])); // link_0 listed -> rigid contact off
+  EXPECT_TRUE(reg.all_of<TagUseContact>(members[1])); // link_1 unlisted -> keeps rigid contact
+}
+
+// An explicit empty nonCollidingLinks removes no links: every link keeps its rigid collision.
+TEST_F(CreateSkinnedArticulatedActorTest, NonCollidingLinksEmptyListKeepsAllColliding) {
+  entt::registry& reg = GetRegistry();
+  auto params = MakeTwoLinkSkinnedParams(_mochiContext);
+  params.skin->nonCollidingLinks = DynamicArray<DynamicString>{};
+
+  auto* actor = _scene->CreateArticulatedActor(params, test::ExpectOK{});
+  ASSERT_NE(nullptr, actor);
+  auto const& members = reg.get<CGroupMembers const>(GetEntity(actor->GetHandle())).actors;
+  ASSERT_EQ(2, static_cast<int>(members.size()));
+  EXPECT_TRUE(reg.all_of<TagUseContact>(members[0]));
+  EXPECT_TRUE(reg.all_of<TagUseContact>(members[1]));
+}
+
+// Skin params whose shape handle is invalid describe a skin that cannot exist. Reject them rather
+// than silently discarding every other skin setting (including nonCollidingLinks).
+TEST_F(CreateSkinnedArticulatedActorTest, SkinWithoutValidShapeIsRejected) {
+  auto params = MakeTwoLinkSkinnedParams(_mochiContext);
+  params.skin->shape = ShapeHandle{};
+  int const numActorsBefore = _scene->GetNumActors();
+
+  EXPECT_EQ(nullptr, _scene->CreateArticulatedActor(params, test::ExpectNotOK{}));
+  EXPECT_EQ(numActorsBefore, _scene->GetNumActors());
+}
+
 class CreateBlendedActorTest : public test::MochiSceneTestBase {
  protected:
   // Build minimal SoftSkinnedActorParams describing a one-bone articulated skeleton with
@@ -2181,6 +2533,278 @@ class CreateBlendedActorTest : public test::MochiSceneTestBase {
   }
 };
 
+// The soft-skinned path enables link collision via enableCollidingLinks. With no
+// nonCollidingLinks list that flag alone governs, which is the behavior that predates the list.
+TEST_F(CreateBlendedActorTest, EnableCollidingLinksGovernsWhenNonCollidingLinksUnset) {
+  entt::registry& reg = GetRegistry();
+  auto params = MakeMinimalBlendedParams(
+      CreateUnitCubeTetBlendedSkinShape(_mochiContext, DynamicString{"soft"}));
+  params.skeletonParams.links[0].name = "bone_0";
+  params.enableCollidingLinks = true;
+
+  auto* actor = _scene->CreateSoftSkinnedActor(params, test::ExpectOK{});
+  ASSERT_NE(nullptr, actor);
+  auto const linkHandles = actor->GetNestedLinkActors(test::ExpectOK{});
+  ASSERT_EQ(1, isize(linkHandles));
+  EXPECT_TRUE(reg.all_of<TagUseContact>(GetEntity(linkHandles[0])));
+}
+
+// nonCollidingLinks is honored on the soft-skinned path too: it subtracts from the links
+// enableCollidingLinks turned on, so a listed link ends up non-colliding.
+TEST_F(CreateBlendedActorTest, NonCollidingLinksRemovesLinkEnabledByEnableCollidingLinks) {
+  entt::registry& reg = GetRegistry();
+  auto params = MakeMinimalBlendedParams(
+      CreateUnitCubeTetBlendedSkinShape(_mochiContext, DynamicString{"soft"}));
+  params.skeletonParams.links[0].name = "bone_0";
+  params.enableCollidingLinks = true;
+  params.skeletonParams.skin->nonCollidingLinks = DynamicArray<DynamicString>{"bone_0"};
+
+  auto* actor = _scene->CreateSoftSkinnedActor(params, test::ExpectOK{});
+  ASSERT_NE(nullptr, actor);
+  auto const linkHandles = actor->GetNestedLinkActors(test::ExpectOK{});
+  ASSERT_EQ(1, isize(linkHandles));
+  EXPECT_FALSE(reg.all_of<TagUseContact>(GetEntity(linkHandles[0])));
+}
+
+// A name matching no link is rejected on the soft-skinned path as well, before any actor exists.
+TEST_F(CreateBlendedActorTest, NonCollidingLinksRejectsUnknownLinkName) {
+  auto params = MakeMinimalBlendedParams(
+      CreateUnitCubeTetBlendedSkinShape(_mochiContext, DynamicString{"soft"}));
+  params.skeletonParams.links[0].name = "bone_0";
+  params.skeletonParams.skin->nonCollidingLinks = DynamicArray<DynamicString>{"does_not_exist"};
+  int const numActorsBefore = _scene->GetNumActors();
+
+  EXPECT_EQ(nullptr, _scene->CreateSoftSkinnedActor(params, test::ExpectNotOK{}));
+  EXPECT_EQ(numActorsBefore, _scene->GetNumActors());
+}
+
+// Without a blended surface there is no skin to collide in a listed link's place, so the list is
+// rejected rather than silently leaving those links with no collision at all. Mirrors the
+// boundarySubsampling guard on the same path.
+TEST_F(CreateBlendedActorTest, NonCollidingLinksRejectedWithoutBlendedSurface) {
+  auto params = MakeMinimalBlendedParams(ShapeHandle{});
+  params.skeletonParams.links[0].name = "bone_0";
+  params.skeletonParams.skin->boundarySubsampling.reset();
+  params.skeletonParams.skin->nonCollidingLinks = DynamicArray<DynamicString>{"bone_0"};
+  int const numActorsBefore = _scene->GetNumActors();
+
+  EXPECT_EQ(nullptr, _scene->CreateSoftSkinnedActor(params, test::ExpectNotOK{}));
+  EXPECT_EQ(numActorsBefore, _scene->GetNumActors());
+}
+
+class ExternalPoseResetTest : public CreateBlendedActorTest {
+ protected:
+  enum class Route { Links, Joints, Root };
+
+  [[nodiscard]] static DynamicArray<real> CopyDisplacements(Actor const& actor) {
+    return DynamicArray<real>(actor.GetDisplacements(test::ExpectOK{}));
+  }
+
+  void CheckExternalPoseReset(Route route) {
+    _scene->SetGravity({});
+    auto solverParams = _scene->GetSolverParams();
+    solverParams.integrationMethod = IntegrationMethod::BDF3;
+    _scene->SetSolverParams(solverParams, test::ExpectOK{});
+
+    auto params = MakeMinimalBlendedParams(
+        CreateUnitCubeTetBlendedSkinShape(_mochiContext, DynamicString{"soft"}));
+    params.softParams[0].hasInertia = true;
+    params.softParams[0].hasStress = false;
+    params.softParams[0].hasGravity = false;
+
+    auto* parent = _scene->CreateSoftSkinnedActor(params, test::ExpectOK{});
+    ASSERT_NE(nullptr, parent);
+    auto const linkHandles = parent->GetNestedLinkActors(test::ExpectOK{});
+    auto const softHandles = parent->GetNestedSoftActors(test::ExpectOK{});
+    ASSERT_EQ(1, isize(linkHandles));
+    ASSERT_EQ(1, isize(softHandles));
+    auto* link = _scene->GetActor(linkHandles[0]);
+    auto* nested = _scene->GetActor(softHandles[0]);
+    ASSERT_NE(nullptr, link);
+    ASSERT_NE(nullptr, nested);
+
+    TransformRT const linkInitial = link->GetRootTransform();
+    auto const nestedInitial = CopyDisplacements(*nested);
+    DynamicArray<real> elastic(nestedInitial.size(), 0_r);
+    ASSERT_GT(elastic.size(), 3u);
+    elastic[3] = 0.25_r;
+    nested->SetDisplacements(elastic, test::ExpectOK{});
+
+    for (int i = 0; i < 3; ++i) {
+      _scene->Step(1e-3_r);
+    }
+
+    TransformRT const linkBefore = link->GetRootTransform();
+    TransformRT const rootBefore = parent->GetRootTransform();
+    auto const nestedBefore = CopyDisplacements(*nested);
+    auto const parentBefore = CopyDisplacements(*parent);
+    ASSERT_TRUE(NearEqual(linkInitial, linkBefore, kTolerance));
+    ASSERT_FALSE(test::NearEqualSpan(nestedInitial, nestedBefore, kTolerance));
+    ASSERT_TRUE(test::NearEqualSpan(parentBefore, nestedBefore, kTolerance));
+
+    auto& reg = GetRegistry();
+    entt::entity const parentEntity = GetEntity(parent);
+    entt::entity const linkEntity = GetEntity(link);
+    entt::entity const nestedEntity = GetEntity(nested);
+    ASSERT_FALSE(reg.get<CIntegrationArticulatedReducedPose const>(parentEntity).prevSteps.empty());
+    ASSERT_FALSE(reg.get<CIntegrationArticulatedJointVels const>(parentEntity).prevSteps.empty());
+    ASSERT_FALSE(reg.get<CIntegrationRigidVels const>(linkEntity).prevSteps.empty());
+    ASSERT_FALSE(reg.get<CIntegrationDisplacementSlices const>(nestedEntity).prevSteps.empty());
+    ASSERT_FALSE(reg.get<CConservativeStepBounds const>(linkEntity).needsNextStepRelaxation);
+    ASSERT_FALSE(reg.get<CConservativeStepBounds const>(nestedEntity).needsNextStepRelaxation);
+
+    Real3 constexpr kTranslation{1_r, 0_r, 0_r};
+    switch (route) {
+      case Route::Links: {
+        DynamicArray<TransformRT> links(1);
+        parent->GetArticulatedLinkTransforms(links, test::ExpectOK{});
+        links[0].SetTranslation(links[0].GetTranslation() + kTranslation);
+        parent->SetArticulatedPoseFromLinks(links, test::ExpectOK{});
+        break;
+      }
+      case Route::Joints: {
+        DynamicArray<real> pose(parent->GetNumDofs());
+        parent->GetArticulatedPose(pose, test::ExpectOK{});
+        ASSERT_FALSE(pose.empty());
+        pose[0] += kTranslation[0];
+        parent->SetArticulatedPoseFromJoints(pose, test::ExpectOK{});
+        break;
+      }
+      case Route::Root: {
+        TransformRT root = rootBefore;
+        root.SetTranslation(root.GetTranslation() + kTranslation);
+        parent->SetRootTransform(root, test::ExpectOK{});
+        break;
+      }
+    }
+
+    Real3 const translationBefore =
+        route == Route::Root ? rootBefore.GetTranslation() : linkBefore.GetTranslation();
+    Real3 const translationAfter = route == Route::Root
+        ? parent->GetRootTransform().GetTranslation()
+        : link->GetRootTransform().GetTranslation();
+    EXPECT_TRUE(NearEqual(translationBefore + kTranslation, translationAfter, kTolerance));
+    auto const nestedAfter = CopyDisplacements(*nested);
+    auto const parentAfter = CopyDisplacements(*parent);
+    EXPECT_TRUE(DisplacementsMatchTranslation(nestedBefore, nestedAfter, kTranslation, kTolerance));
+    if (route == Route::Root) {
+      EXPECT_TRUE(test::NearEqualSpan(parentBefore, parentAfter, kTolerance));
+    } else {
+      EXPECT_TRUE(test::NearEqualSpan(parentAfter, nestedAfter, kTolerance));
+    }
+
+    EXPECT_TRUE(reg.get<CIntegrationArticulatedReducedPose const>(parentEntity).prevSteps.empty());
+    EXPECT_TRUE(reg.get<CIntegrationArticulatedJointVels const>(parentEntity).prevSteps.empty());
+    EXPECT_TRUE(reg.get<CIntegrationRigidVels const>(linkEntity).prevSteps.empty());
+    EXPECT_TRUE(reg.get<CIntegrationDisplacementSlices const>(nestedEntity).prevSteps.empty());
+    EXPECT_TRUE(reg.get<CConservativeStepBounds const>(linkEntity).needsNextStepRelaxation);
+    EXPECT_TRUE(reg.get<CConservativeStepBounds const>(nestedEntity).needsNextStepRelaxation);
+  }
+};
+
+// Guards link-authored resets against stale dependent state and integration history.
+TEST_F(ExternalPoseResetTest, FromLinksPublishesDerivedState) {
+  CheckExternalPoseReset(Route::Links);
+}
+
+// Guards joint-authored resets against stale dependent state and integration history.
+TEST_F(ExternalPoseResetTest, FromJointsPublishesDerivedState) {
+  CheckExternalPoseReset(Route::Joints);
+}
+
+// Guards root-transform resets against stale dependent state and integration history.
+TEST_F(ExternalPoseResetTest, FromRootPublishesDerivedState) {
+  CheckExternalPoseReset(Route::Root);
+}
+
+TEST_F(CreateBlendedActorTest, NestedDisplacementSettersPublishDerivedState) {
+  real constexpr kSoftWeight = 0.5_r;
+  auto params = MakeMinimalBlendedParams(
+      CreateUnitCubeTetBlendedSkinShape(_mochiContext, DynamicString{"soft"}, kSoftWeight));
+  params.hasInertia = true;
+  params.softParams[0].hasInertia = false;
+  params.softParams[0].hasStress = false;
+
+  auto* parent = _scene->CreateSoftSkinnedActor(params, test::ExpectOK{});
+  ASSERT_NE(nullptr, parent);
+  auto const softHandles = parent->GetNestedSoftActors(test::ExpectOK{});
+  ASSERT_EQ(1, isize(softHandles));
+  auto* nested = _scene->GetActor(softHandles[0]);
+  ASSERT_NE(nullptr, nested);
+
+  DynamicArray<real> jointVelocity(6, 0_r);
+  jointVelocity[5] = 1_r;
+  parent->SetArticulatedJointVelocities(jointVelocity, test::ExpectOK{});
+
+  auto& reg = GetRegistry();
+  entt::entity const parentEntity = GetEntity(parent);
+  entt::entity const nestedEntity = GetEntity(nested);
+  DynamicArray<real> const childBaseline(nested->GetDisplacements(test::ExpectOK{}));
+  DynamicArray<real> const parentBaseline(parent->GetDisplacements(test::ExpectOK{}));
+  auto const& childVelocity =
+      reg.get<CVelocitySlice<real, TimeStep::Current, DisplacementLayer::Skinned> const>(
+             nestedEntity)
+          .value;
+  ColumnVector<real> const childVelocityBaseline = childVelocity;
+  auto& parentVelocity =
+      reg.get<CVelocitySlice<real, TimeStep::Current, DisplacementLayer::Skinned>>(parentEntity)
+          .value;
+  parentVelocity.SetConstant(123_r);
+  ColumnVector<real> const parentVelocityBaseline = parentVelocity;
+  reg.get<CConservativeStepBounds>(nestedEntity).needsNextStepRelaxation = false;
+  reg.get<CConservativeStepBounds>(parentEntity).needsNextStepRelaxation = false;
+
+  // A rotational skeleton velocity makes the skinned velocity depend on node position.
+  DynamicArray<real> elastic(childBaseline.size(), 0_r);
+  ASSERT_GT(elastic.size(), 3u);
+  elastic[3] = 0.25_r;
+  nested->SetDisplacements(elastic, test::ExpectOK{});
+
+  DynamicArray<real> const childAfterSet(nested->GetDisplacements(test::ExpectOK{}));
+  DynamicArray<real> const parentAfterSet(parent->GetDisplacements(test::ExpectOK{}));
+  EXPECT_FALSE(test::NearEqualSpan(childBaseline, childAfterSet, kTolerance));
+  ASSERT_EQ(parentBaseline.size(), childBaseline.size());
+  ASSERT_EQ(childAfterSet.size(), childBaseline.size());
+  DynamicArray<real> expectedParent(parentBaseline);
+  for (int i = 0; i < isize(expectedParent); ++i) {
+    expectedParent[i] += kSoftWeight * (childAfterSet[i] - childBaseline[i]);
+  }
+  EXPECT_TRUE(test::NearEqualSpan(expectedParent, parentAfterSet, kTolerance));
+
+  ColumnVector<real> const childVelocityAfterSet = childVelocity;
+  ColumnVector<real> const childVelocityChange = childVelocityAfterSet - childVelocityBaseline;
+  EXPECT_GT(childVelocityChange.Norm(), kTolerance);
+  Compare(AsConstView(parentVelocityBaseline), AsConstView(parentVelocity), kTolerance);
+  EXPECT_TRUE(reg.get<CConservativeStepBounds const>(nestedEntity).needsNextStepRelaxation);
+  EXPECT_TRUE(reg.get<CConservativeStepBounds const>(parentEntity).needsNextStepRelaxation);
+
+  // Repeating the same update must not apply blending a second time.
+  nested->SetDisplacements(elastic, test::ExpectOK{});
+  EXPECT_SPAN_EQ(parent->GetDisplacements(test::ExpectOK{}), parentAfterSet);
+  Compare(AsConstView(childVelocityAfterSet), AsConstView(childVelocity), kTolerance);
+  // Resetting elastic state must restore the skeleton-driven displacement and velocity.
+  nested->SetZeroDisplacementsAndVelocities(test::ExpectOK{});
+
+  EXPECT_TRUE(
+      test::NearEqualSpan(childBaseline, nested->GetDisplacements(test::ExpectOK{}), kTolerance));
+  EXPECT_TRUE(
+      test::NearEqualSpan(parentBaseline, parent->GetDisplacements(test::ExpectOK{}), kTolerance));
+  auto const& currentDisplacement =
+      reg.get<CDisplacementSlice<real, TimeStep::Current> const>(nestedEntity);
+  auto const& previousDisplacement =
+      reg.get<CDisplacementSlice<real, TimeStep::Previous> const>(nestedEntity);
+  auto const& currentVelocity =
+      reg.get<CVelocitySlice<real, TimeStep::Current> const>(nestedEntity);
+  auto const& previousVelocity =
+      reg.get<CVelocitySlice<real, TimeStep::Previous> const>(nestedEntity);
+  EXPECT_EQ(0_r, currentDisplacement.value.Norm());
+  EXPECT_EQ(0_r, previousDisplacement.value.Norm());
+  EXPECT_EQ(0_r, currentVelocity.value.Norm());
+  EXPECT_EQ(0_r, previousVelocity.value.Norm());
+  Compare(AsConstView(childVelocityBaseline), AsConstView(childVelocity), kTolerance);
+  Compare(AsConstView(parentVelocityBaseline), AsConstView(parentVelocity), kTolerance);
+}
+
 TEST_F(CreateBlendedActorTest, TetMesh) {
   auto params = MakeMinimalBlendedParams(
       CreateUnitCubeTetBlendedSkinShape(_mochiContext, DynamicString{"soft"}));
@@ -2199,6 +2823,52 @@ TEST_F(CreateBlendedActorTest, TriMesh) {
   EXPECT_EQ(ActorType::Articulated, actor->GetType());
 }
 
+TEST_F(CreateBlendedActorTest, NonIdentityRootKeepsRestDisplacementsLocal) {
+  auto params = MakeMinimalBlendedParams(
+      CreateUnitCubeTetBlendedSkinShape(_mochiContext, DynamicString{"soft"}));
+  params.skeletonParams.worldFromRoot = TransformRT{
+      Quaternion::FromRotationVector(Real3{0.2_r, -0.3_r, 0.4_r}), Real3{1_r, 2_r, 3_r}};
+
+  auto* actor = _scene->CreateSoftSkinnedActor(params, test::ExpectOK{});
+  ASSERT_NE(nullptr, actor);
+
+  auto const displacements = actor->GetDisplacements(test::ExpectOK{});
+  DynamicArray<real> const expected(displacements.size(), 0_r);
+  EXPECT_TRUE(test::NearEqualSpan(expected, displacements, kTolerance));
+
+  DynamicArray<real> pose(actor->GetNumDofs());
+  actor->GetArticulatedPose(pose, test::ExpectOK{});
+  Real3 constexpr kTranslation{0.1_r, -0.2_r, 0.3_r};
+  for (int axis = 0; axis < 3; ++axis) {
+    pose[axis] += kTranslation[axis];
+  }
+  actor->SetArticulatedPoseFromJoints(pose, test::ExpectOK{});
+
+  EXPECT_TRUE(DisplacementsMatchTranslation(
+      expected, actor->GetDisplacements(test::ExpectOK{}), kTranslation, kTolerance));
+}
+
+TEST_F(CreateBlendedActorTest, EmptyActiveNodesLeaveDerivedStateUnchanged) {
+  auto params = MakeMinimalBlendedParams(
+      CreateUnitCubeTetBlendedSkinShape(_mochiContext, DynamicString{"soft"}));
+  params.skeletonParams.skin->boundarySubsampling = MakeSubsampling(0_r);
+  auto* actor = _scene->CreateSoftSkinnedActor(params, test::ExpectOK{});
+  ASSERT_NE(nullptr, actor);
+
+  auto& reg = GetRegistry();
+  entt::entity const entity = GetEntity(actor);
+  ASSERT_EQ(0, reg.get<CActiveUniqueNodes const>(entity).Count());
+  auto& displacements =
+      reg.get<CDisplacementSlice<real, TimeStep::Current, DisplacementLayer::Skinned>>(entity)
+          .value;
+  displacements.SetConstant(9_r);
+  ColumnVector<real> const expectedDisplacements(displacements);
+
+  blended::UpdateDerivedStatePipeline(reg, MakeSingletonConstSpan(entity));
+
+  EXPECT_TRUE(test::NearEqualMatrices(expectedDisplacements, displacements));
+}
+
 // A soft-skinned actor cannot be bound to a zero-dof (all-Hard) skeleton: there is no joint
 // Jacobian to deform the soft bodies, so creation must fail with an error.
 TEST_F(CreateBlendedActorTest, ZeroDofHardSkeletonRejected) {
@@ -2207,4 +2877,35 @@ TEST_F(CreateBlendedActorTest, ZeroDofHardSkeletonRejected) {
   params.skeletonParams.joints = {{.type = ArticulatedJointType::Hard}};
 
   EXPECT_EQ(nullptr, _scene->CreateSoftSkinnedActor(params, test::ExpectNotOK{}));
+}
+
+// Destroying the blended skeleton must also destroy the nested soft actors it owns.
+TEST_F(CreateBlendedActorTest, DestroyBlendedActorDestroysNestedActors) {
+  auto params = MakeMinimalBlendedParams(
+      CreateUnitCubeTetBlendedSkinShape(_mochiContext, DynamicString{"soft"}));
+
+  Actor const* actor = _scene->CreateSoftSkinnedActor(params, test::ExpectOK{});
+  ASSERT_NE(nullptr, actor);
+  EXPECT_GT(_scene->GetNumActors(), 1);
+
+  _scene->DestroyActor(actor->GetHandle());
+
+  EXPECT_EQ(0, _scene->GetNumActors());
+}
+
+TEST_F(CreateBlendedActorTest, MissingSecondSoftBlendingDataLeavesSceneUnchanged) {
+  auto params = MakeMinimalBlendedParams(
+      CreateUnitCubeTetBlendedSkinShape(_mochiContext, DynamicString{"soft"}));
+  auto secondSoft = params.softParams[0];
+  secondSoft.name = "other_soft";
+  params.softParams.push_back(std::move(secondSoft));
+  int const numActorsBefore = _scene->GetNumActors();
+  int const numConstraintsBefore = _scene->GetNumConstraints();
+
+  // The skin has data for the first soft actor only, so blending fails after both are created.
+  Actor const* actor = _scene->CreateSoftSkinnedActor(params, test::ExpectNotOK{});
+
+  EXPECT_EQ(nullptr, actor);
+  EXPECT_EQ(numActorsBefore, _scene->GetNumActors());
+  EXPECT_EQ(numConstraintsBefore, _scene->GetNumConstraints());
 }

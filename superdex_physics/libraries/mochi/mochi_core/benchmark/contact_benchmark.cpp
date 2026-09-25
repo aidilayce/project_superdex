@@ -92,7 +92,8 @@ static void ComputeBatchCollisionForceDForce(benchmark::State& state) {
       benchmark::Counter(state.iterations() * kBatchSize, benchmark::Counter::kIsRate);
 }
 
-static constexpr int kBatchSize = Simd<real>::kSize;
+// TODO[T289584846] - Match actual batch size used by production code.
+static constexpr int kBatchSize = Min(Simd<real>::kSize, kCollResponseMaxBatchSize);
 
 #define MOCHI_CONTACT_BENCHMARK(benchmarkName, ...)                \
   BENCHMARK_TEMPLATE(ComputeBatchCollisionForceDForce, kBatchSize) \

@@ -140,6 +140,13 @@ TEST(IslandOperators, SingleSparseActor) {
   auto global2 = ops2.CondenseFullMatrix();
   std::visit([&](auto const& A) { EXPECT_TRUE(NearEqualMatrices(actorMat, A)); }, global2);
 
+  std::vector<AnyInteractionMatrixViewInfo<real const>> interactionMatrices;
+  interactionMatrices.emplace_back(0, 0, actorMatAsBlockable, /*symmetricPair*/ std::nullopt);
+  IslandOperators ops3(actorMatricesAsBlockable, interactionMatrices, {});
+  auto expectedWithInteraction = Matrix<real>{2_r * ToMatrix(actorMat)};
+  EXPECT_TRUE(NearEqualMatrices(expectedWithInteraction, ops3.FullSparseMatrix()));
+  EXPECT_TRUE(NearEqualMatrices(expectedWithInteraction, ops3.FullBlockSparseMatrix<3>()));
+
   // 'Apply' and 'ApplyToRange' methods.
   SparseMatrix<real> fullSp = ops1.FullSparseMatrix();
   ColumnVector<real> x(ops1.Rows()), y0(ops1.Cols()), y1(ops1.Cols()), y2(ops1.Cols());

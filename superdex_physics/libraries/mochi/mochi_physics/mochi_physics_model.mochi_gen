@@ -1,3 +1,17 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 namespace model;
 
 // @brief Load model data from a file. Then, @ref model::AutoCorrect and @ref model::Validate
@@ -114,7 +128,7 @@ fn model::AutoCorrect(ModelData& data) -> void [export, mochi_error, no_capi];
 // Non-uniform scale by absolute value discards the precomputed SDF. If an SDF collider later
 // requires SDF data, Mochi regenerates the SDF from the transformed mesh at runtime, which may be
 // expensive.
-fn model::BakeTransform(ModelData& data, Real3 const& scale = kReal3Ones, Quaternion const& rotation = kQuaternionIdentity, Real3 const& translation = kReal3Zeros) -> void [export, overloaded, mochi_error, no_capi];
+fn model::BakeTransform(ModelData& data, Real3 const& scale = kReal3Ones, Quaternion const& rotation = kQuaternionIdentity, Real3 const& translation = kReal3Zeros) -> void [export, overloaded, bind_task_scheduler, mochi_error, no_capi];
 
 // @brief Modify the @ref ModelData by applying a scale, rotation, and translation (in that order).
 //
@@ -135,7 +149,7 @@ fn model::BakeTransform(ModelData& data, Real3 const& scale = kReal3Ones, Quater
 // Non-uniform scale by absolute value discards the precomputed SDF. If an SDF collider later
 // requires SDF data, Mochi regenerates the SDF from the transformed mesh at runtime, which may be
 // expensive.
-fn model::BakeTransform(ModelData& data, Real3 const& scale = kReal3Ones, TransformRT const& transform = kTransformRTIdentity) -> void [export, overloaded, mochi_error, no_capi];
+fn model::BakeTransform(ModelData& data, Real3 const& scale = kReal3Ones, TransformRT const& transform = kTransformRTIdentity) -> void [export, overloaded, bind_task_scheduler, mochi_error, no_capi];
 
 // @brief Modify the @ref MeshData to convert it from one @ref CoordinateSpace to another.
 //
@@ -147,7 +161,7 @@ fn model::BakeTransform(ModelData& data, Real3 const& scale = kReal3Ones, Transf
 // @param[in,out] data @ref MeshData to modify.
 // @param[in] fromSpace Coordinate space the mesh is currently expressed in.
 // @param[in] toSpace Coordinate space to convert the mesh to.
-fn model::BakeCoordinateSpaceTransform(MeshData& data, CoordinateSpace const& fromSpace, CoordinateSpace const& toSpace) -> void [export, overloaded, mochi_error, no_capi];
+fn model::BakeCoordinateSpaceTransform(MeshData& data, CoordinateSpace const& fromSpace, CoordinateSpace const& toSpace) -> void [export, overloaded, bind_task_scheduler, mochi_error, no_capi];
 
 // @brief Modify the @ref ModelData to convert it from one @ref CoordinateSpace to another.
 //
@@ -161,7 +175,7 @@ fn model::BakeCoordinateSpaceTransform(MeshData& data, CoordinateSpace const& fr
 // @param[in,out] data @ref ModelData to modify.
 // @param[in] fromSpace Coordinate space the model is currently expressed in.
 // @param[in] toSpace Coordinate space to convert the model to.
-fn model::BakeCoordinateSpaceTransform(ModelData& data, CoordinateSpace const& fromSpace, CoordinateSpace const& toSpace) -> void [export, overloaded, mochi_error, no_capi];
+fn model::BakeCoordinateSpaceTransform(ModelData& data, CoordinateSpace const& fromSpace, CoordinateSpace const& toSpace) -> void [export, overloaded, bind_task_scheduler, mochi_error, no_capi];
 
 // @brief Compute and bake an SDF grid into the model data.
 //
@@ -172,7 +186,7 @@ fn model::BakeCoordinateSpaceTransform(ModelData& data, CoordinateSpace const& f
 // @param[in] params Parameters to control grid resolution and padding.
 //
 // @warning SDF computation may be slow.
-fn model::BakeSdf(ModelData& data, GridSdfParams const& params = kGridSdfParamsDefault) -> void [export, mochi_error, no_capi];
+fn model::BakeSdf(ModelData& data, GridSdfParams const& params = kGridSdfParamsDefault) -> void [export, bind_task_scheduler, mochi_error, no_capi];
 
 // @brief Flip mesh winding order by swapping the connectivity indices within each element.
 //
@@ -181,8 +195,9 @@ fn model::FlipWindingOrder(MeshData& data) -> void [export, overloaded, mochi_er
 
 // @brief Flip mesh winding order by swapping the connectivity indices within each element.
 //
-// @details Operates on both the simulation mesh (@ref ModelData::mesh) and the visual mesh
-// (@ref ModelData::visualMesh) when present. Implicit shapes and SDF data are not modified.
+// @details Operates on the simulation mesh (@ref ModelData::mesh), visual mesh
+// (@ref ModelData::visualMesh), and contact skin (@ref ModelData::contactSkinMesh) when present.
+// Implicit shapes and SDF data are not modified.
 //
 // @param[in,out] data @ref ModelData to modify.
 fn model::FlipWindingOrder(ModelData& data) -> void [export, overloaded, mochi_error, no_capi];

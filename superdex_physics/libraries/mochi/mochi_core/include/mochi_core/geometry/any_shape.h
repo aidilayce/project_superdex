@@ -39,6 +39,10 @@ using AnyShape = std::variant<Sphere, Aabb, Obb, Plane>;
  Utils for AnyShape
 */
 
+/**
+  Output spans must match inPoints.size(). The returned count identifies the densely written prefix
+  of both output spans; elements after that prefix are left unwritten.
+*/
 int FindPointsInAnyShape(
     AnyShape const& anyShape,
     Span<Real3 const> inPoints,

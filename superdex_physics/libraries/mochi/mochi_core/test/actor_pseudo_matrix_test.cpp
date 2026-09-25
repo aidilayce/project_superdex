@@ -111,7 +111,7 @@ TEST(ActorPseudoMatrix, BlockSparseActorToBlockSparseMatrix) {
   ActorPseudoMatrix<real> ops{0, actorMat, {}};
   EXPECT_EQ(6, ops.Rows());
   EXPECT_EQ(6, ops.Cols());
-  auto bsrMatrix = ToBlockSparseMatrix<3>(ops);
+  auto bsrMatrix = ToBlockSparseMatrix<3, MissingSparsityPolicy::Discard>(ops);
   EXPECT_EQ(actorMat.Rows(), bsrMatrix.Rows());
   EXPECT_EQ(actorMat.BlockRows(), bsrMatrix.BlockRows());
   EXPECT_EQ(actorMat.Cols(), bsrMatrix.Cols());
@@ -397,7 +397,7 @@ TEST(ActorPseudoMatrix, ActorBlockSparseWithContactBlockSparseToBlockSparseMatri
         0,
         AsConstView(actorBsr),
         {{20, 20, contact0, std::nullopt}, {13, 13, contact1, std::nullopt}}};
-    auto bsrMatrix = ToBlockSparseMatrix<3>(ops);
+    auto bsrMatrix = ToBlockSparseMatrix<3, MissingSparsityPolicy::Discard>(ops);
     EXPECT_EQ(actorSize, bsrMatrix.Rows());
     EXPECT_EQ(actorNNZB, bsrMatrix.NumNonZeroBlocks());
     auto mat1 = ToMatrix(bsrMatrix);
@@ -413,7 +413,7 @@ TEST(ActorPseudoMatrix, ActorBlockSparseWithContactBlockSparseToBlockSparseMatri
         AsConstView(actorBsr),
         {{offsetC0, offsetC0, contact0, /*symmetricPair*/ std::nullopt},
          {offsetC1, offsetC1, contact1, /*symmetricPair*/ std::nullopt}}};
-    auto bsrMatrix = ToBlockSparseMatrix<3>(ops);
+    auto bsrMatrix = ToBlockSparseMatrix<3, MissingSparsityPolicy::Discard>(ops);
     EXPECT_EQ(actorSize, bsrMatrix.Rows());
     EXPECT_EQ(actorNNZB, bsrMatrix.NumNonZeroBlocks());
     auto mat1 = ToMatrix(bsrMatrix);
@@ -441,7 +441,7 @@ TEST(ActorPseudoMatrix, ActorBlockSparseWithContactBlockSparseToBlockSparseMatri
         AsConstView(actorBsr),
         {{offsetC0, offsetC0, contact0, /*symmetricPair*/ std::nullopt},
          {offsetC1, offsetC1, contact1, /*symmetricPair*/ std::nullopt}}};
-    auto bsrMatrix = ToBlockSparseMatrix<3>(ops);
+    auto bsrMatrix = ToBlockSparseMatrix<3, MissingSparsityPolicy::Discard>(ops);
     EXPECT_EQ(actorSize, bsrMatrix.Rows());
     EXPECT_EQ(actorNNZB, bsrMatrix.NumNonZeroBlocks());
     auto mat1 = ToMatrix(bsrMatrix);
@@ -502,9 +502,13 @@ static void ExpectOffDiagonalInteractionOutsideActorDoesNotChangeBlockSparseActo
 
   real constexpr kExactTolerance = 0_r;
   EXPECT_TRUE(NearEqualMatrices(
-      expected, ToMatrix(ToBlockSparseMatrix<kBlockSize>(rowsOverlapOnly)), kExactTolerance));
+      expected,
+      ToMatrix(ToBlockSparseMatrix<kBlockSize, MissingSparsityPolicy::Discard>(rowsOverlapOnly)),
+      kExactTolerance));
   EXPECT_TRUE(NearEqualMatrices(
-      expected, ToMatrix(ToBlockSparseMatrix<kBlockSize>(colsOverlapOnly)), kExactTolerance));
+      expected,
+      ToMatrix(ToBlockSparseMatrix<kBlockSize, MissingSparsityPolicy::Discard>(colsOverlapOnly)),
+      kExactTolerance));
 }
 
 template <int kBlockSize>
@@ -556,7 +560,7 @@ TEST(ActorPseudoMatrix, ActorBlockSparseWithContactSparseToBlockSparseMatrix) {
   for (auto aOffset : {0, 11, 23, 25}) {
     ActorPseudoMatrix<real> ops{
         aOffset, AsConstView(actorBsr), {{20, 20, contactSparse, std::nullopt}}};
-    auto bsrMatrix = ToBlockSparseMatrix<3>(ops);
+    auto bsrMatrix = ToBlockSparseMatrix<3, MissingSparsityPolicy::Discard>(ops);
     EXPECT_EQ(actorSize, bsrMatrix.Rows());
     EXPECT_EQ(actorNNZB, bsrMatrix.NumNonZeroBlocks());
     auto mat1 = ToMatrix(bsrMatrix);
@@ -570,7 +574,7 @@ TEST(ActorPseudoMatrix, ActorBlockSparseWithContactSparseToBlockSparseMatrix) {
       auto const diffOffset = cOffset - aOffset;
       ActorPseudoMatrix<real> ops{
           aOffset, AsConstView(actorBsr), {{cOffset, cOffset, contactSparse, std::nullopt}}};
-      auto bsrMatrix = ToBlockSparseMatrix<3>(ops);
+      auto bsrMatrix = ToBlockSparseMatrix<3, MissingSparsityPolicy::Discard>(ops);
       EXPECT_EQ(actorSize, bsrMatrix.Rows());
       EXPECT_EQ(actorNNZB, bsrMatrix.NumNonZeroBlocks());
       auto mat1 = ToMatrix(bsrMatrix);
@@ -636,7 +640,7 @@ TEST(ActorPseudoMatrix, ActorBlockSparseWithContactSparseToBlockSparseMatrix) {
           aOffset,
           AsConstView(actorBsrLarge),
           {{cOffset, cOffset, contactSparseNonblockable, std::nullopt}}};
-      auto bsrMatrix = ToBlockSparseMatrix<3>(actorPseudoMat);
+      auto bsrMatrix = ToBlockSparseMatrix<3, MissingSparsityPolicy::Discard>(actorPseudoMat);
       EXPECT_EQ(actorBsrLarge.Rows(), bsrMatrix.Rows());
       EXPECT_EQ(actorBsrLarge.Cols(), bsrMatrix.Cols());
       EXPECT_EQ(actorBsrLarge.NumNonZeroBlocks(), bsrMatrix.NumNonZeroBlocks());

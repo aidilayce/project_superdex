@@ -1517,8 +1517,13 @@ inline void FindPointContactsParallel(
     return;
   }
 
-  // If we don't have enough points for multiple tasks, then forward to FindPointContactsT.
-  if (isize(points) <= minPointsPerTask) {
+  int const numOtherThreads = TaskScheduler::StaticGetNumOtherThreads();
+  int const maxTasks = 2 * (1 + numOtherThreads);
+  int const numTasks = Clamp(isize(points) / minPointsPerTask, 1, maxTasks);
+  MOCHI_ASSERT_VERBOSE(numTasks >= 1);
+
+  // If parallel execution is unavailable or unnecessary, forward to FindPointContactsT.
+  if (numOtherThreads == 0 || numTasks == 1) {
     FindPointContactsT(
         points,
         collider,
@@ -1530,10 +1535,6 @@ inline void FindPointContactsParallel(
         outIsSdfGradUnitary);
     return;
   }
-
-  int maxTasks = 2 * (1 + TaskScheduler::StaticGetNumOtherThreads());
-  int numTasks = Clamp(isize(points) / minPointsPerTask, 1, maxTasks);
-  MOCHI_ASSERT_VERBOSE(numTasks >= 1);
 
   // Show the scope name in the profiler if we're actually doing parallel work
   MOCHI_PROFILE_SCOPE();

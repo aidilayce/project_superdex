@@ -49,6 +49,8 @@ class TransmissionActuator {
   virtual void EnergyGradientHessian(
       real displacement,
       real prevDisplacement,
+      // May be infinite: quasi-static solves (e.g. the IK solver) step with an infinite time step
+      // to drop the inertial terms. Implementations must stay finite in that case.
       real timeStep,
       // (Incremental) potential minimized by the actuator. This is not strictly necessary, and may
       // not be possible to define in all cases, but can be used to improve performance via
@@ -101,8 +103,11 @@ class DisplacementControlActuator : public TransmissionActuator {
       return;
     }
     real const dDisplacement = displacement - _targetDisplacement;
-    real const velocity = (displacement - previousDisplacement) / timeStep;
-    real const force = _stiffness * dDisplacement + _damping * velocity;
+    real const displacementChange = displacement - previousDisplacement;
+    // The damping contribution divides by timeStep, so an infinite time step (quasi-static solves)
+    // makes it vanish cleanly instead of producing 0*inf == NaN.
+    real const dampingOverDt = _damping / timeStep;
+    real const force = _stiffness * dDisplacement + dampingOverDt * displacementChange;
     if (!_allowCompressiveForce && force <= 0_r) {
       if (outEnergy) {
         *outEnergy = 0_r;
@@ -116,13 +121,17 @@ class DisplacementControlActuator : public TransmissionActuator {
       return;
     }
     if (outEnergy) {
-      *outEnergy = 0.5_r * (_stiffness * Sqr(dDisplacement) + _damping * Sqr(velocity) * timeStep);
+      // The damping term is d*(dx/dt)^2*dt, written here as (d/dt)*dx^2 so that an infinite time
+      // step gives 0 instead of 0*inf == NaN. The two forms are algebraically identical for a
+      // finite time step.
+      *outEnergy =
+          0.5_r * (_stiffness * Sqr(dDisplacement) + dampingOverDt * Sqr(displacementChange));
     }
     if (outGradient) {
       *outGradient = force;
     }
     if (outHessian) {
-      *outHessian = _stiffness + _damping / timeStep;
+      *outHessian = _stiffness + dampingOverDt;
     }
   }
 

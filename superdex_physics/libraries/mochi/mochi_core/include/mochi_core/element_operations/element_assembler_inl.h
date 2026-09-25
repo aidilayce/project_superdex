@@ -132,28 +132,26 @@ namespace mochi {
  * one uint64_t holding the `ready`, `acquired` or `finished` state.
  * Though most C++ programmer who have attempted to take advantage of the full C++ memory model
  * may be familiar with the `release` and `acquire` concepts of the model, they may not be aware
- * of the details regarding the writing and reading of several atomic variables. For x86 machines,
- * this does not cause any problem, as the hardware implements a sequentially consistent
- * model always. However for ARM and RISC-V, this is not the case. The following is an explanation
- * of a surprising behavior that the dynamic dispatch has to protect itself against:
+ * of the details regarding the writing and reading of several atomic variables. This protocol
+ * avoids the missed-completion outcome on x86 because its TSO ordering and atomic completion RMW
+ * order the subsequent dependency loads. ARM and RISC-V permit weaker outcomes under
+ * acquire/release ordering alone. The following is an explanation of a surprising behavior that
+ * the dynamic dispatch has to protect itself against:
  *
  *    Let's assume thread A and thread B complete work of aggregates a and b at the same time and
  *    that aggregate c depends on both a and b. A will mark finished_a = true atomically and
- *    B will mark finished_b = true. Such marking has to be done with a release semantic, since
- *    the modifications made by the threads must become visible to other threads that will check
- *    for the completion of that work. After having marked that their work is finished, both threads
- *    will examine the dependencies of `c`. Surprisingly, with a `release` or `release and acquire`
- *    semantic on the atomic operations of A and B, it is possible that both A sees
- *    finished_b == false  and B sees finished_a == false thus leading both to the conclusion that
- *    c is not ready. This is possible because in such case, these architectures do not guarantee
- *    any visible order of operations on different atomic variables. A is allowed to see
- *    a stale value of finished_b that B updates if it is in a different atomic variables than
- *    finished_a and similarly for B.
- *    The only update mode that guarantees that will not happen is a sequentially consistent
- *    update.
+ *    B will mark finished_b = true. After marking their work as finished, both threads examine
+ *    the dependencies of `c`. With only release completion updates and acquire dependency loads,
+ *    it is possible that A sees finished_b == false and B sees finished_a == false. Both threads
+ *    then conclude that c is not ready, and no thread will examine it again.
  *
- *  The `finished` atomics are the only place where the strictest and costliest sequentially
- *  consistent mode of operation is being used.
+ *    To prevent this, both the completion updates and the dependency observations participate in
+ *    the same sequentially consistent order. If both threads missed the other's completion, each
+ *    completion would have to follow the other thread's dependency observation in that order,
+ *    contradicting the program order from each completion to its subsequent observations.
+ *
+ *  The `finished` atomics are the only place in the concurrent protocol where the strictest and
+ *  costliest sequentially consistent mode of operation is used, for both updates and observations.
  *
  */
 
@@ -193,8 +191,7 @@ MOCHI_FORCE_INLINE void GatherBatchElementSolution(
             globalSol[indicesFlat[globalElemIndices[Min(1, kBatchSize - 1)] * kNumEleDofs + d]],
             globalSol[indicesFlat[globalElemIndices[Min(2, kBatchSize - 1)] * kNumEleDofs + d]],
             globalSol[indicesFlat[globalElemIndices[Min(3, kBatchSize - 1)] * kNumEleDofs + d]]};
-    } else {
-      static_assert(V::kSize == 8, "Unsupported SIMD size");
+    } else if constexpr (V::kSize == 8) {
       outBatchElemSol[d] =
           V{globalSol[indicesFlat[globalElemIndices[Min(0, kBatchSize - 1)] * kNumEleDofs + d]],
             globalSol[indicesFlat[globalElemIndices[Min(1, kBatchSize - 1)] * kNumEleDofs + d]],
@@ -204,6 +201,25 @@ MOCHI_FORCE_INLINE void GatherBatchElementSolution(
             globalSol[indicesFlat[globalElemIndices[Min(5, kBatchSize - 1)] * kNumEleDofs + d]],
             globalSol[indicesFlat[globalElemIndices[Min(6, kBatchSize - 1)] * kNumEleDofs + d]],
             globalSol[indicesFlat[globalElemIndices[Min(7, kBatchSize - 1)] * kNumEleDofs + d]]};
+    } else {
+      static_assert(V::kSize == 16, "Unsupported SIMD size");
+      outBatchElemSol[d] =
+          V{globalSol[indicesFlat[globalElemIndices[Min(0, kBatchSize - 1)] * kNumEleDofs + d]],
+            globalSol[indicesFlat[globalElemIndices[Min(1, kBatchSize - 1)] * kNumEleDofs + d]],
+            globalSol[indicesFlat[globalElemIndices[Min(2, kBatchSize - 1)] * kNumEleDofs + d]],
+            globalSol[indicesFlat[globalElemIndices[Min(3, kBatchSize - 1)] * kNumEleDofs + d]],
+            globalSol[indicesFlat[globalElemIndices[Min(4, kBatchSize - 1)] * kNumEleDofs + d]],
+            globalSol[indicesFlat[globalElemIndices[Min(5, kBatchSize - 1)] * kNumEleDofs + d]],
+            globalSol[indicesFlat[globalElemIndices[Min(6, kBatchSize - 1)] * kNumEleDofs + d]],
+            globalSol[indicesFlat[globalElemIndices[Min(7, kBatchSize - 1)] * kNumEleDofs + d]],
+            globalSol[indicesFlat[globalElemIndices[Min(8, kBatchSize - 1)] * kNumEleDofs + d]],
+            globalSol[indicesFlat[globalElemIndices[Min(9, kBatchSize - 1)] * kNumEleDofs + d]],
+            globalSol[indicesFlat[globalElemIndices[Min(10, kBatchSize - 1)] * kNumEleDofs + d]],
+            globalSol[indicesFlat[globalElemIndices[Min(11, kBatchSize - 1)] * kNumEleDofs + d]],
+            globalSol[indicesFlat[globalElemIndices[Min(12, kBatchSize - 1)] * kNumEleDofs + d]],
+            globalSol[indicesFlat[globalElemIndices[Min(13, kBatchSize - 1)] * kNumEleDofs + d]],
+            globalSol[indicesFlat[globalElemIndices[Min(14, kBatchSize - 1)] * kNumEleDofs + d]],
+            globalSol[indicesFlat[globalElemIndices[Min(15, kBatchSize - 1)] * kNumEleDofs + d]]};
     }
   }
 }
@@ -559,11 +575,14 @@ static void DynamicLoadBalancingAssembly(
       double* obj = assemObj ? &localObj : nullptr;
 
       DynamicArray<int> activeElems;
-      activeElems.reserve(2 * nbs.NumElements() / numGroups);
+      bool const useSubset = !isElementActive.empty();
+      if (useSubset) {
+        activeElems.reserve(2 * nbs.NumElements() / numGroups);
+      }
 
-      auto processGroup = [&](Span<int const> groupElements) {
+      auto processGroup = [&, useSubset](Span<int const> groupElements) {
         Span<int const> elemsToProcess = groupElements;
-        if (!isElementActive.empty()) {
+        if (useSubset) {
           activeElems.clear();
           for (auto e : groupElements) {
             if (isElementActive[e]) {

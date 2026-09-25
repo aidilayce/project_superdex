@@ -367,24 +367,37 @@ auto ToBlockSparseMatrix(SparseMatrix<Scalar, CRIdx, Ptr, Storage> const& spmat)
   return BlockSparseMatrix<NonConstScalar, kBlockSizeOutput, NonConstIdx, NonConstPtr>();
 }
 
-/// @brief Convert from ActorPseudoMatrix to block sparse matrix.
-/// @tparam kBlockSize Block size
-/// @tparam kSkipMissingSparsityEntries If true, interaction matrix entries that fall outside the
-/// actor matrix's sparsity pattern are silently dropped. If false (default), it is invalid to have
-/// such entries (asserts in debug builds; undefined behavior in optimized builds). Skipping is
-/// useful for preconditioners, which are approximate by nature and do not require the interaction
-/// sparsity to be a subset of the actor sparsity.
-/// @tparam Scalar Type for the numerical values
-/// @param[in] in Actor pseudo-matrix
+/** @brief How to handle source entries absent from a block-sparse destination pattern. */
+enum class MissingSparsityPolicy {
+  /// @brief Discard source entries absent from the destination sparsity pattern.
+  Discard,
+
+  /// @brief Add each absent source entry's magnitude to the corresponding destination diagonal.
+  ///
+  /// @note The destination sparsity pattern must contain all diagonal blocks.
+  /// @note The resulting contribution is positive semidefinite if the source matrix is symmetric
+  /// positive semidefinite and the destination sparsity pattern is symmetric.
+  AddAbsToDiagonal,
+};
+
+/// @brief Convert an @ref ActorPseudoMatrix to a block sparse matrix.
+/// @tparam kBlockSize Block size.
+/// @tparam kMissingSparsityPolicy How to handle interaction entries outside the actor matrix's
+/// sparsity pattern.
+/// @tparam Scalar Numerical value type.
+/// @param[in] in Actor pseudo-matrix.
 ///
-/// @note The actor matrix has to be a block sparse matrix (block size kBlockSize x kBlockSize).
-/// @note Only the block size 3 is currently supported.
-/// @note Interaction matrices that overlap with the actor matrix must be square and have the same
-/// row and col offsets.
-/// @note When the interaction matrix is sparse and with an overlapping (with the actor matrix)
-/// "component", the overlapping "component" must have a block structure (block size kBlockSize x
-/// kBlockSize).
-template <int kBlockSize, bool kSkipMissingSparsityEntries = false, typename Scalar>
+/// @note The actor matrix must be block sparse with block size @p kBlockSize. Only block sizes 3
+/// and 4 are supported.
+/// @note If both an interaction's global row range and global column range intersect the actor's
+/// range, the interaction must be square and have equal row and column offsets.
+/// @note An overlapping block-sparse interaction with block size @p kBlockSize must be aligned with
+/// the actor's block boundaries. An overlapping block-sparse interaction with another block size
+/// must not have stored blocks in any block row that intersects the actor's row range.
+/// @note A dense interaction must not overlap the actor in both its row and column ranges.
+/// @note Scalar-sparse interactions' offsets need not align with the actor's block boundaries, and
+/// their sparsity need not be blockable.
+template <int kBlockSize, MissingSparsityPolicy kMissingSparsityPolicy, typename Scalar>
 BlockSparseMatrix<std::remove_const_t<Scalar>, kBlockSize, int, int> ToBlockSparseMatrix(
     ActorPseudoMatrix<Scalar> const& in);
 

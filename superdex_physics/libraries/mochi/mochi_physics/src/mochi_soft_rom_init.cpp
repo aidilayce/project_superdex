@@ -19,9 +19,11 @@
 #include "mochi_discretization_functions.h"
 #include "mochi_hyper_reduction.h"
 #include "mochi_rom_jacobian.h"
+#include "mochi_shape.h"
 #include "mochi_soft_rom_components.h"
 #include "mochi_soft_rom_polynomial_crom_systems.h"
 
+#include <mochi_core/contact/contact_types.h>
 #include <mochi_core/geometry/tetrahedral_map.h>
 #include <mochi_core/linear_algebra/qr.h>
 #include <mochi_core/mochi_config.h>
@@ -549,6 +551,10 @@ void mochi::rom::InitSoftActorRom(
   // preconditions (todo: this is not complete)
   //
   MOCHI_ASSERT(shapePtr->GetMesh(), "Cannot initialize ROM actor without valid mesh.");
+  MOCHI_ERROR_IF(
+      flow && flow->flow && flow->flow->numDofs > ColliderJacDofs::kMaxDoFs - RigidSize::kDAll,
+      error,
+      "Deep Flow has more DoFs than supported for collider Jacobians.");
   MOCHI_ERROR_IF_NOT(
       static_cast<int>(romParams.romProjectionStrategy) >= 0 &&
           romParams.romProjectionStrategy < experimental::RomProjectionStrategy::Count,

@@ -21,6 +21,7 @@
 #include <atomic>
 #include <mutex>
 #include <set>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -43,6 +44,12 @@ struct BotContactFilterBuilder {
   // on it and assume its topology (link count and order) does not change. Do not
   // outlive the referenced prefab.
   explicit BotContactFilterBuilder(superdex::robotics::BotPrefab& prefab);
+  // Same, but reads+writes overrides in a separate list `overrides` (topology, defaults, and names
+  // still come from `prefab`). Used for a mod bot: the matrix reads the built/composed bot but
+  // writes into the recipe's ModBotPrefab::contactOverrides, which persists across rebuilds.
+  BotContactFilterBuilder(
+      superdex::robotics::BotPrefab& prefab,
+      mochi::DynamicArray<superdex::robotics::BotContactOverride>& overrides);
 
   // True if Mochi implicitly disables contact between the two links.
   [[nodiscard]] bool IsImplicitlyDisabled(int linkA, int linkB) const;
@@ -56,16 +63,40 @@ struct BotContactFilterBuilder {
   // Make contact between the pair `enable`d. Stores an override only when it
   // differs from the default; otherwise removes any redundant existing override.
   void SetFilter(int linkA, int linkB, bool enable);
-  // Clear all overrides and write the minimal set so every pair is `enable`d.
+  // Clear all link<->link overrides and write the minimal set so every pair is `enable`d.
+  // Skin<->link overrides are left intact (skin rows are governed by SetSkinFilter).
   void SetAll(bool enable);
+
+  // --- Skin<->link contact API (skin is singular, so it is indexed by link column only). ---
+  // The skin<->link default is always "enabled": the skin collides with the bot's links by default.
+  // Only opt-outs (disables) are stored as overrides -- e.g. the skin's own links, which it wraps
+  // and would otherwise fight the joints.
+
+  // True if the bound prefab has a skin.
+  [[nodiscard]] bool HasSkin() const;
+  // The skin's effective reference name (@ref superdex::robotics::GetBotSkinName); empty if no
+  // skin.
+  [[nodiscard]] std::string_view SkinName() const;
+  // The default checkbox state for a skin<->link pair (always enabled).
+  [[nodiscard]] bool SkinDefaultEnabled(int link) const;
+  // True if the bound prefab has an explicit override for the skin<->link pair.
+  [[nodiscard]] bool HasSkinOverride(int link) const;
+  // Effective enabled state for the skin<->link pair (override if present, else default=enabled).
+  [[nodiscard]] bool IsSkinEnabled(int link) const;
+  // Make skin<->link contact `enable`d. Stores an override only when disabled (the non-default),
+  // otherwise removes any redundant existing override.
+  void SetSkinFilter(int link, bool enable);
 
   int numLinks = 0;
   mochi::DynamicArray<bool> implicitDisabledMask; // row-major numLinks*numLinks
 
  private:
   [[nodiscard]] int FindFilterIndex(int linkA, int linkB) const;
+  [[nodiscard]] int FindSkinFilterIndex(int link) const;
 
   superdex::robotics::BotPrefab& _prefab;
+  // The override list read+written by all queries/edits (defaults to _prefab.contactOverrides).
+  mochi::DynamicArray<superdex::robotics::BotContactOverride>& _overrides;
 };
 
 // Reusable collision probe for a fixed bot. Building the scene, articulated actor,

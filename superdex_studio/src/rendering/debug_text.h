@@ -32,7 +32,14 @@ namespace superdex::studio {
 // immediate-mode, submitted every frame, cleared by the owner. Submit from OnRender right next to
 // the debug geometry the label annotates.
 //
-// The labels are ImGui overlay text: always on top of the viewport image, never depth-occluded.
+// The labels are ImGui overlay text on a rounded background chip (the same fill as the viewport's
+// stats overlay, so they stay legible over any scene content): always on top of the viewport image,
+// never depth-occluded.
+//
+// Chips never overlap each other. @ref Show nudges them apart vertically after projecting, so a
+// cluster of labels on nearby geometry stays readable instead of stacking into an illegible pile.
+// Labels on geometry nearer the camera keep their anchored position and farther ones step aside, so
+// the displacement is stable as the camera moves rather than flickering between arrangements.
 //
 // Timing: the studio runs its ImGui pass before its render pass, and the owning @ref Viewport draws
 // and clears these labels at the end of the ImGui pass (@ref DebugDraw is instead cleared at the
@@ -52,9 +59,10 @@ class DebugText {
       filament::math::float4 color = kDefaultColor,
       ImVec2 pixelOffset = {});
 
-  // Projects every queued label with @p viewMatrix / @p projMatrix and emits it into the current
-  // ImGui window's draw list. @p contentOrigin and @p logicalWidth / @p logicalHeight describe the
-  // viewport image in ImGui (logical) coordinates. Labels behind the camera are dropped.
+  // Projects every queued label with @p viewMatrix / @p projMatrix, nudges any that would overlap
+  // apart, and emits them into the current ImGui window's draw list. @p contentOrigin and
+  // @p logicalWidth / @p logicalHeight describe the viewport image in ImGui (logical) coordinates,
+  // and also bound which way a displaced label moves. Labels behind the camera are dropped.
   void Show(
       filament::math::mat4 const& viewMatrix,
       filament::math::mat4 const& projMatrix,

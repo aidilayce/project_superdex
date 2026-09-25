@@ -13,13 +13,13 @@
 # limitations under the License.
 
 [build-system]
-requires = ["scikit-build-core>=0.11"]
+requires = ["scikit-build-core>=1.0"]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "superdex-physics-debugger"
 version = "1.0.0"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.12"
 authors = [{name = "SuperDex Team"}]
 description = "Standalone debugger UI for SuperDex physics scenes"
 readme = "README.md"
@@ -31,6 +31,8 @@ classifiers = [
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering",
 ]
 
@@ -41,12 +43,20 @@ superdex-physics-debugger = "superdex_physics_debugger.__main__:main"
 Homepage = "https://github.com/facebookresearch/project_superdex"
 Repository = "https://github.com/facebookresearch/project_superdex"
 
+[tool.uv]
+managed = false
+
 [tool.scikit-build]
 build-dir = "../build-fp32/{wheel_tag}"
 wheel.packages = ["superdex_physics_debugger"]
 wheel.install-dir = "superdex_physics_debugger/_native"
+wheel.py-api = "py3"
 build.targets = ["mochi_debugger"]
 install.components = ["mochi_debugger"]
+
+[tool.scikit-build.env]
+CC = { env = "CC" }
+CXX = { env = "CXX" }
 
 [tool.scikit-build.cmake]
 source-dir = ".."

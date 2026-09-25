@@ -19,6 +19,7 @@
 #include "mochi_common_components.h"
 #include "mochi_contact.h"
 #include "mochi_discretization_components.h"
+#include "mochi_discretization_functions.h"
 #include "mochi_ecs.h"
 #include "mochi_ecs_utils.h"
 #include "mochi_materials.h"
@@ -215,7 +216,7 @@ template <typename TriElementLow, typename TriElementHigh>
 }
 
 // Assemble just the volume term into CActorSnle.
-MOCHI_API void AssembleBody(
+void AssembleBody(
     AssemblyParams const& params, // external parameter
     ecs::Included<TagShellActor>,
     ecs::CtxGlobal<CSceneGravity const> sceneGravity,
@@ -337,6 +338,7 @@ void AssembleAsyncContact(
     AssemblyParams const& params, // external parameter
     entt::entity e,
     ecs::Included<TagShellActor, TagUseContact>,
+    ecs::Excluded<TagUseDeformableContactSkin>,
     ecs::OptionalTag<TagQueryActiveContacts> queryActiveContacts,
     ecs::CtxGlobal<CSimulationParams const> simParams,
     CTimeIntegratorState const& intState,
@@ -351,29 +353,67 @@ void AssembleAsyncContact(
     CDeformablePointAsyncCollisionsResponse& outResponse,
     CActorSnle& outActorSnle);
 
-// Update CBoundingVolume<TimeStep::Current>.localShape based on the deformation of the shell. kStep
-// defines the data to be used in the update, not the component storing the result. There's no
-// CBoundingVolume<TimeStep::StageStart>, as it's not needed. We do bound checks in stage-start
-// collision detection, but we can use CBoundingVolume<TimeStep::Current> for this.
+template <TimeStep kTimeStep>
+void UpdateContactSkinPositions(
+    ecs::Included<TagShellActor>,
+    ecs::RequiredTag<TagUseDeformableContactSkin>,
+    CTriangularMesh const& physicsMesh,
+    CSurfaceMesh const& contactSkin,
+    CFinalDisplacementRef<kTimeStep> const& displacements,
+    CFemSurfaceDiscretization const& surfaceDisc,
+    CDeformedContactSkinNodes& deformedNodes,
+    CContactSamples<kTimeStep>& outSamples);
+
+template <TimeStep kTimeStep>
+void UpdateContactSkinSamples(
+    ecs::Included<TagShellActor>,
+    ecs::RequiredTag<TagUseDeformableContactSkin>,
+    CFemSurfaceDiscretization const& surfaceDisc,
+    CDeformedContactSkinNodes const& deformedNodes,
+    CContactSamples<kTimeStep>& outSamples);
+
+// Update CBoundingVolume.localShape based on the deformation of the shell. kStep selects the
+// displacement state used to compute the bounds.
 template <TimeStep kStep>
 void UpdateBounds(
     ecs::Included<TagShellActor>,
     CTriangularMesh const& meshComponent,
+    CSurfaceMesh const& surfaceMesh,
     CFinalDisplacementRef<kStep> const& solComponent,
     CPointCloudColliderParams const* pointCloudColliderParams,
-    CBoundingVolume<TimeStep::Current>& outBounds) {
+    CDeformedContactSkinNodes* deformedContactSkinNodes,
+    CBoundingVolume& outBounds) {
   static_assert(kStep == TimeStep::Current || kStep == TimeStep::StageStart);
   MOCHI_PROFILE_SCOPE();
-  auto const& sol = solComponent.value;
-  auto nodeCoordinates = meshComponent.mesh->GetNodeCoordinates();
-  auto nodeDisplacements = Unflatten<Real3 const>(sol.GetConstSpan());
-  Obb bounds = GetObb(CalcAabbWithDisplacements(nodeCoordinates, nodeDisplacements));
-  // NOTE: Contact padding will be automatically added elsewhere if shell-actors become first-class
-  // colliders without separate contact collision detection and parameters.
-  if (pointCloudColliderParams) {
-    bounds = ExpandShape(bounds, pointCloudColliderParams->radius);
+
+  auto const nodeDisplacements = Unflatten<Real3 const>(solComponent.value.GetConstSpan());
+  Aabb bounds;
+  if (!deformedContactSkinNodes || pointCloudColliderParams) {
+    bounds = CalcAabbWithDisplacements(meshComponent.mesh->GetNodeCoordinates(), nodeDisplacements);
+    if (pointCloudColliderParams) {
+      bounds = GetAabb(ExpandShape(GetObb(bounds), pointCloudColliderParams->radius));
+    }
   }
-  outBounds.localShape = bounds;
+
+  if (deformedContactSkinNodes) {
+    MOCHI_ASSERT_VERBOSE(
+        surfaceMesh.embedding != nullptr, "Contact skin requires a linear embedding.");
+    auto const deformedPositions = Unflatten<Real3>(MakeSpan(deformedContactSkinNodes->positions));
+    UpdateLinearEmbeddedNodePositionsFromDisplacements(
+        *surfaceMesh.embedding,
+        Unflatten<Real3 const>(MakeConstSpan(deformedContactSkinNodes->referencePositions)),
+        nodeDisplacements,
+        surfaceMesh.mesh->GetActiveNodes(),
+        deformedPositions);
+    Aabb const contactSkinBounds = CalcAabb(deformedPositions);
+    bounds = pointCloudColliderParams
+        ? Aabb{
+              Min(bounds.VGetMin(), contactSkinBounds.VGetMin()),
+              Max(bounds.VGetMax(), contactSkinBounds.VGetMax())}
+        : contactSkinBounds;
+  }
+
+  outBounds.localShape = GetObb(bounds);
 }
 
 void InitializeOnce(entt::registry& reg);

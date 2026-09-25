@@ -1,3 +1,17 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 // @brief Type of actor.
 //
 // @see Actor, Actor::GetType
@@ -259,13 +273,13 @@ enum QueryType {
 
   // @brief Positions of all mesh nodes. Available via @ref Actor::GetNodePositionsLocal.
   //
-  // @note Only supported for soft, soft-skinned and shell actors.
+  // @note Only supported for standalone soft actors, nested soft actors, and shell actors.
   NodePositions,
 
   // @brief Deformation gradients for elements in deformable actors. Available via @ref
   // Actor::GetElementsDeformationGradient.
   //
-  // @note Only supported for soft and soft-skinned actors (except ROMs).
+  // @note Only supported for standalone and nested soft actors (except ROMs).
   ElementsDeformationGradient,
 
   // @brief Positions of surface mesh nodes. Available via @ref
@@ -303,7 +317,7 @@ enum QueryType {
 
   // @brief Elastic energy of a deformable actor. Available via @ref Actor::GetElasticEnergy.
   //
-  // @note Only supported for soft and soft-skinned actors.
+  // @note Only supported for standalone and nested soft actors.
   ElasticEnergy,
 
   // @brief Contact forces per node. Available via @ref Actor::GetNodeContactForcesWorld.

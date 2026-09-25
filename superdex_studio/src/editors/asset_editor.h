@@ -108,6 +108,15 @@ class AssetEditor : public IAssetReferencer {
   // work.
   virtual void ShowAuxiliaryWindows();
 
+  // The viewport Measure tool's panel, available to any editor with a viewport. Add
+  // MeasureWindowDeclaration() to GetAuxiliaryWindows() and call ShowMeasureWindow() from
+  // ShowAuxiliaryWindows(); everything else (the Ctrl+M toggle, picking, the highlight) is owned by
+  // the Viewport. An editor still has to give the tool geometry to pick, via
+  // GetViewport()->GetMeasureTool()->SetTargetProvider().
+  static char const* MeasureWindowName();
+  static WindowDeclaration MeasureWindowDeclaration();
+  void ShowMeasureWindow();
+
   // Raises an auxiliary window to the front of its dock node, but only if it is currently open.
   // Use instead of ImGui::SetWindowFocus so a closed window is never brought back.
   void FocusWindowIfOpen(char const* name);

@@ -23,6 +23,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <functional>
 #include <type_traits>
 #include <vector>
@@ -56,19 +57,18 @@ static void TestUnaryFunction(
     T min = T(-VecType::kSize),
     T max = T(VecType::kSize)) {
   ASSERT_GE(max, min);
-  T const kValues[] = {
-      T(min + 0.05 * (max - min)),
-      T(min + 0.95 * (max - min)),
-      T(min + 0.4 * (max - min)),
-      T(min + 0.6 * (max - min)),
-      T(min + 0.3 * (max - min)),
-      T(min + 0.7 * (max - min)),
-      T(min + 0.45 * (max - min)),
-      T(min + 0.55 * (max - min))};
-  auto result = vectorFn(Load<VecType>(&kValues[0]));
+  constexpr double kOriginalFractions[] = {0.05, 0.95, 0.4, 0.6, 0.3, 0.7, 0.45, 0.55};
+  std::array<T, VecType::kSize> values{};
   for (int i = 0; i < VecType::kSize; ++i) {
-    T expected = scalarFn(kValues[i]);
-    T actual = Get(result, i);
+    double const fraction = i < 8
+        ? kOriginalFractions[i]
+        : static_cast<double>(i - 7) / static_cast<double>(VecType::kSize - 7);
+    values[i] = T(min + fraction * (max - min));
+  }
+  auto result = vectorFn(Load<VecType>(values.data()));
+  for (int i = 0; i < VecType::kSize; ++i) {
+    T expected = scalarFn(values[i]);
+    T actual = result[i];
     EXPECT_TRUE(compareFn(expected, actual)) << "exepcted " << expected << ", but got " << actual;
   }
   // Also test +/- zero
@@ -77,7 +77,7 @@ static void TestUnaryFunction(
     result = vectorFn(VecType{val});
     T expected = scalarFn(val);
     for (int i = 0; i < VecType::kSize; ++i) {
-      T actual = Get(result, i);
+      T actual = result[i];
       EXPECT_TRUE(compareFn(expected, actual));
     }
   }
@@ -126,14 +126,18 @@ static void TestBinaryFunction(
     std::function<T(T, T)> const& scalarFn,
     std::function<VecType(VecType, VecType)> vectorFn,
     std::function<bool(T, T)> compareFn) {
-  constexpr T kValuesA[] = {T(1), T(-2.25), T(3.5), T(-4.75), T(5.25), T(-6.5), T(7.75), T(-8)};
-  constexpr T kValuesB[] = {T(-2.25), T(3.5), T(4.75), T(-5.75), T(-6.5), T(7.25), T(8), T(-9)};
-  auto va = Load<VecType>(&kValuesA[0]);
-  auto vb = Load<VecType>(&kValuesB[0]);
+  std::array<T, VecType::kSize> valuesA{};
+  std::array<T, VecType::kSize> valuesB{};
+  for (int i = 0; i < VecType::kSize; ++i) {
+    valuesA[i] = T((i % 2 == 0 ? 1.0 : -1.0) * (i + 1.25));
+    valuesB[i] = T((i % 3 == 0 ? -1.0 : 1.0) * (i + 2.5));
+  }
+  auto va = Load<VecType>(valuesA.data());
+  auto vb = Load<VecType>(valuesB.data());
   auto result = vectorFn(va, vb);
   for (int i = 0; i < VecType::kSize; ++i) {
-    T expected = scalarFn(kValuesA[i], kValuesB[i]);
-    T actual = Get(result, i);
+    T expected = scalarFn(valuesA[i], valuesB[i]);
+    T actual = result[i];
     EXPECT_TRUE(compareFn(expected, actual));
   }
 }
@@ -143,16 +147,21 @@ static void TestTernaryFunction(
     std::function<T(T, T, T)> const& scalarFn,
     std::function<VecType(VecType, VecType, VecType)> vectorFn,
     std::function<bool(T, T)> compareFn) {
-  constexpr T kValuesA[] = {T(1), T(-2.25), T(3.5), T(-4.75), T(5.25), T(-6.5), T(7.75), T(-8)};
-  constexpr T kValuesB[] = {T(-2.25), T(3.5), T(4.75), T(-5.75), T(-6.5), T(7.25), T(8), T(-9)};
-  constexpr T kValuesC[] = {T(8), T(7.75), T(6.5), T(5.25), T(-4.75), T(-3.5), T(-2.25), T(-1)};
-  auto va = Load<VecType>(&kValuesA[0]);
-  auto vb = Load<VecType>(&kValuesB[0]);
-  auto vc = Load<VecType>(&kValuesC[0]);
+  std::array<T, VecType::kSize> valuesA{};
+  std::array<T, VecType::kSize> valuesB{};
+  std::array<T, VecType::kSize> valuesC{};
+  for (int i = 0; i < VecType::kSize; ++i) {
+    valuesA[i] = T((i % 2 == 0 ? 1.0 : -1.0) * (i + 1.25));
+    valuesB[i] = T((i % 3 == 0 ? -1.0 : 1.0) * (i + 2.5));
+    valuesC[i] = T((i % 4 < 2 ? 1.0 : -1.0) * (VecType::kSize - i + 0.75));
+  }
+  auto va = Load<VecType>(valuesA.data());
+  auto vb = Load<VecType>(valuesB.data());
+  auto vc = Load<VecType>(valuesC.data());
   auto result = vectorFn(va, vb, vc);
   for (int i = 0; i < VecType::kSize; ++i) {
-    T expected = scalarFn(kValuesA[i], kValuesB[i], kValuesC[i]);
-    T actual = Get(result, i);
+    T expected = scalarFn(valuesA[i], valuesB[i], valuesC[i]);
+    T actual = result[i];
     EXPECT_TRUE(compareFn(expected, actual));
   }
 }

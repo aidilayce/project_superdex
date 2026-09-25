@@ -17,6 +17,7 @@
 #include "editors/asset_editor.h"
 
 #include "app/app.h"
+#include "rendering/measure_tool.h"
 
 namespace superdex::studio {
 
@@ -38,6 +39,24 @@ std::vector<AssetEditor::WindowDeclaration> AssetEditor::GetAuxiliaryWindows() c
 }
 
 void AssetEditor::ShowAuxiliaryWindows() {}
+
+char const* AssetEditor::MeasureWindowName() {
+  return MeasureTool::GetWindowName();
+}
+
+AssetEditor::WindowDeclaration AssetEditor::MeasureWindowDeclaration() {
+  return {MeasureWindowName(), /*showByDefault=*/false, DockRegion::SidePanelBottom};
+}
+
+void AssetEditor::ShowMeasureWindow() {
+  Viewport* const viewport = GetViewport();
+  if (viewport == nullptr) {
+    return;
+  }
+  if (bool& open = _studio->GetWindowVisible(MeasureWindowName())) {
+    viewport->GetMeasureTool()->ShowWindow(MeasureWindowName(), &open);
+  }
+}
 
 void AssetEditor::FocusWindowIfOpen(char const* name) {
   if (_studio->GetWindowVisible(name)) {

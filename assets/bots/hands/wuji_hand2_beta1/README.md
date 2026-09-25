@@ -14,8 +14,21 @@ One or more of the following modifications were made to adapt the original asset
 - Added or modified actuator descriptions.
 - Added or modified sensor descriptions where applicable.
 
+## Skinned Variants
+
+This package also provides skinned descriptions, which cover the articulated hand with a deformable skin:
+
+- [`left/wuji_hand2_beta1_skinned_left.superdex_bot`](left/wuji_hand2_beta1_skinned_left.superdex_bot)
+- [`right/wuji_hand2_beta1_skinned_right.superdex_bot`](right/wuji_hand2_beta1_skinned_right.superdex_bot)
+
+Each attaches a skin render mesh (`render/skin_render.glb`) and a skin collision mesh (`collision/skin_low_poly_cut_tips_collision.mochi.h5`) from its own side's directory.
+
+Skinned render assets were derived from 3D scans of the Wuji v2 Beta 2 hand, retopologized and bound to the skeleton by a professional technical artist.
+
 ## License
 
 The upstream Wuji Hand 2 assets are provided under the [MIT License](https://github.com/wuji-technology/wuji-description/blob/main/LICENSE) (Copyright (c) 2025 Wuji Technology).
+
+The skin assets used by the skinned variants were created by Meta Platforms, Inc. and affiliates and are released under the same MIT License.
 
 **You are responsible for ensuring your use is compatible with all third-party licenses.**

@@ -69,6 +69,10 @@ struct PrecApplyer {
       ParallelWorkerInfo const& data) const {
     prec.get().ConcurrentSolve(x, Px, data);
   }
+
+  void PrepareConcurrentSolve(Span<int const> workerRowRanges) const {
+    prec.get().PrepareConcurrentSolve(workerRowRanges);
+  }
 };
 
 inline constexpr bool IsCudaSolver(LinearSolverType const& solverType) {
@@ -168,9 +172,9 @@ namespace mochi {
 /// @note The input matrix must be a supported matrix or linear operator type. For the particular
 /// case of an IslandOperators, the preconditioner is constructed (or updated) in the linear solver
 /// for consistency with the case in which the input is a matrix type. That is, the caller is NOT
-/// responsible for calling @ref IslandOperators::MakePerActorPrec before @ref LinearSolver::Solve.
-/// Doing so would be inefficient (the preconditioner would be computed or updated twice) but not
-/// incorrect.
+/// responsible for calling @ref IslandOperators::MakePerActorPreconditionerEntries before @ref
+/// LinearSolver::Solve. Doing so would be inefficient (the preconditioner would be computed or
+/// updated twice) but not incorrect.
 /// @note It provides a unified interface for solving a linear system with various solver and
 /// preconditioner types.
 /// @note It manages internal state for preconditioner recycling and Krylov subspace recycling.
@@ -212,6 +216,11 @@ class LinearSolver {
   /// operator types, the dense LDLt factorization is always used.
   static constexpr int kSparseLdltDofThreshold = 200;
 
+  /// @brief Constructs the solver.
+  ///
+  /// @param[in] params Solver parameters.
+  /// @param[in] precRecyclingMgr Preconditioner recycling manager, which may be shared with other
+  /// solvers to reuse the preconditioner across them. If null, the solver creates its own.
   LinearSolver(
       KrylovSolverParams const& params,
       std::shared_ptr<PreconditionerRecyclingManager<T>> precRecyclingMgr = nullptr)
@@ -225,7 +234,9 @@ class LinearSolver {
 
   /// @brief Set the parameters of the solver.
   void SetParams(KrylovSolverParams const& params) {
-    MOCHI_ASSERT(params.maxIter >= 0, "Maximum number of linear iterations must not be negative.");
+    MOCHI_ASSERT(
+        params.maxIter > 0,
+        "Maximum number of iterations for iterative linear solvers must be positive.");
     MOCHI_ASSERT(params.solverType != LinearSolverType::Auto, "Solver type must have been set.");
     if (params.preconditionerLifespan > 1 && details::IsCudaSolver(params.solverType)) {
       MOCHI_LOG_WARNING_ONCE("Preconditioner recycling not supported with CUDA solvers.");
@@ -251,17 +262,28 @@ class LinearSolver {
   /// @param[in] A Matrix of the linear system.
   /// @param[in] b Vector with the right-hand side.
   /// @param[in,out] x Vector with the initial guess at input and the solution at output.
-  /// @param[in] hasOperatorChanged Boolean flag for whether the operator has changed since the
-  /// previous solve. Used as performance optimization for direct solvers, Krylov subspace recycling
-  /// and preconditioner recycling if the operator has not changed. Default is true.
+  /// @param[in] hasOperatorChanged Whether @p A has changed since the previous solve, including
+  /// solves by other solvers sharing the preconditioner recycling manager. If false, data computed
+  /// from the previous operator, e.g. factorizations and the preconditioner, is reused, so passing
+  /// false for a changed operator is incorrect. Default is true.
+  /// @param[in] initialGuessHint Indicates whether @p x is known to be zero. The zero hint enables
+  /// iterative solvers to skip work and requires @p x to be exactly zero.
   template <int kPrecBlockSize = 3, typename MatrixType, typename RhsType, typename SolType>
-  LinearSolverStatus
-  Solve(MatrixType const& A, RhsType const& b, SolType& x, bool hasOperatorChanged = true);
+  LinearSolverStatus Solve(
+      MatrixType const& A,
+      RhsType const& b,
+      SolType& x,
+      bool hasOperatorChanged = true,
+      InitialGuessHint initialGuessHint = InitialGuessHint::Unknown);
 
  protected:
   template <typename MatrixType, typename RhsType, typename SolType, typename PrecType>
-  LinearSolverStatus
-  IterativeSolve(MatrixType const& A, RhsType const& b, SolType& x, PrecType const& prec);
+  LinearSolverStatus IterativeSolve(
+      MatrixType const& A,
+      RhsType const& b,
+      SolType& x,
+      PrecType const& prec,
+      InitialGuessHint initialGuessHint);
 
   template <int kPrecBlockSize, typename MatrixType, typename RhsType, typename SolType>
   LinearSolverStatus CudaIterativeSolve(MatrixType const& A, RhsType const& b, SolType& x);
@@ -302,8 +324,12 @@ class LinearSolver {
 
 template <typename T>
 template <int kPrecBlockSize, typename MatrixType, typename RhsType, typename SolType>
-LinearSolverStatus
-LinearSolver<T>::Solve(MatrixType const& A, RhsType const& b, SolType& x, bool hasOperatorChanged) {
+LinearSolverStatus LinearSolver<T>::Solve(
+    MatrixType const& A,
+    RhsType const& b,
+    SolType& x,
+    bool hasOperatorChanged,
+    InitialGuessHint initialGuessHint) {
   if constexpr (IsLinearOperator<MatrixType>) {
     static_assert(!IsCuda<MatrixType>, "CUDA matrices not supported yet");
     MOCHI_PROFILE_SCOPE();
@@ -357,7 +383,9 @@ LinearSolver<T>::Solve(MatrixType const& A, RhsType const& b, SolType& x, bool h
           } else {
             _sparseLdlt = std::monostate{};
           }
-          return LinearSolverStatus{.converged = (info == 0)};
+          return LinearSolverStatus{
+              .convergence = info == 0 ? LinearSolverConvergenceStatus::Converged
+                                       : LinearSolverConvergenceStatus::Diverged};
         }
       }
 
@@ -383,7 +411,9 @@ LinearSolver<T>::Solve(MatrixType const& A, RhsType const& b, SolType& x, bool h
       } else {
         _denseLdlt.reset(nullptr);
       }
-      return LinearSolverStatus{.converged = (info == 0)};
+      return LinearSolverStatus{
+          .convergence = info == 0 ? LinearSolverConvergenceStatus::Converged
+                                   : LinearSolverConvergenceStatus::Diverged};
 
     } else if (_params.solverType == LinearSolverType::LU) {
       if (_lu == nullptr) {
@@ -395,7 +425,7 @@ LinearSolver<T>::Solve(MatrixType const& A, RhsType const& b, SolType& x, bool h
       }
       x = b;
       _lu->LeftSolveInPlace(x);
-      return LinearSolverStatus{.converged = true};
+      return LinearSolverStatus{.convergence = LinearSolverConvergenceStatus::Converged};
     } else if (_params.solverType == LinearSolverType::ExperimentalCudaSparseCholesky) {
 #if MOCHI_USE_CUDA
       if constexpr (IsSparseMatrix<MatrixType> || IsBlockSparseMatrix<MatrixType>) {
@@ -403,7 +433,7 @@ LinearSolver<T>::Solve(MatrixType const& A, RhsType const& b, SolType& x, bool h
         CudaVector<T> bCuda(b), xCuda(x); // Transfer data to the GPU
         Chol(bCuda, xCuda);
         x = xCuda;
-        return LinearSolverStatus{.converged = true};
+        return LinearSolverStatus{.convergence = LinearSolverConvergenceStatus::Converged};
       } else {
         MOCHI_ASSERT(false, "CudaSparseCholesky requires building a sparse matrix type.");
       }
@@ -417,7 +447,7 @@ LinearSolver<T>::Solve(MatrixType const& A, RhsType const& b, SolType& x, bool h
         CudaVector<T> bCuda(b), xCuda(x); // Transfer data to the GPU
         LDLt(bCuda, xCuda);
         x = xCuda;
-        return LinearSolverStatus{.converged = true};
+        return LinearSolverStatus{.convergence = LinearSolverConvergenceStatus::Converged};
       } else {
         MOCHI_ASSERT(false, "CudaSparseLDLt requires a sparse matrix type.");
       }
@@ -431,7 +461,7 @@ LinearSolver<T>::Solve(MatrixType const& A, RhsType const& b, SolType& x, bool h
         CudaVector<T> bCuda(b), xCuda(x); // Transfer data to the GPU
         LU(bCuda, xCuda);
         x = xCuda;
-        return LinearSolverStatus{.converged = true};
+        return LinearSolverStatus{.convergence = LinearSolverConvergenceStatus::Converged};
       } else {
         MOCHI_ASSERT(false, "CudaSparseLU requires a sparse matrix type.");
       }
@@ -448,7 +478,11 @@ LinearSolver<T>::Solve(MatrixType const& A, RhsType const& b, SolType& x, bool h
       _precRecyclingMgr->template SetupPreconditioner<kPrecBlockSize>(
           A, hasOperatorChanged, _params.preconditionerType, _params.preconditionerLifespan);
       return IterativeSolve(
-          A, b, x, details::PrecApplyer<T>{*_precRecyclingMgr->GetPreconditioner()});
+          A,
+          b,
+          x,
+          details::PrecApplyer<T>{*_precRecyclingMgr->GetPreconditioner()},
+          initialGuessHint);
     } else if (
         _params.solverType == LinearSolverType::CudaCG ||
         _params.solverType == LinearSolverType::CudaGMRES) {
@@ -460,7 +494,10 @@ LinearSolver<T>::Solve(MatrixType const& A, RhsType const& b, SolType& x, bool h
     // Branch for std::variant's holding matrix and linear operator types. It resolves to the Solve
     // specialization with the actual implementation, i.e. the 'if' branch above.
     return std::visit(
-        [&](auto const& mat) { return Solve<kPrecBlockSize>(mat, b, x, hasOperatorChanged); }, A);
+        [&](auto const& mat) {
+          return Solve<kPrecBlockSize>(mat, b, x, hasOperatorChanged, initialGuessHint);
+        },
+        A);
   }
 }
 
@@ -470,11 +507,21 @@ LinearSolverStatus LinearSolver<T>::IterativeSolve(
     MatrixType const& A,
     RhsType const& b,
     SolType& x,
-    PrecType const& prec) {
+    PrecType const& prec,
+    InitialGuessHint initialGuessHint) {
   if (_params.solverType == LinearSolverType::CG) {
     return details::DispatchConvergenceNorm<T>(_params, [&](auto& stopCriterion) {
       return krylov::PCG(
-          A, b, x, prec, _params.maxIter, stopCriterion, _params.abortIfNotSpd, _params.verbosity);
+          A,
+          b,
+          x,
+          prec,
+          _params.maxIter,
+          stopCriterion,
+          _params.abortIfNotSpd,
+          _params.verbosity,
+          /*usePolakRibiere*/ true,
+          initialGuessHint);
     });
   } else if (_params.solverType == LinearSolverType::ParallelCG) {
     if constexpr (!IsCuda<MatrixType>) {
@@ -487,7 +534,9 @@ LinearSolverStatus LinearSolver<T>::IterativeSolve(
             _params.maxIter,
             stopCriterion,
             _params.abortIfNotSpd,
-            _params.verbosity);
+            _params.verbosity,
+            /*usePolakRibiere*/ true,
+            initialGuessHint);
       });
     } else {
       MOCHI_ASSERT(false, "Parallel PCG not supported for CUDA matrices.");
@@ -503,7 +552,9 @@ LinearSolverStatus LinearSolver<T>::IterativeSolve(
             _params.maxIter,
             stopCriterion,
             _params.abortIfNotSpd,
-            _params.verbosity);
+            _params.verbosity,
+            /*usePolakRibiere*/ true,
+            initialGuessHint);
       });
     } else {
       MOCHI_ASSERT(false, "Async PCG not supported for CUDA matrices.");
@@ -531,7 +582,8 @@ LinearSolverStatus LinearSolver<T>::IterativeSolve(
           RecyclingParams(_params),
           _subspaceRecycling,
           _params.abortIfNotSpd,
-          _params.verbosity);
+          _params.verbosity,
+          initialGuessHint);
       _subspaceRecycling.hasOperatorChanged = false;
       return result;
     } else {
@@ -543,13 +595,22 @@ LinearSolverStatus LinearSolver<T>::IterativeSolve(
         static_cast<T>(_params.absTol),
         static_cast<T>(_params.relDivTol));
     return krylov::GMRes(
-        A, b, x, prec, _params.maxIter, stopCriterion, _params.restartSize, _params.verbosity);
+        A,
+        b,
+        x,
+        prec,
+        _params.maxIter,
+        stopCriterion,
+        _params.restartSize,
+        _params.verbosity,
+        initialGuessHint);
   } else if (_params.solverType == LinearSolverType::MINRES) {
     krylov::StatusImplicitResidualNorm<T> stopCriterion(
         static_cast<T>(_params.relTol),
         static_cast<T>(_params.absTol),
         static_cast<T>(_params.relDivTol));
-    return krylov::MinRes(A, b, x, prec, _params.maxIter, stopCriterion, _params.verbosity);
+    return krylov::MinRes(
+        A, b, x, prec, _params.maxIter, stopCriterion, _params.verbosity, initialGuessHint);
   }
   MOCHI_ASSERT(false, "Solver type (%i) not supported.", static_cast<int>(_params.solverType));
   return {};

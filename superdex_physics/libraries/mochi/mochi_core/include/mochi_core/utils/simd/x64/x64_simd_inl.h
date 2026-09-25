@@ -41,17 +41,25 @@
 
 #include "x64_simd_int_8_inl.h"
 
+#include "x64_simd_int_16_inl.h"
+
 #include "x64_simd_int64_2_inl.h"
 
 #include "x64_simd_int64_4_inl.h"
+
+#include "x64_simd_int64_8_inl.h"
 
 #include "x64_simd_double_2_inl.h"
 
 #include "x64_simd_double_4_inl.h"
 
+#include "x64_simd_double_8_inl.h"
+
 #include "x64_simd_float_4_inl.h"
 
 #include "x64_simd_float_8_inl.h"
+
+#include "x64_simd_float_16_inl.h"
 
 /***********************************************************************************************
   Simd Utlities for x64 Architecture
@@ -67,17 +75,23 @@ template <> MOCHI_FORCE_INLINE Simd<int64_t, 2> ReinterpretCast<Simd<int64_t, 2>
 template <>
 MOCHI_FORCE_INLINE Simd<int64_t, 2> StaticCast<Simd<int64_t, 2>, Simd<double, 2>>(
     Simd<double, 2> const& a) {
-  // Native support for _mm_cvttpd_epi64 requires AVX512
+#if MOCHI_ARCH_X64_AVX512
+  return _mm_cvttpd_epi64(a.raw); // AVX512VL
+#else
   return {_mm_cvttsd_si64(a.raw), _mm_cvttsd_si64(_mm_unpackhi_pd(a.raw, a.raw))};
-} // SSE2
+#endif
+}
 template <>
 MOCHI_FORCE_INLINE Simd<double, 2> StaticCast<Simd<double, 2>, Simd<int64_t, 2>>(
     Simd<int64_t, 2> const& a) {
-  // Native support for _mm_cvtepi64_pd requires AVX512
+#if MOCHI_ARCH_X64_AVX512
+  return _mm_cvtepi64_pd(a.raw); // AVX512VL
+#else
   return {
       static_cast<double>(_mm_cvtsi128_si64(a.raw)),
       static_cast<double>(_mm_cvtsi128_si64(_mm_unpackhi_epi64(a.raw, a.raw)))};
-} // SSE2
+#endif
+}
 
 // clang-format off
 template <> MOCHI_FORCE_INLINE Simd<double, 2> ReinterpretCast<Simd<double, 2>, Simd<float, 4>>(Simd<float, 4> const& a) { return _mm_castps_pd(a.raw); } // SSE2
@@ -105,25 +119,31 @@ template <> MOCHI_FORCE_INLINE Simd<int64_t, 4> ReinterpretCast<Simd<int64_t, 4>
 template <>
 MOCHI_FORCE_INLINE Simd<int64_t, 4> StaticCast<Simd<int64_t, 4>, Simd<double, 4>>(
     Simd<double, 4> const& a) {
-  /// Native support is provided in AVX512 '_mm256_cvttpd_epi64'
+#if MOCHI_ARCH_X64_AVX512
+  return _mm256_cvttpd_epi64(a.raw); // AVX512VL
+#else
   using VType = Simd<double, 4>;
   return {
       static_cast<int64_t>(VType::Get<0>(a)),
       static_cast<int64_t>(VType::Get<1>(a)),
       static_cast<int64_t>(VType::Get<2>(a)),
       static_cast<int64_t>(VType::Get<3>(a))};
+#endif
 }
 
 template <>
 MOCHI_FORCE_INLINE Simd<double, 4> StaticCast<Simd<double, 4>, Simd<int64_t, 4>>(
     Simd<int64_t, 4> const& a) {
-  /// Native support is provided in AVX512 '_mm256_cvtepi64_pd'
+#if MOCHI_ARCH_X64_AVX512
+  return _mm256_cvtepi64_pd(a.raw); // AVX512VL
+#else
   using VType = Simd<int64_t, 4>;
   return {
       static_cast<double>(VType::Get<0>(a)),
       static_cast<double>(VType::Get<1>(a)),
       static_cast<double>(VType::Get<2>(a)),
       static_cast<double>(VType::Get<3>(a))};
+#endif
 }
 
 // clang-format off
@@ -143,37 +163,46 @@ template <> MOCHI_FORCE_INLINE Simd<float, 4> StaticCast<Simd<float, 4>, Simd<in
 template <>
 MOCHI_FORCE_INLINE Simd<int64_t, 4> StaticCast<Simd<int64_t, 4>, Simd<float, 4>>(
     Simd<float, 4> const& a) {
-  // Native support '_mm256_cvttps_epi64' requires AVX512
+#if MOCHI_ARCH_X64_AVX512
+  return _mm256_cvttps_epi64(a.raw); // AVX512VL
+#else
   using VType = Simd<float, 4>;
   return {
       static_cast<int64_t>(VType::Get<0>(a)),
       static_cast<int64_t>(VType::Get<1>(a)),
       static_cast<int64_t>(VType::Get<2>(a)),
       static_cast<int64_t>(VType::Get<3>(a))};
+#endif
 }
 
 template <>
 MOCHI_FORCE_INLINE Simd<float, 4> StaticCast<Simd<float, 4>, Simd<int64_t, 4>>(
     Simd<int64_t, 4> const& a) {
-  // Native support '_mm256_cvtepi64_ps' requires AVX512
+#if MOCHI_ARCH_X64_AVX512
+  return _mm256_cvtepi64_ps(a.raw); // AVX512VL
+#else
   using VType = Simd<int64_t, 4>;
   return {
       static_cast<float>(VType::Get<0>(a)),
       static_cast<float>(VType::Get<1>(a)),
       static_cast<float>(VType::Get<2>(a)),
       static_cast<float>(VType::Get<3>(a))};
+#endif
 }
 
 template <>
 MOCHI_FORCE_INLINE Simd<int, 4> StaticCast<Simd<int, 4>, Simd<int64_t, 4>>(
     Simd<int64_t, 4> const& a) {
-  // Native support '_mm256_cvtepi64_epi32' requires AVX512
+#if MOCHI_ARCH_X64_AVX512
+  return _mm256_cvtepi64_epi32(a.raw); // AVX512VL
+#else
   using VType = Simd<int64_t, 4>;
   return {
       static_cast<int>(VType::Get<0>(a)),
       static_cast<int>(VType::Get<1>(a)),
       static_cast<int>(VType::Get<2>(a)),
       static_cast<int>(VType::Get<3>(a))};
+#endif
 }
 template <>
 MOCHI_FORCE_INLINE Simd<int64_t, 4> StaticCast<Simd<int64_t, 4>, Simd<int, 4>>(
@@ -193,6 +222,36 @@ template <> MOCHI_FORCE_INLINE Simd<int64_t, 4> ReinterpretCast<Simd<int64_t, 4>
 template <> MOCHI_FORCE_INLINE Simd<int, 8> ReinterpretCast<Simd<int, 8>, Simd<int64_t, 4>>(Simd<int64_t, 4> const& a) { return a.raw; } // AVX
 template <> MOCHI_FORCE_INLINE Simd<int64_t, 4> ReinterpretCast<Simd<int64_t, 4>, Simd<int, 8>>(Simd<int, 8> const& a) { return a.raw; } // AVX
 // clang-format on
+
+#if MOCHI_ARCH_X64_AVX512
+// clang-format off
+template <> MOCHI_FORCE_INLINE Simd<float, 16> ReinterpretCast<Simd<float, 16>, Simd<int, 16>>(Simd<int, 16> const& a) { return _mm512_castsi512_ps(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<int, 16> ReinterpretCast<Simd<int, 16>, Simd<float, 16>>(Simd<float, 16> const& a) { return _mm512_castps_si512(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<double, 8> ReinterpretCast<Simd<double, 8>, Simd<int64_t, 8>>(Simd<int64_t, 8> const& a) { return _mm512_castsi512_pd(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<int64_t, 8> ReinterpretCast<Simd<int64_t, 8>, Simd<double, 8>>(Simd<double, 8> const& a) { return _mm512_castpd_si512(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<double, 8> ReinterpretCast<Simd<double, 8>, Simd<float, 16>>(Simd<float, 16> const& a) { return _mm512_castps_pd(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<float, 16> ReinterpretCast<Simd<float, 16>, Simd<double, 8>>(Simd<double, 8> const& a) { return _mm512_castpd_ps(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<double, 8> ReinterpretCast<Simd<double, 8>, Simd<int, 16>>(Simd<int, 16> const& a) { return _mm512_castsi512_pd(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<int, 16> ReinterpretCast<Simd<int, 16>, Simd<double, 8>>(Simd<double, 8> const& a) { return _mm512_castpd_si512(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<float, 16> ReinterpretCast<Simd<float, 16>, Simd<int64_t, 8>>(Simd<int64_t, 8> const& a) { return _mm512_castsi512_ps(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<int64_t, 8> ReinterpretCast<Simd<int64_t, 8>, Simd<float, 16>>(Simd<float, 16> const& a) { return _mm512_castps_si512(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<int, 16> ReinterpretCast<Simd<int, 16>, Simd<int64_t, 8>>(Simd<int64_t, 8> const& a) { return a.raw; }
+template <> MOCHI_FORCE_INLINE Simd<int64_t, 8> ReinterpretCast<Simd<int64_t, 8>, Simd<int, 16>>(Simd<int, 16> const& a) { return a.raw; }
+
+template <> MOCHI_FORCE_INLINE Simd<int, 16> StaticCast<Simd<int, 16>, Simd<float, 16>>(Simd<float, 16> const& a) { return _mm512_cvttps_epi32(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<float, 16> StaticCast<Simd<float, 16>, Simd<int, 16>>(Simd<int, 16> const& a) { return _mm512_cvtepi32_ps(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<int64_t, 8> StaticCast<Simd<int64_t, 8>, Simd<double, 8>>(Simd<double, 8> const& a) { return _mm512_cvttpd_epi64(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<double, 8> StaticCast<Simd<double, 8>, Simd<int64_t, 8>>(Simd<int64_t, 8> const& a) { return _mm512_cvtepi64_pd(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<float, 8> StaticCast<Simd<float, 8>, Simd<double, 8>>(Simd<double, 8> const& a) { return _mm512_cvtpd_ps(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<double, 8> StaticCast<Simd<double, 8>, Simd<float, 8>>(Simd<float, 8> const& a) { return _mm512_cvtps_pd(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<int, 8> StaticCast<Simd<int, 8>, Simd<double, 8>>(Simd<double, 8> const& a) { return _mm512_cvttpd_epi32(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<double, 8> StaticCast<Simd<double, 8>, Simd<int, 8>>(Simd<int, 8> const& a) { return _mm512_cvtepi32_pd(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<int64_t, 8> StaticCast<Simd<int64_t, 8>, Simd<float, 8>>(Simd<float, 8> const& a) { return _mm512_cvttps_epi64(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<float, 8> StaticCast<Simd<float, 8>, Simd<int64_t, 8>>(Simd<int64_t, 8> const& a) { return _mm512_cvtepi64_ps(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<int, 8> StaticCast<Simd<int, 8>, Simd<int64_t, 8>>(Simd<int64_t, 8> const& a) { return _mm512_cvtepi64_epi32(a.raw); }
+template <> MOCHI_FORCE_INLINE Simd<int64_t, 8> StaticCast<Simd<int64_t, 8>, Simd<int, 8>>(Simd<int, 8> const& a) { return _mm512_cvtepi32_epi64(a.raw); }
+// clang-format on
+#endif
 
 } // namespace mochi
 

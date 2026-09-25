@@ -48,7 +48,8 @@ TEST(Vec8r, Class) {
   static_assert(Vec8r::kIsSupported, "Should be supported");
 
 #if MOCHI_USE_SIMD
-  bool constexpr kExpectNativeSize = (MOCHI_ARCH_X64_AVX2 && !MOCHI_USE_DOUBLE_PRECISION);
+  bool constexpr kExpectNativeSize =
+      MOCHI_ARCH_X64_AVX512 || (MOCHI_ARCH_X64_AVX2 && !MOCHI_USE_DOUBLE_PRECISION);
   static_assert(Vec8r::kIsComposite == !kExpectNativeSize);
   static_assert(!Vec8r::kIsEmulated);
 #else
@@ -734,7 +735,7 @@ TEST(Vec8r, Norm) {
     // 8 components (only size currently supported for Vec8r)
     real nsqr = 0_r;
     for (int i = 0; i < 8; ++i) {
-      nsqr += Sqr(Get(v, i));
+      nsqr += Sqr(v[i]);
     }
     auto norm = std::sqrt(nsqr);
     EXPECT_NEAR_EQ(Vec8r(norm), VNorm(v));
@@ -751,7 +752,7 @@ TEST(Vec8r, Normalize) {
   EXPECT_TRUE(NearEqual(v / Sqrt(204_r), Normalize(v, 204_r))); // 4 components
 }
 
-TEST(Vec8r, get) {
+TEST(Vec8r, Get) {
   Vec8r a = {1_r, 2_r, 3_r, 4_r, 5_r, 6_r, 7_r, 8_r};
 
   EXPECT_NEAR(1_r, Get0(a), kEps);
@@ -764,28 +765,28 @@ TEST(Vec8r, get) {
   EXPECT_NEAR(7_r, Get<6>(a), kEps);
   EXPECT_NEAR(8_r, Get<7>(a), kEps);
 
-  EXPECT_NEAR(1_r, Get(a, 0), kEps);
-  EXPECT_NEAR(2_r, Get(a, 1), kEps);
-  EXPECT_NEAR(3_r, Get(a, 2), kEps);
-  EXPECT_NEAR(4_r, Get(a, 3), kEps);
-  EXPECT_NEAR(5_r, Get(a, 4), kEps);
-  EXPECT_NEAR(6_r, Get(a, 5), kEps);
-  EXPECT_NEAR(7_r, Get(a, 6), kEps);
-  EXPECT_NEAR(8_r, Get(a, 7), kEps);
+  EXPECT_NEAR(1_r, a[0], kEps);
+  EXPECT_NEAR(2_r, a[1], kEps);
+  EXPECT_NEAR(3_r, a[2], kEps);
+  EXPECT_NEAR(4_r, a[3], kEps);
+  EXPECT_NEAR(5_r, a[4], kEps);
+  EXPECT_NEAR(6_r, a[5], kEps);
+  EXPECT_NEAR(7_r, a[6], kEps);
+  EXPECT_NEAR(8_r, a[7], kEps);
 }
 
 TEST(Vec8r, GetHalf) {
   auto a = Vec8r{1_r, 2_r, 3_r, 4_r, 5_r, 6_r, 7_r, 8_r};
   auto low = GetHalf<0>(a);
   auto high = GetHalf<1>(a);
-  EXPECT_NEAR_EQ(1_r, Get(low, 0));
-  EXPECT_NEAR_EQ(2_r, Get(low, 1));
-  EXPECT_NEAR_EQ(3_r, Get(low, 2));
-  EXPECT_NEAR_EQ(4_r, Get(low, 3));
-  EXPECT_NEAR_EQ(5_r, Get(high, 0));
-  EXPECT_NEAR_EQ(6_r, Get(high, 1));
-  EXPECT_NEAR_EQ(7_r, Get(high, 2));
-  EXPECT_NEAR_EQ(8_r, Get(high, 3));
+  EXPECT_NEAR_EQ(1_r, low[0]);
+  EXPECT_NEAR_EQ(2_r, low[1]);
+  EXPECT_NEAR_EQ(3_r, low[2]);
+  EXPECT_NEAR_EQ(4_r, low[3]);
+  EXPECT_NEAR_EQ(5_r, high[0]);
+  EXPECT_NEAR_EQ(6_r, high[1]);
+  EXPECT_NEAR_EQ(7_r, high[2]);
+  EXPECT_NEAR_EQ(8_r, high[3]);
 }
 
 TEST(Vec8r, Set) {
@@ -866,6 +867,12 @@ TEST(Vec8r, HSum) {
   EXPECT_NEAR_EQ(36_r, HSum(a));
 }
 
+TEST(Vec8r, Dot) {
+  auto a = Vec8r{1_r, 2_r, 3_r, 4_r, 5_r, 6_r, 7_r, 8_r};
+  auto b = Vec8r{0.5_r, -2_r, 3_r, -0.25_r, 1.5_r, -1_r, 2_r, 0.125_r};
+  EXPECT_NEAR_EQ(21_r, Dot(a, b));
+}
+
 // HProd is not implemented for Vec8f (only Vec2d/Vec4d/Vec4f, per simd.h support matrix).
 #if MOCHI_USE_DOUBLE_PRECISION
 TEST(Vec8r, HProd) {
@@ -929,6 +936,7 @@ TEST(Vec8r, Load) {
   EXPECT_VEC8R(1_r, 2_r, 3_r, 4_r, 5_r, 6_r, 7_r, 8_r, (Load<8, Vec8r>(values + 1)));
   EXPECT_VEC8R(1_r, 2_r, 3_r, 4_r, 5_r, 6_r, 7_r, 8_r, (Load<Vec8r>(values + 1)));
 
+  EXPECT_VEC8R(0_r, 0_r, 0_r, 0_r, 0_r, 0_r, 0_r, 0_r, (Load<Vec8r>(values + 1, 0)));
   EXPECT_VEC8R(1_r, 0_r, 0_r, 0_r, 0_r, 0_r, 0_r, 0_r, (Load<Vec8r>(values + 1, 1)));
   EXPECT_VEC8R(1_r, 2_r, 0_r, 0_r, 0_r, 0_r, 0_r, 0_r, (Load<Vec8r>(values + 1, 2)));
   EXPECT_VEC8R(1_r, 2_r, 3_r, 0_r, 0_r, 0_r, 0_r, 0_r, (Load<Vec8r>(values + 1, 3)));
@@ -1042,14 +1050,14 @@ TEST(Vec8r, Select) {
               for (int b6 = 0; b6 < 2; ++b6) {
                 for (int b7 = 0; b7 < 2; ++b7) {
                   auto expected = Vec8r{
-                      b0 ? Get(a, 0) : Get(b, 0),
-                      b1 ? Get(a, 1) : Get(b, 1),
-                      b2 ? Get(a, 2) : Get(b, 2),
-                      b3 ? Get(a, 3) : Get(b, 3),
-                      b4 ? Get(a, 4) : Get(b, 4),
-                      b5 ? Get(a, 5) : Get(b, 5),
-                      b6 ? Get(a, 6) : Get(b, 6),
-                      b7 ? Get(a, 7) : Get(b, 7)};
+                      b0 ? Get<0>(a) : Get<0>(b),
+                      b1 ? Get<1>(a) : Get<1>(b),
+                      b2 ? Get<2>(a) : Get<2>(b),
+                      b3 ? Get<3>(a) : Get<3>(b),
+                      b4 ? Get<4>(a) : Get<4>(b),
+                      b5 ? Get<5>(a) : Get<5>(b),
+                      b6 ? Get<6>(a) : Get<6>(b),
+                      b7 ? Get<7>(a) : Get<7>(b)};
                   auto actual =
                       Select(SimdMask<Vec8r>(!!b0, !!b1, !!b2, !!b3, !!b4, !!b5, !!b6, !!b7), a, b);
                   EXPECT_NEAR_EQ(expected, actual);
@@ -1275,9 +1283,7 @@ TEST(Vec8r, ExpExtreme) {
   auto expv = Exp(v), expmv = Exp(-v);
   auto tol = real(2.0) * std::numeric_limits<real>::epsilon();
   for (int i = 0; i < 8; ++i) {
-    EXPECT_NEAR_RTOL(Vec8r::Get(expv, i), std::exp(x[i]), tol);
-    EXPECT_LE(
-        Abs(Vec8r::Get(expmv, i) - std::exp(-x[i])),
-        Max(Vec8r::Get(expmv, i), std::exp(-x[i])) * tol);
+    EXPECT_NEAR_RTOL(expv[i], std::exp(x[i]), tol);
+    EXPECT_LE(Abs(expmv[i] - std::exp(-x[i])), Max(expmv[i], std::exp(-x[i])) * tol);
   }
 }

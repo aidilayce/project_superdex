@@ -71,7 +71,7 @@ static void UpdateDirichletBC(
 
   // SNLE BC stores BC values as displacements, but we store BC positions.
   // Subtract our positions from the reference pose to update SNLE BC.
-  outLocalBC.poseValues.resize(inWorldBC->poseIndices.size());
+  outLocalBC.poseValues.resize_noinit(inWorldBC->poseIndices.size());
   Span<real const> refPositions = Flatten(mesh.mesh->GetNodeCoordinates());
   for (int i = 0; i < isize(inWorldBC->poseValues); i += 3) {
     Vec4r posWorld = ToSimdPoint(Load<3, Vec4r>(&inWorldBC->poseValues[i]));
@@ -87,6 +87,43 @@ void mochi::PreStepDeformableActorAsync(entt::registry& reg, entt::entity e) {
   // for the simulation step. DO NOT ADD/REMOVE COMPONENTS AT THIS TIME.
 
   ecs::InvokeOnEntity(&UpdateDirichletBC, reg, e);
+}
+
+static real ComputeMaxContactSkinSpeed(
+    CContactSkinningData const& contactSkinning,
+    ColumnVectorView<real const> velocity) {
+  auto const& jacobian = contactSkinning.jacobian;
+  MOCHI_ASSERT_VERBOSE(
+      jacobian.Cols() == velocity.Rows(),
+      "Contact-skin Jacobian and velocity dimensions must match.");
+
+  real maxSpeedSqr = 0_r;
+  for (int row = 0; row < jacobian.Rows(); ++row) {
+    Vec4r skinVelocity{};
+    auto const indices = jacobian.Indices(row);
+    auto const values = jacobian.Values(row);
+    for (int i = 0; i < isize(indices); ++i) {
+      skinVelocity += velocity[indices[i]] * ToSimd(values[i]);
+    }
+    maxSpeedSqr = Max(maxSpeedSqr, NormSqr<3>(skinVelocity));
+  }
+  return Sqrt(maxSpeedSqr);
+}
+
+void deformable::UpdateMaxGeometrySpeed(
+    ecs::Included<TagDeformableActor>,
+    ecs::Excluded<TagNestedSoftActor, TagRodActor>,
+    CVelocitySlice<real, TimeStep::Current> const& velocity,
+    CColliderInfo const& collider,
+    CContactSkinningData const* contactSkinning,
+    CConservativeStepBounds& outStepBounds) {
+  // Match tight bounds: skin-only actors use the skin, while colliders also use the physics mesh.
+  real const physicsMaxSpeed = (collider.type != ColliderType::None || !contactSkinning)
+      ? MaxPackedVector3Norm<kSpaceDim3>(velocity.value.GetConstSpan())
+      : 0_r;
+  real const contactSkinMaxSpeed =
+      contactSkinning ? ComputeMaxContactSkinSpeed(*contactSkinning, velocity.value) : 0_r;
+  outStepBounds.maxGeometrySpeed = Max(physicsMaxSpeed, contactSkinMaxSpeed);
 }
 
 template <ContactType kContactType, typename DiscretizationT>
@@ -128,7 +165,7 @@ void deformable::SetupActiveCollisionNormals(
     auto const& jacColliderFromWorld = explicitNormals
         ? collisionResult.jacColliderFromWorldStageStart
         : collisionResult.jacColliderFromWorld;
-    auto jacColliderFromCollidingT =
+    auto const jacColliderFromCollidingT =
         Dot3x3(rotWorldFromCollidingT, Transpose3x3(jacColliderFromWorld[0]));
 
     femDisc.Visit([&](auto const& discretizationImpl) {
@@ -137,6 +174,7 @@ void deformable::SetupActiveCollisionNormals(
       static int constexpr kNumEleNodes = DiscretizationImplT::kNumEleNodes;
       int prevElementIndex = -1;
       NdArray<Vec4r, kNumEleNodes> nodeCoords;
+      Vec4r normalColliding;
 
       for (size_t i = 0; i < collisionResult.sampleIndices.size(); i++) {
         int const sampleIndex = collisionResult.sampleIndices[i];
@@ -145,8 +183,11 @@ void deformable::SetupActiveCollisionNormals(
         int const elementIndex = sampleIndex / kNumQuads;
         int const quadPointIndex = sampleIndex % kNumQuads;
         auto const& element = discretizationImpl.femElements[elementIndex];
+        using BaseElementT = std::decay_t<decltype(element.GetBaseElement())>;
+        static_assert(
+            BaseElementT::kPolyOrder == 1, "Collision-normal caching requires P1 elements.");
 
-        // Cache deformed node coordinates if the element index has changed.
+        // Cache element-constant data if the element index has changed.
         if (elementIndex != prevElementIndex) {
           auto const baseElementDofIndices = kSpaceDim3 * element.GetBaseElement().Nodes();
           for (int j = 0; j < kNumEleNodes; ++j) {
@@ -154,36 +195,33 @@ void deformable::SetupActiveCollisionNormals(
                 Load<3, Vec4r>(&displForNormals[baseElementDofIndices[j]]);
           }
 
-          prevElementIndex = elementIndex;
-        }
-
-        // Compute the surface normal at the quadrature point in the colliding actor's local frame.
-        Vec4r normalColliding;
-        if constexpr (std::is_same_v<DiscretizationT, CFemBoundaryDiscretization>) {
-          // Tetrahedral trace: 3D parametric, 3x3 Jacobian. Use the trace's
-          // QuadraturePointEvaluateMap and QuadraturePointEvaluateWeightNormal.
-          Vec4r vmap;
-          VMatrix3x3r vdmap;
-          element.QuadraturePointEvaluateMap(quadPointIndex, nodeCoords, vmap, vdmap);
-          real const det = Det3x3(vdmap);
-          real unused = 0_r;
-          element.QuadraturePointEvaluateWeightNormal(
-              quadPointIndex, det, Invert3x3(vdmap, det), unused, normalColliding);
-        } else {
-          // Triangular surface (Pk2DElement): evaluate the deformed tangent map (3x2) at this
-          // quad point as `tangent_k(q) = Σ_f deformed_pos[f] * dBasisParametric[q][f][k]`,
-          // then `normal = normalize(cross(tangent_0, tangent_1))`. This is the general FEM
-          // formula and matches the rest-shape computation in `Pk2DElement::QuadratureEvaluateMap`.
-          using ElementImplT = std::decay_t<decltype(element)>;
-          Vec4r tangent0{};
-          Vec4r tangent1{};
-          for (int f = 0; f < kNumEleNodes; ++f) {
-            auto const& dBasis =
-                ElementImplT::kBasisEvaluatedParametric.kDBasisEvaluated[quadPointIndex][f];
-            tangent0 += nodeCoords[f] * dBasis[0];
-            tangent1 += nodeCoords[f] * dBasis[1];
+          // Compute the surface normal in the colliding actor's local frame. Linear elements have
+          // a constant normal across their quadrature points.
+          if constexpr (std::is_same_v<DiscretizationT, CFemBoundaryDiscretization>) {
+            // Tetrahedral trace: evaluate the deformed normal from the tetrahedral map.
+            Vec4r vmap;
+            VMatrix3x3r vdmap;
+            element.QuadraturePointEvaluateMap(quadPointIndex, nodeCoords, vmap, vdmap);
+            real const det = Det3x3(vdmap);
+            real unused = 0_r;
+            element.QuadraturePointEvaluateWeightNormal(
+                quadPointIndex, det, Invert3x3(vdmap, det), unused, normalColliding);
+          } else {
+            // Triangular surface: evaluate the deformed tangent map as in
+            // Pk2DElement::QuadratureEvaluateMap.
+            using ElementImplT = std::decay_t<decltype(element)>;
+            Vec4r tangent0{};
+            Vec4r tangent1{};
+            for (int f = 0; f < kNumEleNodes; ++f) {
+              auto const& dBasis =
+                  ElementImplT::kBasisEvaluatedParametric.kDBasisEvaluated[quadPointIndex][f];
+              tangent0 += nodeCoords[f] * dBasis[0];
+              tangent1 += nodeCoords[f] * dBasis[1];
+            }
+            normalColliding = Normalize<3>(Cross3(tangent0, tangent1));
           }
-          normalColliding = Normalize<3>(Cross3(tangent0, tangent1));
+
+          prevElementIndex = elementIndex;
         }
 
         // Transform to the collider's local frame.
@@ -191,9 +229,9 @@ void deformable::SetupActiveCollisionNormals(
           collisionResult.normalColliding[i] =
               ToReal3(DotVecMat3x3(normalColliding, jacColliderFromCollidingT));
         } else {
-          normalColliding = DotVecMat3x3(normalColliding, rotWorldFromCollidingT);
+          auto const normalWorld = DotVecMat3x3(normalColliding, rotWorldFromCollidingT);
           collisionResult.normalColliding[i] =
-              ToReal3(DotMatVec3x3(jacColliderFromWorld[i], normalColliding));
+              ToReal3(DotMatVec3x3(jacColliderFromWorld[i], normalWorld));
         }
       }
     });
@@ -387,7 +425,7 @@ MOCHI_COMPUTE_ASYNC_CONTACT_RESPONSE_INST(CFemSegmentDiscretization, 4);
 template <typename ActorTag, typename DiscretizationType>
 void deformable::SetupCollidingJacobians(
     ecs::Included<ActorTag>,
-    ecs::Excluded<TagRomActor, TagSoftSkinnedActor, TagUseVisualMeshContact>,
+    ecs::Excluded<TagRomActor, TagNestedSoftActor, TagUseDeformableContactSkin>,
     DiscretizationType const& discretization,
     CRootTransform const& transform,
     CDofOffset const& dofOffset,
@@ -434,7 +472,7 @@ void deformable::SetupCollidingJacobians(
 #define MOCHI_SETUP_COLLIDING_JACOBIANS_INST(ACTOR_TAG, DISCRETIZATION_TYPE)         \
   template void deformable::SetupCollidingJacobians<ACTOR_TAG, DISCRETIZATION_TYPE>( \
       ecs::Included<ACTOR_TAG>,                                                      \
-      ecs::Excluded<TagRomActor, TagSoftSkinnedActor, TagUseVisualMeshContact>,      \
+      ecs::Excluded<TagRomActor, TagNestedSoftActor, TagUseDeformableContactSkin>,   \
       DISCRETIZATION_TYPE const& discretization,                                     \
       CRootTransform const& transform,                                               \
       CDofOffset const& dofOffset,                                                   \
@@ -519,6 +557,7 @@ void mochi::deformable::RecordState(
     CVelocitySlice<real, TimeStep::Current> const& vel,
     CDisplacementSlice<real, TimeStep::Current, DisplacementLayer::Skinned> const* dispSkinned,
     CVelocitySlice<real, TimeStep::Current, DisplacementLayer::Skinned> const* velSkinned,
+    CIntegrationVelocitySlices<DisplacementLayer::Skinned> const* integrationVelSkinned,
     CRodPose<TimeStep::Current> const* rodPose,
     [[maybe_unused]] ecs::OptionalTag<TagSoftActor> isSoft,
     [[maybe_unused]] ecs::OptionalTag<TagShellActor> isShell,
@@ -561,8 +600,8 @@ void mochi::deformable::RecordState(
     RecordDataset("displacementSkinned", dims, dispSkinned->value.GetConstSpan(), outData);
   }
 
-  // Velocities of the skinned layer
-  if (velSkinned) {
+  // Velocities of the skinned layer (only if state)
+  if (velSkinned && integrationVelSkinned) {
     MOCHI_ASSERT_VERBOSE(isSoft, "Skinned velocities are only supported for soft actors");
     MOCHI_ASSERT(velSkinned->value.size() % 3 == 0, "Expected 3 values per node");
     MOCHI_ASSERT(isize(velSkinned->value) == isize(dispSpan), "Size mismatch");

@@ -24,6 +24,7 @@
 
 #include <math/vec3.h>
 
+#include <array>
 #include <functional>
 #include <optional>
 #include <string>
@@ -64,9 +65,9 @@ struct AxisColors {
 };
 
 inline constexpr AxisColors kAxisX = {
-    IM_COL32(233, 55, 81, 255), // red, normal
-    IM_COL32(255, 61, 90, 255), // red, hovered
-    IM_COL32(207, 49, 72, 255)}; // red, active
+    IM_COL32(230, 45, 45, 255), // red, normal
+    IM_COL32(255, 55, 55, 255), // red, hovered
+    IM_COL32(204, 40, 40, 255)}; // red, active
 inline constexpr AxisColors kAxisY = {
     IM_COL32(131, 204, 15, 255), // green, normal
     IM_COL32(148, 230, 17, 255), // green, hovered
@@ -75,7 +76,7 @@ inline constexpr AxisColors kAxisZ = {
     IM_COL32(46, 134, 233, 255), // blue, normal
     IM_COL32(50, 147, 255, 255), // blue, hovered
     IM_COL32(41, 119, 207, 255)}; // blue, active
-inline constexpr AxisColors kAxes[3] = {kAxisX, kAxisY, kAxisZ};
+inline constexpr std::array<AxisColors, 3> kAxes = {kAxisX, kAxisY, kAxisZ};
 
 // Frame-background highlight for a name input whose value collides with an existing name.
 inline ImVec4 const kNameConflictColor(0.5f, 0.0f, 0.0f, 1.0f);
@@ -201,7 +202,7 @@ bool ViewportOrientationGizmo(
 
 bool DragFloatXYZ(
     char const* label,
-    float v[3],
+    float v[3], // NOLINT(modernize-avoid-c-arrays) Array parameters are pointers.
     float v_speed = 1.0f,
     float v_min = 0.0f,
     float v_max = 0.0f,
@@ -421,6 +422,15 @@ void HoverableSeparatorText(char const* label);
 // running off the screen edge. Shown even when the item is disabled. Use instead of SetTooltip for
 // prose (SetTooltip never wraps, so the caller would have to hard-code newlines).
 void ItemTooltipWrapped(char const* text);
+
+// Read-only, selectable (and so copyable) multi-line text block. Sized to its content up to
+// @p maxLines, after which it scrolls. Pass a monospace @p font (may be null) when the text has
+// space-padded columns to line up.
+void ReadOnlyTextBlock(
+    char const* id,
+    std::string const& text,
+    ImFont* font = nullptr,
+    int maxLines = 10);
 
 // True/False dropdown, the shape reflected bool fields get. Preferred over Checkbox in settings
 // panels: it fills the value column like the drag widgets do, with the value centered to match

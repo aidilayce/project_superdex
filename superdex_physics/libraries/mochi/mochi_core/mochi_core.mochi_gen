@@ -1,3 +1,17 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 // @brief Types of joints in an articulated body.
 enum ArticulatedJointType [from_mochi_core] {
   // @brief 6-DoF joint with unconstrained relative motion between links.
@@ -68,9 +82,15 @@ struct BlendingData [from_mochi_core, no_capi, equality] {
   ctor BlendingData(BlendingDataView const& src) [overloaded];
   // @brief Name of the soft source shape.
   DynamicString sourceShape;
-  // @brief Indices for blending. Size is numNodes * 2.
+  // @brief Nested-soft source vertex indices for each target vertex.
+  //
+  // @details Entry `i` identifies the vertex in the nested soft shape for target vertex `i`. The
+  // index is ignored when `weights[i]` is zero. The size equals the number of target vertices.
   DynamicArray<int> indices;
-  // @brief Weights for blending. Size is numNodes * 2.
+  // @brief Nested-soft blend weights for each target vertex.
+  //
+  // @details Entry `i` is in `[0, 1]`, where zero is purely articulated and one is fully
+  // nested-soft. The size equals the number of target vertices.
   DynamicArray<real> weights;
 }
 
@@ -82,11 +102,11 @@ struct BlendingDataView [from_mochi_core, no_capi, equality] {
   //
   // @param[in] src Source data.
   ctor BlendingDataView(BlendingData const& src [keep_alive]) [implicit, overloaded];
-  // @brief Name of the soft source shape.
+  // @brief See @ref BlendingData::sourceShape.
   StringView sourceShape;
-  // @brief Indices for blending. Size is numNodes * 2.
+  // @brief See @ref BlendingData::indices.
   Span<int const> indices;
-  // @brief Weights for blending. Size is numNodes * 2.
+  // @brief See @ref BlendingData::weights.
   Span<real const> weights;
 }
 
@@ -137,7 +157,7 @@ struct MeshData [from_mochi_core, no_capi, equality] {
   // @brief Flat array of node coordinate values [m].
   //
   // @note Size must be a multiple of 3.
-  DynamicArray<real> coordinates [units(m)];
+  DynamicArray<real> coordinates [units("m")];
   // @brief Flat array of node indices forming the elements.
   //
   // @note Size must be a multiple of @ref nodesPerElement.
@@ -200,7 +220,7 @@ struct GridSdfData [from_mochi_core, no_capi, equality] {
   // @brief Dimensions of the SDF grid in X, Y, and Z.
   Int3 dims;
   // @brief Signed distance values [m]. Size must be dims[0] * dims[1] * dims[2].
-  DynamicArray<real> values [units(m)];
+  DynamicArray<real> values [units("m")];
   // @brief Spatial bounds of the SDF grid. Values are distributed uniformly within this volume.
   Aabb bounds;
   // @brief Spatial bounds of the portion of the SDF grid with negative values.
@@ -264,9 +284,9 @@ struct GridSdfDataView [from_mochi_core, no_capi, equality] {
 // @brief Oriented box represented by center, half extents, and rotation.
 struct Box [from_mochi_core, equality] {
   // @brief Center position [m].
-  Real3 center [units(m)];
+  Real3 center [units("m")];
   // @brief Half-size along each local axis [m].
-  Real3 halfExtents [units(m)] = kReal3Ones;
+  Real3 halfExtents [units("m")] = kReal3Ones;
   // @brief Orientation of the box local frame.
   Quaternion rotation;
 }
@@ -276,15 +296,15 @@ struct Plane [from_mochi_core, equality] {
   // @brief Unit normal vector.
   Real3 normal = kReal3YAxis;
   // @brief Signed distance from the origin [m].
-  real distance [units(m)];
+  real distance [units("m")];
 }
 
 // @brief Sphere represented by center and radius.
 struct Sphere [from_mochi_core, equality] {
   // @brief Center position [m].
-  Real3 center [units(m)];
+  Real3 center [units("m")];
   // @brief Radius [m].
-  real radius [units(m)];
+  real radius [units("m")];
 }
 
 // @brief Contents of a SuperDex model file.
@@ -298,6 +318,13 @@ struct ModelData [from_mochi_core, no_capi, equality] {
   # Mesh
   Optional<MeshData> mesh;
   Optional<MeshData> visualMesh;
+  // @brief Optional triangular mesh used for surface queries and, when selected as a shell or rod
+  // actor's contact geometry, for contact quadrature.
+  //
+  // @details For triangular and tetrahedral primary meshes, the skinning data is a node-based
+  // linear embedding whose indices reference primary-mesh nodes. For polylines, the indices
+  // reference primary-mesh elements and define the rod's element-based embedding.
+  Optional<MeshData> contactSkinMesh;
   Optional<DynamicArray<BlendingData>> blending;
   // @brief Indices of mesh nodes that are constrained.
   Optional<DynamicArray<int>> constrainedNodes;
@@ -334,6 +361,13 @@ struct ModelDataView [from_mochi_core, no_capi, equality] {
   # Mesh
   Optional<MeshDataView> mesh;
   Optional<MeshDataView> visualMesh;
+  // @brief Optional triangular mesh used for surface queries and, when selected as a shell or rod
+  // actor's contact geometry, for contact quadrature.
+  //
+  // @details For triangular and tetrahedral primary meshes, the skinning data is a node-based
+  // linear embedding whose indices reference primary-mesh nodes. For polylines, the indices
+  // reference primary-mesh elements and define the rod's element-based embedding.
+  Optional<MeshDataView> contactSkinMesh;
   Optional<DynamicArray<BlendingDataView>> blending;
   // @brief Indices of mesh nodes that are constrained.
   Optional<Span<int const>> constrainedNodes;
@@ -620,7 +654,7 @@ struct GridSdfParams [from_mochi_core] {
   // value is larger than the default contact penalty threshold distance for this reason.
   //
   // @see kGridSdfDefaultBoundaryPadding
-  real boundaryPaddingDist [units(m)] = kGridSdfDefaultBoundaryPadding;
+  real boundaryPaddingDist [units("m")] = kGridSdfDefaultBoundaryPadding;
   // @brief The minimum grid resolution measured in number of voxels per axis.
   //
   // @note This may override the voxel count (and voxel size) computed using @ref resolutionMode and
@@ -631,7 +665,7 @@ struct GridSdfParams [from_mochi_core] {
 // @brief Parameters for a linear elastic material model.
 struct LinearElasticMaterialParams [from_mochi_core] {
   // @brief Young's modulus [Pa]. Must be positive.
-  real youngsModulus [units(Pa)] = 1e5;
+  real youngsModulus [units("Pa")] = 1e5;
 
   // @brief Poisson's ratio (dimensionless).
   //
@@ -642,7 +676,7 @@ struct LinearElasticMaterialParams [from_mochi_core] {
 // @brief Parameters for the St. Venant-Kirchhoff material model.
 struct StVenantKirchhoffMaterialParams [from_mochi_core] {
   // @brief Young's modulus [Pa]. Must be positive.
-  real youngsModulus [units(Pa)] = 1e5;
+  real youngsModulus [units("Pa")] = 1e5;
 
   // @brief Poisson's ratio (dimensionless).
   //
@@ -658,7 +692,7 @@ struct StVenantKirchhoffMaterialParams [from_mochi_core] {
 // @brief Parameters for the Smith stable Neo-Hookean material model.
 struct NeoHookeanMaterialParams [from_mochi_core] {
   // @brief Young's modulus [Pa]. Must be positive.
-  real youngsModulus [units(Pa)] = 1e5;
+  real youngsModulus [units("Pa")] = 1e5;
 
   // @brief Poisson's ratio (dimensionless).
   //
@@ -676,7 +710,7 @@ struct ActiveAnisoArapMaterialParams [from_mochi_core] {
   // @brief Anisotropic stiffness (α) along fiber direction [Pa].
   //
   // @note Must not be negative.
-  real alpha [units(Pa)] = 1000;
+  real alpha [units("Pa")] = 1000;
 
   // @brief Anisotropic reference length (dimensionless).
   //
@@ -734,7 +768,7 @@ struct ArapMaterialParams [from_mochi_core] {
   // @brief ARAP stiffness parameter (μ) [Pa].
   //
   // @note Must be greater than zero.
-  real stiffness [units(Pa)] = 1000;
+  real stiffness [units("Pa")] = 1000;
 
   // @brief Strategy for ensuring positive semi-definite Hessian matrices.
   //
@@ -747,7 +781,7 @@ struct ActiveShapeTargetingArapMaterialParams [from_mochi_core] {
   // @brief ARAP stiffness parameter (μ) [Pa].
   //
   // @note Must be greater than zero.
-  real stiffness [units(Pa)] = 1000;
+  real stiffness [units("Pa")] = 1000;
 
   // @brief Shape target tensor (6 values).
   //
@@ -787,13 +821,13 @@ struct SoftMaterialParams [from_mochi_core] {
   ArapMaterialParams arap;
 
   // @brief Material density in the undeformed configuration [kg/m³]. Must be positive.
-  real density [units(kg/m^3)] = 1000;
+  real density [units("kg/m^3")] = 1000;
 
   // @brief Mass damping coefficient [1/s]. Applies a velocity-proportional force `α·M·v`.
   //
   // @details Must be non-negative. Active only when the actor has inertia. A nonzero value with no
   // inertia is valid but inactive (logged as a warning at actor initialization).
-  real massDampingCoefficient [units(1/s)] = 0;
+  real massDampingCoefficient [units("1/s")] = 0;
 
   // @brief Stiffness damping coefficient `β` [s]. Adds a strain-rate-proportional viscous stress.
   //
@@ -811,7 +845,7 @@ struct SoftMaterialParams [from_mochi_core] {
   // @note While the parameterization in terms of a timescale β is similar, this differs from
   // standard Rayleigh damping using the global assembled stiffness matrix; it depends only on
   // strain rate, therefore dissipating energy only during deformation.
-  real stiffnessDampingCoefficient [units(s)] = 0;
+  real stiffnessDampingCoefficient [units("s")] = 0;
 
   // @brief [Experimental] Include the geometric term in the stiffness-damping tangent. Defaults
   // to `false`.
@@ -845,25 +879,25 @@ struct PerElementSoftMaterialData [from_mochi_core, equality, no_capi] {
   MaterialPsdStrategy psdStrategy = MaterialDefault;
 
   // @brief Young's modulus [Pa]. 1 per element.
-  DynamicArray<real> youngsModulus [units(Pa)];
+  DynamicArray<real> youngsModulus [units("Pa")];
 
   // @brief Poisson's ratio (dimensionless). 1 per element.
   DynamicArray<real> poissonRatio;
 
   // @brief Anisotropic stiffness (α) [Pa]. 1 per element.
-  DynamicArray<real> anisoAlpha [units(Pa)];
+  DynamicArray<real> anisoAlpha [units("Pa")];
 
   // @brief Anisotropic reference length (dimensionless). 1 per element.
   DynamicArray<real> anisoLength;
 
   // @brief Fiber azimuthal angle (θ) [rad]. 1 per element.
-  DynamicArray<real> anisoTheta [units(rad)];
+  DynamicArray<real> anisoTheta [units("rad")];
 
   // @brief Fiber elevation angle (φ) [rad]. 1 per element.
-  DynamicArray<real> anisoPhi [units(rad)];
+  DynamicArray<real> anisoPhi [units("rad")];
 
   // @brief ARAP stiffness (μ) [Pa]. 1 per element.
-  DynamicArray<real> arapStiffness [units(Pa)];
+  DynamicArray<real> arapStiffness [units("Pa")];
 
   // @brief Shape target tensor offset in flat symmetric upper-triangle layout.
   //
@@ -998,8 +1032,8 @@ enum ColliderType [from_mochi_core] {
 
 // @brief Parameters for contact mechanics simulation.
 //
-// @note In contact between a colliding actor and a collider, the collider's contact parameters
-// (not the colliding actor's) are used. The exceptions are:
+// @note For each field without an actor-pair override, contact between a colliding actor and a
+// collider uses the collider's contact parameter (not the colliding actor's). The exceptions are:
 //   - For friction and dissipation coefficients (viscousFrictionCoefficient,
 //     coulombFrictionCoefficient, normalViscousDampingCoefficient), the geometric mean of the
 //     colliding and collider's coefficients is used. This disables friction/dissipation if either
@@ -1007,6 +1041,8 @@ enum ColliderType [from_mochi_core] {
 //   - For penalty coefficient (penaltyCoefficient) and friction velocity threshold
 //     (frictionFalloffVel), the geometric mean of the colliding and collider's values is used,
 //     except if the collider is static in which case the colliding's values are used.
+//
+// @see Scene::SetContactPairParamsOverride
 struct ContactParams [from_mochi_core] {
   // @brief Construct ContactParams with all parameters explicitly specified.
   //
@@ -1028,49 +1064,49 @@ struct ContactParams [from_mochi_core] {
   ctor ContactParams(real penaltyCoefficient, real penaltySmoothingHalfDistance, real penaltyThresholdDefault, real penaltyThresholdExtraPadding, bool frictionWithColliderNormal, real maxAlignmentNormals, real viscousFrictionCoefficient, real coulombFrictionCoefficient, real frictionFalloffVel, real normalViscousDampingCoefficient, real distanceErrorBound, real objScale, real collidingPenaltyLengthScale) [no_python];
   // @brief Stiffness of the contact penalty force [Pa/m].
   //
-  // @note Must be strictly positive.
+  // @note Must be finite and strictly positive.
   // @note Higher penalties create stiffer contacts and reduce penetration.
   // @note Arbitrarily large penalties may degrade stability.
   // @note The default penalty is appropriate for actors with default density. For actors with much
   // higher/lower density than the default density, the penalty coefficient may need to be
   // increased/decreased accordingly.
-  // @note The penalty coefficient used in a collision is the geometric mean of the colliding and
-  // collider's coefficients. The exception is if the collider is static, in which case the
-  // colliding's penalty is used.
+  // @note Without an actor-pair override for this field, the value used in a collision is the
+  // geometric mean of the colliding and collider's coefficients. The exception is if the collider
+  // is static, in which case the colliding's penalty is used.
   // @note The penalty coefficient is additionally scaled by length-scale corrections when the
   // colliding or collider integrates contact over a non-2D manifold (e.g., rod, shell). See @ref
   // collidingPenaltyLengthScale.
-  real penaltyCoefficient [units(Pa/m)] = 1e9;
+  real penaltyCoefficient [units("Pa/m")] = 1e9;
   // @brief PolyReLU smoothing half-width [m].
   //
   // @details The penalty force transitions from 0 to linear over the decreasing distance range
   // (penaltyThreshold, penaltyThreshold - 2 * @ref penaltySmoothingHalfDistance).
   //
-  // @note Must not be negative.
+  // @note Must be finite and not negative.
   // @note Larger smoothing distances improve stability but may increase penetration.
   // @note Smoothing distance is expected to be small relative to the collider geometry.
-  real penaltySmoothingHalfDistance [units(m)] = 0.005;
+  real penaltySmoothingHalfDistance [units("m")] = 0.005;
   // @brief Default contact detection threshold [m].
   //
   // @details The penalty force transitions from 0 to linear over the decreasing distance range
   // (penaltyThreshold, penaltyThreshold - 2 * @ref penaltySmoothingHalfDistance).
   //
-  // @note Negative values are legal.
+  // @note Must be finite. Negative values are legal.
   // @note If the colliding actor has @ref ColliderType::None or @ref ColliderType::PointCloud,
   // penaltyThreshold = penaltyThresholdDefault + @ref penaltyThresholdExtraPadding. Otherwise,
   // penaltyThreshold = penaltyThresholdDefault.
   //
   // @see penaltyThresholdExtraPadding, GetPenaltyThresholdDist
-  real penaltyThresholdDefault [units(m)] = 0.001;
+  real penaltyThresholdDefault [units("m")] = 0.001;
   // @brief Extra padding [m] added to the default contact detection threshold if the colliding
   // actor has @ref ColliderType::None or @ref ColliderType::PointCloud.
   //
-  // @note Must not be negative.
+  // @note Must be finite and not negative.
   // @note Extra padding is useful to avoid tunneling through thin actors when the other actor has
   // @ref ColliderType::None or @ref ColliderType::PointCloud.
   //
   // @see penaltyThresholdDefault, GetPenaltyThresholdDist
-  real penaltyThresholdExtraPadding [units(m)] = 0;
+  real penaltyThresholdExtraPadding [units("m")] = 0;
   // @brief Use collider's normal (normalized SDF gradient) for friction direction if true, or the
   // colliding's surface normal at the sample point if false.
   //
@@ -1083,25 +1119,27 @@ struct ContactParams [from_mochi_core] {
   // Contact is disabled for sample points whose normal alignment exceeds this threshold. This
   // prevents sample points from being trapped inside the collider when penetration is large.
   //
-  // @note Valid range is [-1, 1]. -1 allows contact only for perfectly opposing normals, 1 allows
-  // all contacts.
+  // @note Must be in [-1, 1]. -1 allows contact only for perfectly opposing normals, 1 allows all
+  // contacts.
   // @note For co-dimensional colliding actors with ambiguous normals, contact is not disabled
   // regardless of maxAlignmentNormals (normal alignment cannot be computed).
   real maxAlignmentNormals = 0;
   // @brief Viscous friction coefficient [s/m].
   //
   // @note Friction force is proportional to contact force and tangential velocity.
-  // @note Must not be negative.
+  // @note Must be finite and not negative.
   // @note Both viscousFrictionCoefficient and @ref coulombFrictionCoefficient can be >0.
-  // @note The viscous friction coefficient used in a collision is the geometric mean of the
-  // colliding and collider's coefficients. This disables viscous friction if either of them does.
-  real viscousFrictionCoefficient [units(s/m)] = 0;
+  // @note Without an actor-pair override for this field, the value used in a collision is the
+  // geometric mean of the colliding and collider's coefficients. This disables viscous friction if
+  // either of them does.
+  real viscousFrictionCoefficient [units("s/m")] = 0;
   // @brief Coulomb friction coefficient (dimensionless).
   //
-  // @note Must not be negative.
+  // @note Must be finite and not negative.
   // @note Both @ref viscousFrictionCoefficient and coulombFrictionCoefficient can be >0.
-  // @note The Coulomb friction coefficient used in a collision is the geometric mean of the
-  // colliding and collider's coefficients. This disables Coulomb friction if either of them does.
+  // @note Without an actor-pair override for this field, the value used in a collision is the
+  // geometric mean of the colliding and collider's coefficients. This disables Coulomb friction if
+  // either of them does.
   real coulombFrictionCoefficient = 0.5;
   // @brief Velocity threshold for Coulomb friction smoothing [m/s].
   //
@@ -1110,13 +1148,13 @@ struct ContactParams [from_mochi_core] {
   // CinfRegularized, the force asymptotically approaches full strength with no compact support
   // boundary; frictionFalloffVel controls the regularization scale.
   //
-  // @note Must not be negative. For CinfRegularized, a value of zero is clamped internally to
-  // avoid numerical issues.
+  // @note Must be finite and not negative. For CinfRegularized, a value of zero is clamped
+  // internally to avoid numerical issues.
   // @note Smaller velocity thresholds improve physical accuracy but may degrade stability.
-  // @note The velocity threshold used in a collision is the geometric mean of the colliding and
-  // collider's thresholds. The exception is if the collider is static, in which case the
-  // colliding's threshold is used.
-  real frictionFalloffVel [units(m/s)] = 0.01;
+  // @note Without an actor-pair override for this field, the value used in a collision is the
+  // geometric mean of the colliding and collider's thresholds. The exception is if the collider is
+  // static, in which case the colliding's threshold is used.
+  real frictionFalloffVel [units("m/s")] = 0.01;
   // @brief Normal viscous damping coefficient [s/m].
   //
   // @details Damping force in the normal direction, proportional to the elastic normal contact
@@ -1126,9 +1164,10 @@ struct ContactParams [from_mochi_core] {
   // @warning The calibration diverges as CoR approaches zero, which may cause numerical problems
   // when approaching fully-inelastic collisions.
   //
-  // @note Must not be negative.
-  // @note The normal viscous damping coefficient used in a collision is the geometric mean of the
-  // colliding and collider's coefficients. This disables normal damping if either of them does.
+  // @note Must be finite and not negative.
+  // @note Without an actor-pair override for this field, the value used in a collision is the
+  // geometric mean of the colliding and collider's coefficients. This disables normal damping if
+  // either of them does.
   // @note The resulting coefficient of restitution (CoR) is velocity-dependent. For a
   // characteristic impact velocity,
   // @ref experimental::CalibrateNormalViscousDampingCoefficient computes the coefficient that
@@ -1137,21 +1176,24 @@ struct ContactParams [from_mochi_core] {
   // @note Because the damping force depends on the normal velocity at each contact point, it also
   // introduces rolling resistance: a body rolling on a surface dissipates energy through the
   // differing normal velocities across its contacting region.
-  real normalViscousDampingCoefficient [units(s/m)] = 0;
+  real normalViscousDampingCoefficient [units("s/m")] = 0;
   // @brief [Experimental] Padding [m] added to the collider's bounding volume for collision
   // culling.
   //
   // @warning This is an experimental feature. It may be changed or removed in the future. Use at
   // your own risk.
   //
+  // @note Must be finite.
   // @note Useful, for example, with approximate SDFs (e.g., deep flow map) to compensate for
   // potentially overestimating the true distance.
-  real distanceErrorBound [units(m)] = 0;
+  real distanceErrorBound [units("m")] = 0;
   // @brief [Experimental] Object scale relative to default size (dimensionless). Used by deep flow
   // only.
   //
   // @warning Deep flow is an experimental feature. It may be changed or removed in the future. Use
   // at your own risk.
+  //
+  // @note Must be finite and strictly positive.
   real objScale = 1;
   // @brief [Experimental] Length scale [m] used to correct the penalty coefficient when the
   // colliding body integrates contact traction over a lower-than-two-dimensional manifold, such as
@@ -1161,11 +1203,12 @@ struct ContactParams [from_mochi_core] {
   // @warning Contact with lower-dimensional bodies is an experimental feature. It may be changed or
   // removed in the future. Use at your own risk.
   //
+  // @note Must be finite and strictly positive.
   // @note This value is not used in the most common case, where contact traction is integrated over
   // a two-dimensional surface.
   // @note The colliding body's value is always used in a contact pair, because the colliding body
   // determines the dimension of the contact traction integral.
-  real collidingPenaltyLengthScale [units(m)] = 1;
+  real collidingPenaltyLengthScale [units("m")] = 1;
 
   // @brief Get the total contact detection threshold.
   //
@@ -1857,10 +1900,10 @@ struct LinearSolverParams [from_mochi_core] {
   //
   // @note Applies only to iterative solvers.
   real relDivTol = 1e10;
-  // @brief Maximum number of linear solver iterations.
+  // @brief Maximum number of iterations for iterative solvers.
   //
   // @note Applies only to iterative solvers.
-  // @note Must be non-negative or @ref kAutoLinearSolverMaxIter.
+  // @note Must be positive or @ref kAutoLinearSolverMaxIter.
   // @note @ref kAutoLinearSolverMaxIter lets Mochi select the maximum number of iterations based
   // on the problem.
   int maxIter = kAutoLinearSolverMaxIter;

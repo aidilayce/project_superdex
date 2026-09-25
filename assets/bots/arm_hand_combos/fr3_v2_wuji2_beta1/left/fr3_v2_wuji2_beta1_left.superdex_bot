@@ -1,0 +1,61 @@
+{
+  "base": "//arms/fr3_v2/fr3_v2.superdex_bot",
+  "modifications": [
+    {
+      "AttachLink": {
+        "enabled": true,
+        "joint": {
+          "name": "mount_joint",
+          "type": "Hard"
+        },
+        "link": {
+          "centerOfMass": [
+            -0.0012511536478996277,
+            -0.0039428621530532837,
+            0.016306621953845024
+          ],
+          "mass": 0.05000000074505806,
+          "momentOfInertia": [
+            1.6505095118191093e-05,
+            -7.3866272032319102e-07,
+            8.5933027094142744e-07,
+            1.7383295926265419e-05,
+            -6.0373287169568357e-07,
+            2.2878562958794646e-05
+          ],
+          "name": "mount_link",
+          "renderModel": "render/Wuji_AngledMounted_30_10_Left.glb",
+          "shape": "collision/Wuji_AngledMounted_30_10_Left.mochi.h5"
+        },
+        "name": "mount",
+        "parentLinkName": "fr3_link8"
+      }
+    },
+    {
+      "AttachBot": {
+        "enabled": true,
+        "joint": {
+          "name": "mount_to_wuji_joint",
+          "parentLinkFromJoint": {
+            "rotation": [
+              -0.084187977015972137,
+              0.25782245397567749,
+              -0.96225273609161377,
+              0.022572463378310204
+            ],
+            "translation": [
+              0,
+              -0.014999999664723873,
+              0.029999999329447746
+            ]
+          },
+          "type": "Hard"
+        },
+        "name": "wuji",
+        "parentLinkName": "mount_link",
+        "path": "//hands/wuji_hand2_beta1/left/wuji_hand2_beta1_skinned_left.superdex_bot"
+      }
+    }
+  ],
+  "name": "fr3_v2_wuji2_beta1_left"
+}

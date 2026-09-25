@@ -50,44 +50,15 @@ class Simd<float, 8> {
   template <int i>
   [[nodiscard]] static MOCHI_FORCE_INLINE float Get(Simd v) {
     static_assert(i >= 0 && i < 8, "Index out of range");
-    if constexpr (i == 0) {
-      return _mm256_cvtss_f32(v.raw); // AVX
-    } else if constexpr (i == 1) {
-      return _mm256_cvtss_f32(_mm256_shuffle_ps(v.raw, v.raw, 0x01)); // AVX, AVX
-    } else if constexpr (i == 2) {
-      return _mm256_cvtss_f32(_mm256_shuffle_ps(v.raw, v.raw, 0x02)); // AVX, AVX
-    } else if constexpr (i == 3) {
-      return _mm256_cvtss_f32(_mm256_shuffle_ps(v.raw, v.raw, 0x03)); // AVX, AVX
-    } else if constexpr (i == 4) {
-      return _mm256_cvtss_f32(_mm256_permute2f128_ps(v.raw, v.raw, 0x01)); // AVX, AVX
-    } else if constexpr (i == 5) {
-      auto tmp = _mm256_permute2f128_ps(v.raw, v.raw, 0x01); // AVX
-      return _mm256_cvtss_f32(_mm256_shuffle_ps(tmp, tmp, 0x01)); // AVX, AVX
-    } else if constexpr (i == 6) {
-      auto tmp = _mm256_permute2f128_ps(v.raw, v.raw, 0x01); // AVX
-      return _mm256_cvtss_f32(_mm256_shuffle_ps(tmp, tmp, 0x02)); // AVX, AVX
-    } else if constexpr (i == 7) {
-      auto tmp = _mm256_permute2f128_ps(v.raw, v.raw, 0x01); // AVX
-      return _mm256_cvtss_f32(_mm256_shuffle_ps(tmp, tmp, 0x03)); // AVX, AVX
-    }
+    return v[i];
   }
 
-  [[nodiscard]] static MOCHI_FORCE_INLINE float Get(Simd v, int i) {
+  [[nodiscard]] MOCHI_FORCE_INLINE Scalar operator[](int i) const {
     MOCHI_ASSERT_VERBOSE(i >= 0 && i < kSize, "Index out of range");
 #if MOCHI_COMPILER_MSVC
-    return v.raw.m256_f32[i];
+    return raw.m256_f32[i];
 #else
-    switch (i) { // clang-format off
-      case 0: return Get<0>(v);
-      case 1: return Get<1>(v);
-      case 2: return Get<2>(v);
-      case 3: return Get<3>(v);
-      case 4: return Get<4>(v);
-      case 5: return Get<5>(v);
-      case 6: return Get<6>(v);
-      case 7: return Get<7>(v);
-      MOCHI_UNLIKELY default: return 0;
-    } // clang-format on
+    return raw[i];
 #endif
   }
 
@@ -192,7 +163,11 @@ class Simd<float, 8> {
 
   [[nodiscard]] static MOCHI_FORCE_INLINE Simd Load(Scalar const* ptr, int n) {
     MOCHI_ASSERT_VERBOSE(n >= 0 && n <= kSize, "Invalid size parameter");
+#if MOCHI_ARCH_X64_AVX512
+    return _mm256_maskz_loadu_ps(x64_simd::kLaneMasksS8[n], ptr); // AVX512VL
+#else
     return _mm256_maskload_ps(ptr, x64_simd::kLoadMasksS8[n]); // AVX
+#endif
   }
 
   [[nodiscard]] static Simd LoadIndexed(Scalar const* ptr, Simd<int, 8> const& indices) {
@@ -204,7 +179,7 @@ class Simd<float, 8> {
     static_assert(N >= 0 && N <= kSize);
     if constexpr (N == 0) {
     } else if constexpr (N < kSize) {
-      // About 3X faster than a masked store on AMD. About the same on Intel.
+      // About 3X faster than a masked store on older AMD CPUs. About the same on others.
       memcpy(ptr, &v, sizeof(Scalar) * N);
     } else {
       _mm256_storeu_ps(ptr, v.raw); // AVX
@@ -247,9 +222,12 @@ class Simd<float, 8> {
 
   static MOCHI_FORCE_INLINE void Store(Scalar* ptr, Simd v, int n) {
     MOCHI_ASSERT_VERBOSE(n >= 0 && n <= kSize, "Invalid size parameter");
-    // Faster than masked store on AMD.
-    // clang-format off
-    switch (n) {
+#if MOCHI_ARCH_X64_AVX512
+    _mm256_mask_storeu_ps(ptr, x64_simd::kLaneMasksS8[n], v.raw); // AVX512VL
+#else
+    // With AVX2, this is faster than masked store for a predictable value of n.
+    // It is much slower for a random value of n.
+    switch (n) { // clang-format off
       case 1: Store<1>(ptr, v); break;
       case 2: Store<2>(ptr, v); break;
       case 3: Store<3>(ptr, v); break;
@@ -259,8 +237,8 @@ class Simd<float, 8> {
       case 7: Store<7>(ptr, v); break;
       case 8: Store<8>(ptr, v); break;
       MOCHI_UNLIKELY default: break;
-    }
-    // clang-format on
+    } // clang-format on
+#endif
   }
 
   MOCHI_FORCE_INLINE static int StoreSelected(Scalar* ptr, Simd condition, Simd values) {

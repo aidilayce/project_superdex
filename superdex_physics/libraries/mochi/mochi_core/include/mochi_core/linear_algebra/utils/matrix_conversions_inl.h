@@ -85,9 +85,8 @@ void CheckDimensionsOffsets(
 /**
  * @brief Add interaction matrices to a block sparse matrix.
  *
- * @tparam kSkipMissingSparsityEntries If true, interaction matrix entries that fall outside the
- * target block sparse matrix's sparsity pattern are silently dropped. If false (default), it is
- * invalid to have such entries (asserts in debug builds; undefined behavior in optimized builds).
+ * @tparam kMissingSparsityPolicy How to handle interaction entries outside the target matrix's
+ * sparsity pattern.
  * @tparam kBlockSize Block size
  * @tparam Scalar Type for the numerical values
  * @param[in] interactionMatrices Interaction matrices to be added
@@ -97,11 +96,12 @@ void CheckDimensionsOffsets(
  * @note The constraints for the interaction matrices are documented in @ref
  * InteractionMatrixInfoImpl.
  */
-template <bool kSkipMissingSparsityEntries = false, int kBlockSize, typename Scalar>
+template <MissingSparsityPolicy kMissingSparsityPolicy, int kBlockSize, typename Scalar>
 void AddInteractionToBlockSparseMatrix(
     std::vector<AnyInteractionMatrixViewInfo<Scalar const>> const& interactionMatrices,
     BlockSparseMatrix<std::remove_const_t<Scalar>, kBlockSize, int, int>& ABsr,
     int AOffset) {
+  using NonConstScalar = std::remove_const_t<Scalar>;
   CheckDimensionsOffsets<kBlockSize>(interactionMatrices, ABsr, AOffset);
 
   auto const aRows = ABsr.Rows();
@@ -147,27 +147,47 @@ void AddInteractionToBlockSparseMatrix(
           int const aBlock = blockShift + br;
           auto const aBlockColIdx = ABsr.Indices(aBlock);
           auto aBlockValues = ABsr.Values(aBlock);
+          [[maybe_unused]] NonConstScalar diagonalIncrements[kBlockSize]{};
+          [[maybe_unused]] bool hasMissingBlock = false;
           auto aBlockColIdxItr = aBlockColIdx.begin();
           for (int k = static_cast<int>(
                    std::ranges::lower_bound(blockColIdx, bStart) - blockColIdx.begin());
                (k < isize(blockColIdx)) && (blockColIdx[k] < bEnd);
                ++k) {
             auto const aLocalBlock = blockShift + blockColIdx[k];
-            auto next = std::lower_bound(aBlockColIdxItr, aBlockColIdx.end(), aLocalBlock);
-            if constexpr (kSkipMissingSparsityEntries) {
-              if ((next == aBlockColIdx.end()) || (*next != aLocalBlock))
-                MOCHI_UNLIKELY {
-                  continue;
+            auto const targetBlock =
+                std::lower_bound(aBlockColIdxItr, aBlockColIdx.end(), aLocalBlock);
+            bool const targetBlockIsMissing =
+                targetBlock == aBlockColIdx.end() || *targetBlock != aLocalBlock;
+            if (targetBlockIsMissing)
+              MOCHI_UNLIKELY {
+                if constexpr (kMissingSparsityPolicy == MissingSparsityPolicy::AddAbsToDiagonal) {
+                  hasMissingBlock = true;
+                  for (int localRow = 0; localRow < kBlockSize; ++localRow) {
+                    for (int localCol = 0; localCol < kBlockSize; ++localCol) {
+                      diagonalIncrements[localRow] += Abs(blockValues[k](localRow, localCol));
+                    }
+                  }
                 }
-            } else {
+                continue;
+              }
+            auto const targetBlockIndex = int(targetBlock - aBlockColIdx.begin());
+            aBlockValues[targetBlockIndex] += blockValues[k];
+            aBlockColIdxItr = targetBlock + 1;
+          }
+          if constexpr (kMissingSparsityPolicy == MissingSparsityPolicy::AddAbsToDiagonal) {
+            if (hasMissingBlock) {
+              auto const diagonalBlock =
+                  std::lower_bound(aBlockColIdx.begin(), aBlockColIdx.end(), aBlock);
               MOCHI_ASSERT_VERBOSE(
-                  (next != aBlockColIdx.end()) && (*next == aLocalBlock),
-                  "Attempting to add values that are not supported by the sparsity pattern of the actor matrix.");
+                  diagonalBlock != aBlockColIdx.end() && *diagonalBlock == aBlock,
+                  "Target matrix must contain every diagonal block.");
+              auto diagonalValues =
+                  aBlockValues[static_cast<int>(diagonalBlock - aBlockColIdx.begin())];
+              for (int localRow = 0; localRow < kBlockSize; ++localRow) {
+                diagonalValues(localRow, localRow) += diagonalIncrements[localRow];
+              }
             }
-            // Add values (kBlockSize x kBlockSize matrix) in this block
-            auto const myIdx = int(next - aBlockColIdx.begin());
-            aBlockValues[myIdx] += blockValues[k];
-            aBlockColIdxItr = next + 1;
           }
         }
       };
@@ -212,8 +232,9 @@ void AddInteractionToBlockSparseMatrix(
 
           // Track current block to avoid repeated binary searches for consecutive columns in same
           // block.
-          int currentBlockCol = -1;
-          int currentBlockIdx = -1;
+          int currentTargetBlock = -1;
+          int currentTargetBlockIndex = -1;
+          [[maybe_unused]] NonConstScalar diagonalIncrement{};
 
           for (int k = static_cast<int>(
                    std::ranges::lower_bound(localColIdx, localColStart) - localColIdx.begin());
@@ -222,28 +243,39 @@ void AddInteractionToBlockSparseMatrix(
             auto const globalCol = cOffset + localColIdx[k];
             auto const aCol = globalCol - AOffset;
             auto const aBlockCol = aCol / kBlockSize;
-            auto const aLocalCol = aCol % kBlockSize;
 
             // Find the block index (reuse if same block as previous iteration).
-            if (aBlockCol != currentBlockCol) {
-              auto it = std::lower_bound(
-                  aBlockColIdx.begin() + (currentBlockIdx + 1), aBlockColIdx.end(), aBlockCol);
-              if constexpr (kSkipMissingSparsityEntries) {
-                if (it == aBlockColIdx.end() || *it != aBlockCol)
-                  MOCHI_UNLIKELY {
-                    continue;
-                  }
-              } else {
-                MOCHI_ASSERT_VERBOSE(
-                    it != aBlockColIdx.end() && *it == aBlockCol,
-                    "Attempting to add values that are not supported by the sparsity pattern of the actor matrix.");
-              }
-              currentBlockIdx = static_cast<int>(it - aBlockColIdx.begin());
-              currentBlockCol = aBlockCol;
+            if (aBlockCol != currentTargetBlock) {
+              auto const targetBlock = std::lower_bound(
+                  aBlockColIdx.begin() + (currentTargetBlockIndex + 1),
+                  aBlockColIdx.end(),
+                  aBlockCol);
+              bool const targetBlockIsMissing =
+                  targetBlock == aBlockColIdx.end() || *targetBlock != aBlockCol;
+              currentTargetBlock = aBlockCol;
+              currentTargetBlockIndex =
+                  targetBlockIsMissing ? -1 : static_cast<int>(targetBlock - aBlockColIdx.begin());
             }
-
-            // Add the value to the appropriate position in the block.
-            aBlockValues[currentBlockIdx](aLocalRow, aLocalCol) += values[k];
+            if (currentTargetBlockIndex < 0)
+              MOCHI_UNLIKELY {
+                if constexpr (kMissingSparsityPolicy == MissingSparsityPolicy::AddAbsToDiagonal) {
+                  diagonalIncrement += Abs(values[k]);
+                }
+                continue;
+              }
+            auto const aLocalCol = aCol % kBlockSize;
+            aBlockValues[currentTargetBlockIndex](aLocalRow, aLocalCol) += values[k];
+          }
+          if constexpr (kMissingSparsityPolicy == MissingSparsityPolicy::AddAbsToDiagonal) {
+            if (diagonalIncrement != NonConstScalar{}) {
+              auto const diagonalBlock =
+                  std::lower_bound(aBlockColIdx.begin(), aBlockColIdx.end(), aBlockRow);
+              MOCHI_ASSERT_VERBOSE(
+                  diagonalBlock != aBlockColIdx.end() && *diagonalBlock == aBlockRow,
+                  "Target matrix must contain every diagonal block.");
+              int const diagonalBlockIndex = static_cast<int>(diagonalBlock - aBlockColIdx.begin());
+              aBlockValues[diagonalBlockIndex](aLocalRow, aLocalRow) += diagonalIncrement;
+            }
           }
         }
       };
@@ -261,7 +293,7 @@ void AddInteractionToBlockSparseMatrix(
 
 namespace mochi {
 
-template <int kBlockSize, bool kSkipMissingSparsityEntries, typename Scalar>
+template <int kBlockSize, MissingSparsityPolicy kMissingSparsityPolicy, typename Scalar>
 BlockSparseMatrix<std::remove_const_t<Scalar>, kBlockSize, int, int> ToBlockSparseMatrix(
     ActorPseudoMatrix<Scalar> const& in) {
   // Verify that the actor matrix is block sparse with the correct block size.
@@ -277,7 +309,7 @@ BlockSparseMatrix<std::remove_const_t<Scalar>, kBlockSize, int, int> ToBlockSpar
   // Make a copy of the actor matrix in block sparse format
   BlockSparseMatrix<NonConstScalar, kBlockSize> ABsr(bsr);
   // Add interaction to block sparse matrix
-  details::AddInteractionToBlockSparseMatrix<kSkipMissingSparsityEntries>(
+  details::AddInteractionToBlockSparseMatrix<kMissingSparsityPolicy>(
       in.interactionMatrices, ABsr, in.offset);
   return ABsr;
 }

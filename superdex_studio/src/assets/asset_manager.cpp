@@ -41,7 +41,7 @@ AssetManager::AssetManager(SuperDexStudio* studio) : _studio(studio) {
   _thumbnailScene->CreateSkybox();
   _thumbnailScene->CreateSunlight();
   _thumbnailScene->CreateIndirectLight();
-  _thumbnailScene->SetIbl(_studio->GetDefaultIbl());
+  _thumbnailScene->SetIbl(_studio->GetCurrentIbl());
   _thumbnailScene->SetSkyboxVisible(false);
 }
 
@@ -289,6 +289,20 @@ bool AssetManager::UnloadAllAssets() {
   return _assets.empty();
 }
 
+void AssetManager::InvalidateShapeCachesForPath(mochi::Path const& path) {
+  if (auto* model = FindAssetByPath<MochiModelAsset>(path)) {
+    model->ClearShapeCache();
+  }
+  _studio->GetMochiContext()->ClearFileFromCache(path.ToString());
+  // Prefabs pin one ShapeHandle per actor, and nested prefab references keep their shape paths in
+  // their own unresolved spelling, so there is no reliable way to tell which prefab actors came
+  // from `path`. Clear them all: re-resolving an unaffected shape is a context file-cache hit, not
+  // a disk read.
+  for (Asset* asset : GetAllAssetsOfType(AssetType::MochiPrefab)) {
+    ClearCachedShapes(static_cast<MochiPrefabAsset*>(asset)->GetPrefab());
+  }
+}
+
 Asset* AssetManager::FindAssetByPath(mochi::Path const& path, bool silent) const {
   auto it = _assets.find(path);
   if (it != _assets.end()) {
@@ -315,6 +329,13 @@ std::vector<Asset*> AssetManager::GetAllAssetsOfType(AssetType type) const {
     }
   }
   return result;
+}
+
+void AssetManager::SetThumbnailIbl(mochi_renderer::IBL* ibl) {
+  if (_thumbnailScene) {
+    _thumbnailScene->SetIbl(ibl);
+    _thumbnailScene->SetSkyboxVisible(false);
+  }
 }
 
 void AssetManager::RenderAssetThumbnails(Renderer& renderer, int maxThumbnails) {

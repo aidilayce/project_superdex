@@ -50,6 +50,7 @@ class MochiModelAsset;
 class RenderModelAsset;
 class CadModelAsset;
 class SuperDexStudio;
+struct MeasureTarget;
 
 // One user-added "Additional Reference Model": a viewer-only reference asset shown alongside the
 // fixed CAD/render/mochi slots, with its own type, transform, and visualization toggles. Its
@@ -360,6 +361,10 @@ class ModelEditor : public AssetEditor {
   // modifier's MeshStats (guarded by outputGenId) and recomposites the display. Called once per
   // frame.
   void PumpHausdorffResults();
+  // Fills the Measure tool's pickable-object list: every slot, reference model and processing stage
+  // that has both a scene object and the CPU sections it was built from. The mochi slot (and a
+  // mochi reference) counts as collision geometry; everything else as render geometry.
+  void CollectMeasureTargets(std::vector<MeasureTarget>& out) const;
 
  private:
   std::unique_ptr<Viewport> _viewport;

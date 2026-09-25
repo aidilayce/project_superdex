@@ -30,7 +30,7 @@ void InitializeOnce(entt::registry& reg) {
   ecs::RegisterComponent<component<pre, TimeStep::StageStart, post>>(reg);
 
   ecs::RegisterComponent<CActorInfo>(reg);
-  MOCHI_REGISTER_ALL_TIME_STEPS(CBoundingVolume);
+  ecs::RegisterComponent<CBoundingVolume>(reg);
   ecs::RegisterComponent<CConservativeStepBounds>(reg);
   ecs::RegisterComponent<CContactParams>(reg);
   ecs::RegisterComponent<CConvergenceStatus>(reg);
@@ -62,11 +62,12 @@ void InitializeOnce(entt::registry& reg) {
   ecs::RegisterComponent<TagRigidActor>(reg);
   ecs::RegisterComponent<TagRomActor>(reg);
   ecs::RegisterComponent<TagSoftActor>(reg);
-  ecs::RegisterComponent<TagSoftSkinnedActor>(reg);
+  ecs::RegisterComponent<TagNestedSoftActor>(reg);
   ecs::RegisterComponent<TagShellActor>(reg);
   ecs::RegisterComponent<TagRodActor>(reg);
   ecs::RegisterComponent<TagDeformableActor>(reg);
   ecs::RegisterComponent<TagStaticActor>(reg);
+  ecs::RegisterComponent<TagUseDeformableContactSkin>(reg);
   ecs::RegisterComponent<TagExcludedFromDebugDraw>(reg);
   ecs::RegisterComponent<TagSkinnedContact>(reg);
   ecs::RegisterComponent<CNodalBasedStructure>(reg);

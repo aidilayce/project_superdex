@@ -23,7 +23,7 @@
 namespace mochi::x64_simd {
 
 // Shuffle pattern lookup table for StoreSelected. Used by Simd<float, 4>, Simd<int, 4>
-MOCHI_CACHE_ALIGN static const int kStoreSelectedShuffleTableS4[16][4] = {
+MOCHI_CONSERVATIVE_CACHE_ALIGN static const int kStoreSelectedShuffleTableS4[16][4] = {
     {0, 1, 2, 3},
     {0, 1, 2, 3},
     {1, 0, 2, 3},
@@ -42,7 +42,7 @@ MOCHI_CACHE_ALIGN static const int kStoreSelectedShuffleTableS4[16][4] = {
     {0, 1, 2, 3}};
 
 // Shuffle pattern lookup table for StoreSelected. Used by Simd<double, 4>, Simd<int64_t, 4>
-MOCHI_CACHE_ALIGN static const uint8_t kStoreSelectedShuffleTableD4[16][8] = {
+MOCHI_CONSERVATIVE_CACHE_ALIGN static const uint8_t kStoreSelectedShuffleTableD4[16][8] = {
     {0, 1, 2, 3, 4, 5, 6, 7},
     {0, 1, 2, 3, 4, 5, 6, 7},
     {2, 3, 0, 1, 4, 5, 6, 7},
@@ -61,7 +61,7 @@ MOCHI_CACHE_ALIGN static const uint8_t kStoreSelectedShuffleTableD4[16][8] = {
     {0, 1, 2, 3, 4, 5, 6, 7}};
 
 // Shuffle pattern lookup table for StoreSelected. Used by Simd<int, 8>, Simd<float, 8>
-MOCHI_CACHE_ALIGN static const uint8_t kStoreSelectedShuffleTableS8[256][8] = {
+MOCHI_CONSERVATIVE_CACHE_ALIGN static const uint8_t kStoreSelectedShuffleTableS8[256][8] = {
     {0, 0, 0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0, 0, 0}, {1, 0, 0, 0, 0, 0, 0, 0},
     {0, 1, 0, 0, 0, 0, 0, 0}, {2, 0, 0, 0, 0, 0, 0, 0}, {0, 2, 0, 0, 0, 0, 0, 0},
     {1, 2, 0, 0, 0, 0, 0, 0}, {0, 1, 2, 0, 0, 0, 0, 0}, {3, 0, 0, 0, 0, 0, 0, 0},
@@ -149,6 +149,7 @@ MOCHI_CACHE_ALIGN static const uint8_t kStoreSelectedShuffleTableS8[256][8] = {
     {2, 3, 4, 5, 6, 7, 0, 0}, {0, 2, 3, 4, 5, 6, 7, 0}, {1, 2, 3, 4, 5, 6, 7, 0},
     {0, 1, 2, 3, 4, 5, 6, 7}};
 
+#if !MOCHI_ARCH_X64_AVX512
 // Load masks for masking partial loads of 32-bit elements (4 slots). Used by Simd<float, 4>,
 // Simd<int, 4>
 #if MOCHI_COMPILER_MSVC
@@ -201,6 +202,11 @@ static constexpr __m256i kLoadMasksS8[] = {
     {static_cast<long long>(0xFFFFFFFFFFFFFFFFLL), static_cast<long long>(0xFFFFFFFFFFFFFFFFLL), static_cast<long long>(0xFFFFFFFFFFFFFFFFLL), static_cast<long long>(0x00000000FFFFFFFFLL)},
     {static_cast<long long>(0xFFFFFFFFFFFFFFFFLL), static_cast<long long>(0xFFFFFFFFFFFFFFFFLL), static_cast<long long>(0xFFFFFFFFFFFFFFFFLL), static_cast<long long>(0xFFFFFFFFFFFFFFFFLL)}};
 // clang-format on
+#endif
+#endif
+
+#if MOCHI_ARCH_X64_AVX512
+alignas(16) static constexpr __mmask8 kLaneMasksS8[] = {0, 1, 3, 7, 15, 31, 63, 127, 255};
 #endif
 
 } // namespace mochi::x64_simd

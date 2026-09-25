@@ -51,6 +51,22 @@ namespace mochi {
 
 class Scene;
 
+struct ContactPairParamsOverride {
+  std::optional<real> penaltyCoefficient;
+
+  std::optional<real> frictionFalloffVel;
+
+  std::optional<real> viscousFrictionCoefficient;
+
+  std::optional<real> coulombFrictionCoefficient;
+
+  std::optional<real> normalViscousDampingCoefficient;
+
+#if MOCHI_LANGUAGE_CPP20
+  bool operator==(ContactPairParamsOverride const&) const = default;
+#endif
+};
+
 struct SolverParams {
   NonLinearSolverParams nonLinearSolver = {};
 
@@ -225,6 +241,7 @@ struct ArticulatedSkinParams {
   ContactParams contact;
   ActorBoundaryElementType boundaryElementType = ActorBoundaryElementType::Default;
   std::optional<BoundarySubsamplingParams> boundarySubsampling;
+  std::optional<DynamicArray<DynamicString>> nonCollidingLinks;
 
 #if MOCHI_LANGUAGE_CPP20
   bool operator==(ArticulatedSkinParams const&) const = default;

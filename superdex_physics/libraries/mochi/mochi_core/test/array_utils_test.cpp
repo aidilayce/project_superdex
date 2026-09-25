@@ -644,6 +644,16 @@ TEST(ArrayUtils, MaxAbs) {
   }
 }
 
+TEST(ArrayUtils, MaxPackedVector3Norm) {
+  EXPECT_EQ(0_r, MaxPackedVector3Norm<3>({}));
+
+  std::array<real, 9> const packed3 = {1_r, 2_r, 2_r, 0_r, 0_r, 0_r, 3_r, -4_r, 0_r};
+  EXPECT_NEAR_EQ(5_r, MaxPackedVector3Norm<3>(MakeConstSpan(packed3)));
+
+  std::array<real, 8> const packed4 = {1_r, 2_r, 2_r, 1000_r, 3_r, -4_r, 0_r, -1000_r};
+  EXPECT_NEAR_EQ(5_r, MaxPackedVector3Norm<4>(MakeConstSpan(packed4)));
+}
+
 TEST(ArrayUtils, MaxAbsDifference) {
   for (int sz : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 31, 32, 33}) {
     std::vector<real> vecA(sz);

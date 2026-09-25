@@ -93,7 +93,8 @@ void mochi::MatAddSubBlocks(
   // store the offset of the start of each column IndexGroup. We can then reuse this information
   // for any subsequent row that has the same sparsity (same column indices in dstMatrix).
   MOCHI_FILO_STACK_ALLOCATOR(allocator, 512 * sizeof(int)); // Up to 512 index groups.
-  DynamicArray<int> dstColOffsets(cols.size(), &allocator);
+  DynamicArray<int> dstColOffsets(&allocator);
+  dstColOffsets.resize_noinit(cols.size());
   int dstNumColsInRow = -1;
 
   // Update the cache for a specific row
@@ -155,7 +156,8 @@ void MatAddSubBlocksImpl(
   // for any subsequent block row that has the same sparsity (same block column indices in
   // dstMatrix).
   MOCHI_FILO_STACK_ALLOCATOR(allocator, 512 * sizeof(int)); // Up to 512 index groups.
-  DynamicArray<int> dstBlockColOffsets(cols.size(), &allocator);
+  DynamicArray<int> dstBlockColOffsets(&allocator);
+  dstBlockColOffsets.resize_noinit(cols.size());
   int dstNumBlockColsInRow = -1;
 
   // Update the cache for a specific block row

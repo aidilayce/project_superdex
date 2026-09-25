@@ -206,7 +206,12 @@ void SceneObject::SetShadows(bool castShadows, bool receiveShadows) {
   }
 }
 
+bool SceneObject::IsVisible() const {
+  return _visible;
+}
+
 void SceneObject::SetVisible(bool visible) {
+  _visible = visible;
   auto& rcm = _engine->getRenderableManager();
   auto entities = GetEntities();
   for (auto entity : entities) {

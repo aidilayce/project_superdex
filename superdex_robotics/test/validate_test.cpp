@@ -123,6 +123,29 @@ TEST_F(BotUtilsValidate, DuplicateJointLinkName) {
   Validate(bp, nullptr, ExpectNotOK{});
 }
 
+// 4d. A bot with a skin but no name collision is valid. The skin is referenced by the bot name.
+TEST_F(BotUtilsValidate, SkinPresentNoCollision) {
+  auto bp = MakeValidBotPrefab(3);
+  bp.skin.emplace();
+  Validate(bp, nullptr, ExpectOK{});
+}
+
+// 4e. A link may not share the bot name when a skin is present: the skin is referenced by the bot
+// name in contact overrides, so the reference would be ambiguous.
+TEST_F(BotUtilsValidate, LinkNameCollidesWithBotNameWhenSkin) {
+  auto bp = MakeValidBotPrefab(3);
+  bp.links[1].name = bp.name;
+  bp.skin.emplace();
+  Validate(bp, nullptr, ExpectNotOK{});
+}
+
+// 4f. Without a skin, a link sharing the bot name is fine: the bot name is not a contact party.
+TEST_F(BotUtilsValidate, LinkNameEqualsBotNameNoSkin) {
+  auto bp = MakeValidBotPrefab(3);
+  bp.links[1].name = bp.name;
+  Validate(bp, nullptr, ExpectOK{});
+}
+
 // 5. Root link with non-kIndexNone parent
 TEST_F(BotUtilsValidate, RootLinkWithParent) {
   auto bp = MakeValidBotPrefab(2);

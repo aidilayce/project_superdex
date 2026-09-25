@@ -325,3 +325,75 @@ TEST(ActorPreconditionerTest, ActorPreconditioner) {
   TestActorPrecFromBlockSparseActorMatrix<3>(precBSp);
   TestActorPrecFromBlockSparseActorMatrix<4>(precBSp);
 }
+
+TEST(ActorPreconditionerTest, MissingInteractionEntryPolicies) {
+  auto actorDense = RowMatrix<real>::Zero(6, 6);
+  for (int i = 0; i < actorDense.Rows(); ++i) {
+    actorDense(i, i) = 10_r;
+  }
+  auto const actor = ToBlockSparseMatrix<3>(actorDense, true);
+
+  auto interactionDense = RowMatrix<real>::Zero(6, 6);
+  interactionDense(1, 2) = 2_r;
+  interactionDense(3, 5) = -1_r;
+  interactionDense(0, 3) = -4_r;
+  interactionDense(0, 4) = 5_r;
+  interactionDense(1, 5) = -6_r;
+  interactionDense(3, 0) = -7_r;
+  interactionDense(4, 1) = 8_r;
+  interactionDense(5, 2) = -9_r;
+  auto const sparseInteraction = ToSparseMatrix(interactionDense, true);
+  auto const blockSparseInteraction = ToBlockSparseMatrix<3>(interactionDense, true);
+
+  RowMatrix<real> expectedDiscard = actorDense;
+  expectedDiscard(1, 2) += 2_r;
+  expectedDiscard(3, 5) -= 1_r;
+  RowMatrix<real> expectedCompensated = expectedDiscard;
+  expectedCompensated(0, 0) += 9_r;
+  expectedCompensated(1, 1) += 6_r;
+  expectedCompensated(3, 3) += 7_r;
+  expectedCompensated(4, 4) += 8_r;
+  expectedCompensated(5, 5) += 9_r;
+
+  auto checkInteractionFormat = [&](auto const& interaction) {
+    ActorPseudoMatrix<real> const pseudoMatrix{
+        5, AsConstView(actor), {{5, 5, interaction, /*symmetricPair*/ std::nullopt}}};
+    auto const discardResult = ToBlockSparseMatrix<3, MissingSparsityPolicy::Discard>(pseudoMatrix);
+    auto const compensatedResult =
+        ToBlockSparseMatrix<3, MissingSparsityPolicy::AddAbsToDiagonal>(pseudoMatrix);
+    EXPECT_TRUE(NearEqualMatrices(expectedDiscard, ToMatrix(discardResult), 0_r));
+    EXPECT_TRUE(NearEqualMatrices(expectedCompensated, ToMatrix(compensatedResult), 0_r));
+  };
+  checkInteractionFormat(sparseInteraction);
+  checkInteractionFormat(blockSparseInteraction);
+}
+
+TEST(ActorPreconditionerTest, AMGCompensatesMissingInteractionEntries) {
+  auto actorDense = RowMatrix<real>::Zero(6, 6);
+  for (int i = 0; i < actorDense.Rows(); ++i) {
+    actorDense(i, i) = 10_r;
+  }
+  auto actor = ToBlockSparseMatrix<3>(actorDense, true);
+
+  auto interactionDense = RowMatrix<real>::Zero(6, 6);
+  interactionDense(0, 3) = -2_r;
+  interactionDense(3, 0) = -2_r;
+  auto interaction = ToSparseMatrix(interactionDense, true);
+  ActorPseudoMatrix<real> pseudoMatrix{
+      5, AsConstView(actor), {{5, 5, interaction, /*symmetricPair*/ std::nullopt}}};
+
+  AMGActorPrec<real, 3> preconditioner(pseudoMatrix);
+  auto expected = actorDense;
+  expected(0, 0) += 2_r;
+  expected(3, 3) += 2_r;
+  EXPECT_TRUE(NearEqualMatrices(expected, ToMatrix(preconditioner.Afine), 0_r));
+
+  actor.SetValue(0, 0, 20_r);
+  interaction.SetValue(0, 3, -5_r);
+  interaction.SetValue(3, 0, -5_r);
+  preconditioner.Update(pseudoMatrix);
+  expected = actorDense;
+  expected(0, 0) = 25_r;
+  expected(3, 3) += 5_r;
+  EXPECT_TRUE(NearEqualMatrices(expected, ToMatrix(preconditioner.Afine), 0_r));
+}

@@ -23,13 +23,15 @@
 
 #include <mochi_core/utils/variant_jacobian.h>
 
+#include <type_traits>
+
 namespace mochi {
 
 // Forwards
 struct CIslandMemberInfo;
 struct CRomProjectionStrategy;
 
-// Actor composition of a soft skinned actor
+// Composition linking a nested soft actor to its articulated parent.
 struct CSkinnedComposition : public NoCopy {
   entt::entity articulated;
   ActorHandle articulatedHandle;
@@ -69,7 +71,7 @@ struct CSoftAttachmentLinks {
 };
 
 /*
-Systems for a soft skinned body
+Nested soft actor systems
 */
 namespace skinned {
 
@@ -106,7 +108,6 @@ void EntityAssembleBody(
     CSoftSkinnedUnposedSnle& outSoftSkinnedSnle,
     CSkinnedInteractionSnle& outInteractionSnle);
 
-// Method to initialize a soft skinned actor.
 void InitSkinnedActor(
     entt::registry& reg,
     entt::entity e,
@@ -116,7 +117,7 @@ void InitSkinnedActor(
     Error& error);
 
 void EntityIncrementStep(
-    ecs::RequiredTag<TagSoftSkinnedActor>,
+    ecs::RequiredTag<TagNestedSoftActor>,
     CVelocitySlice<real, TimeStep::Current, DisplacementLayer::Skinned>& currVel,
     CVelocitySlice<real, TimeStep::Previous, DisplacementLayer::Skinned>& prevVel);
 
@@ -124,7 +125,7 @@ void EntityIncrementStep(
  * Executed before the first time integration stage of the time step.
  */
 void EntityPreFirstStage(
-    ecs::RequiredTag<TagSoftSkinnedActor>,
+    ecs::RequiredTag<TagNestedSoftActor>,
     CTimeIntegratorState const& intState,
     CVelocitySlice<real, TimeStep::Previous, DisplacementLayer::Skinned> const& prevVel,
     CIntegrationVelocitySlices<DisplacementLayer::Skinned>& intVels);
@@ -139,9 +140,11 @@ void PreStagePipeline(entt::registry& reg, Span<entt::entity const> entities);
  * articulated::compound::PostStagePipeline.
  */
 void EntityPostStage(
-    ecs::RequiredTag<TagSoftSkinnedActor>,
+    ecs::RequiredTag<TagNestedSoftActor>,
     CConvergenceStatus const& convergence,
     CTimeIntegratorState const& intState,
+    CDisplacementSlice<real, TimeStep::StageStart, DisplacementLayer::Skinned> const&
+        stageStartDispl,
     CDisplacementSlice<real, TimeStep::Current, DisplacementLayer::Skinned>& currDispl,
     CVelocitySlice<real, TimeStep::Current, DisplacementLayer::Skinned>& currVel,
     CIntegrationVelocitySlices<DisplacementLayer::Skinned>& intVels);
@@ -153,8 +156,41 @@ void EntityPostStage(
 void PostLastStagePipeline(entt::registry& reg, Span<entt::entity const> entities);
 
 /*
+ * Pipeline to resolve current skinning displacements for all nodes, including inactive nodes when
+ * subsampling is enabled.
+ */
+void ResolveAllNodeSkinningDisplacementsPipeline(
+    entt::registry& reg,
+    Span<entt::entity const> entities);
+
+/*
+ * Synchronize a nested soft actor's current skinned displacement and velocity after an external
+ * displacement and velocity change. If it belongs to a blended actor, republishes the parent's
+ * final displacement.
+ */
+void SynchronizeAfterExternalChange(entt::registry& reg, entt::entity e);
+
+// Compute world-space skinning velocity for nested soft actors. The template argument indicates if
+// the system must run on state or non-state velocities.
+template <bool kIsState>
+void UpdateSkinningVelocity(
+    std::conditional_t<
+        kIsState,
+        ecs::Included<CIntegrationVelocitySlices<DisplacementLayer::Skinned>>,
+        ecs::Excluded<CIntegrationVelocitySlices<DisplacementLayer::Skinned>>>,
+    ecs::CtxGlobal<CSceneTime const> time,
+    ecs::PartialRegistry<
+        CArticulatedLinkTransforms<TimeStep::Current> const,
+        CArticulatedLinkVels const> reg,
+    CSkinnedComposition const& composition,
+    CVelocitySlice<real, TimeStep::Current> const& softVelocity,
+    CArticulatedSkinningData const& skinningData,
+    CNodePositions const& positions,
+    CVelocitySlice<real, TimeStep::Current, DisplacementLayer::Skinned>& outVelocity);
+
+/*
  * Pipeline to update quantities that are a function of the state (aka derived state) of the
- * soft skinned actor and make them consistent with the state. Must be called after
+ * nested soft actor and make them consistent with the state. Must be called after
  * articulated::compound::UpdateDerivedStatePipeline()
  */
 void UpdateDerivedStatePipeline(entt::registry& reg, Span<entt::entity const> entities);
@@ -170,7 +206,7 @@ void UpdateJacobiansPipeline(entt::registry& reg, Span<entt::entity const> entit
  * detection pipeline, within each nonlinear solver iteration.
  */
 void SetupCollidingJacobians(
-    ecs::Included<TagSoftSkinnedActor>,
+    ecs::Included<TagNestedSoftActor>,
     ecs::PartialRegistry<CDofOffset const, CArticulatedLinkTransforms<TimeStep::Current> const> reg,
     CSkinnedComposition const& composition,
     CDofOffset const& dofOffset,

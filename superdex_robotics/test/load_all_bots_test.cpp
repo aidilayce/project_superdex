@@ -186,7 +186,14 @@ INSTANTIATE_TEST_SUITE_P(
     LoadAllBotsTest,
     ::testing::ValuesIn(FindAllBotFiles()),
     [](::testing::TestParamInfo<std::filesystem::path> const& info) {
-      std::string name = info.param.stem().string();
+      // Use the bots-root-relative path (not just the stem) so bots that share a file name in
+      // different directories (e.g. skindulum/skindulum and skindulum/old/skindulum) get unique,
+      // non-colliding test names. Mirrors ArchiveBotTest's generator.
+      auto const& path = info.param;
+      auto const botsRoot = FindBotsRoot(path);
+      std::string name = botsRoot.has_value()
+          ? std::filesystem::relative(path, botsRoot.value()).replace_extension().string()
+          : path.stem().string();
       for (char& c : name) {
         if (!std::isalnum(static_cast<unsigned char>(c))) {
           c = '_';

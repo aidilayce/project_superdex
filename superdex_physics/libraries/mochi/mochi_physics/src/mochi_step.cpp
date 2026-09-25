@@ -17,6 +17,7 @@
 #include "mochi_step.h"
 
 #include "mochi_articulated_body.h"
+#include "mochi_blended.h"
 #include "mochi_common_components.h"
 #include "mochi_compound.h"
 #include "mochi_constraint.h"
@@ -38,18 +39,57 @@
 
 #include <mochi_core/utils/defer.h>
 #include <mochi_core/utils/profile.h>
-#include <mochi_core/utils/rigid_body_utils.h>
 
 using namespace mochi;
 
-// Update CBoundingVolume<TimeStep::Current> for actor types whose local bounds can change.
+// Update CBoundingVolume for actor types whose local bounds can change.
 template <typename Invoke>
 static void ForEachCurrentBoundsUpdateSystem(Invoke&& invoke) {
   invoke(&soft::UpdateBounds<TimeStep::Current>);
   invoke(&articulated::compound::UpdateBounds<TimeStep::Current>);
   invoke(&shell::UpdateBounds<TimeStep::Current>);
-  invoke(&rod::UpdateBoundsVisualMesh<TimeStep::Current>);
+  invoke(&rod::UpdateSurfaceContactBounds<TimeStep::Current>);
   invoke(&rod::UpdateBounds<TimeStep::Current>);
+}
+
+static void UpdateSkinnedMaxGeometrySpeed(
+    CVelocitySlice<real, TimeStep::Current, DisplacementLayer::Skinned> const& velocity,
+    CConservativeStepBounds& outStepBounds) {
+  outStepBounds.maxGeometrySpeed = MaxPackedVector3Norm<kSpaceDim3>(velocity.value.GetConstSpan());
+}
+
+void mochi::UpdateMaxGeometrySpeeds(entt::registry& reg) {
+  MOCHI_PROFILE_SCOPE();
+#if MOCHI_ASSERT_VERBOSE_ENABLED
+  auto const stepBoundsView = reg.view<CConservativeStepBounds>(entt::exclude<TagStaticActor>);
+  for (entt::entity const entity : stepBoundsView) {
+    stepBoundsView.get<CConservativeStepBounds>(entity).maxGeometrySpeed =
+        std::numeric_limits<real>::quiet_NaN();
+  }
+#endif
+
+  // On-demand update of skinned velocities, not updated during the solve. Current rigid velocities
+  // must have clean vsym; PreStepEcs satisfies this before reaching this function.
+  ecs::InvokeForEachGlobal(&articulated::compound::UpdateSkinningVelocity, reg);
+  ecs::InvokeForEachGlobal<ecs::policy::AllowReadWriteSameComponent>(
+      &skinned::UpdateSkinningVelocity</*kIsState*/ false>, reg);
+  ecs::InvokeForEachGlobal<ecs::policy::AllowReadWriteSameComponent>(
+      &blended::UpdateBlendingVelocity, reg);
+
+  // Compute velocity-based bounds for all actors.
+  ecs::InvokeForEachGlobal(&rigid::UpdateMaxGeometrySpeed, reg);
+  ecs::InvokeForEachGlobal(&deformable::UpdateMaxGeometrySpeed, reg);
+  ecs::InvokeForEachGlobal(&rod::UpdateMaxGeometrySpeed, reg);
+  ecs::InvokeForEachGlobal(&UpdateSkinnedMaxGeometrySpeed, reg);
+
+#if MOCHI_ASSERT_VERBOSE_ENABLED
+  for (entt::entity const entity : stepBoundsView) {
+    auto const& stepBounds = stepBoundsView.get<CConservativeStepBounds>(entity);
+    MOCHI_ASSERT_VERBOSE(
+        IsFinite(stepBounds.maxGeometrySpeed) && stepBounds.maxGeometrySpeed >= 0_r,
+        "Every dynamic geometry owner must have a finite nonnegative maximum geometry speed.");
+  }
+#endif
 }
 
 static void UpdateConservativeStepBounds(entt::registry& reg) {
@@ -58,12 +98,13 @@ static void UpdateConservativeStepBounds(entt::registry& reg) {
   // Global context
   auto const& time = reg.ctx<CSceneTime const>();
   real const currTimeStep = static_cast<real>(time.DeltaTime());
+  auto const stepBoundsView = reg.view<CConservativeStepBounds>(entt::exclude<TagStaticActor>);
 
   // If timestep is infinity, then we are doing quasistatic optimization, simply set all the bounds
   // to be infinity, because actors can move over arbitrarily large distances, as determined by the
   // optimizer, so we cannot use current configuration to determine a reasonable bound.
   if (!IsFinite(currTimeStep)) {
-    for (auto&& [e, outStepBounds] : reg.view<CConservativeStepBounds>().each()) {
+    for (auto&& [e, outStepBounds] : stepBoundsView.each()) {
       outStepBounds.worldAabb.SetMin(
           Real3{
               -std::numeric_limits<real>::infinity(),
@@ -78,107 +119,33 @@ static void UpdateConservativeStepBounds(entt::registry& reg) {
     return;
   }
 
-  real const prevTimeStep = static_cast<real>(time.DeltaTimePrev());
+  UpdateMaxGeometrySpeeds(reg);
+
   Vec4r const gravityAccel = reg.ctx<CSceneGravity const>().accel;
   real const gravitySpeedDelta = Norm<3>(gravityAccel) * currTimeStep;
-  MOCHI_ASSERT(
-      IsFinite(prevTimeStep) && prevTimeStep > 0_r,
-      "Previous time step must be positive and finite.")
 
-  // For each entity with CConservativeStepBounds
-  for (auto&& [e, outStepBounds] : reg.view<CConservativeStepBounds>().each()) {
-    // NOTE: The conservative step bounds are heuristics based on previous/current AABB deltas,
-    // deformable velocity fields, simple acceleration padding, one-step actor-size relaxation after
-    // history invalidation, etc.
+  // For each dynamic entity with CConservativeStepBounds.
+  for (auto&& [e, outStepBounds] : stepBoundsView.each()) {
+    // NOTE: The conservative step bounds are heuristics based on geometry velocities, simple
+    // acceleration padding, one-step actor-size relaxation after state discontinuities, etc.
     //
     // TODO: Known gaps:
     // - Contact-generated motion, especially from off-center impacts or collisions between actors
     //   whose masses differ by orders of magnitude.
     // - Force-driven motion from transmission actuators and non-target constraints such as joint
     //   limits.
-    // - Rotation that moves geometry farther than changes in its AABB extrema indicate, especially
-    //   for highly anisotropic actors.
-    // - Rigid-link velocities do not expand the conservative bounds owned by a colliding
-    //   articulated skin.
-    // - Motion of rod visual-mesh vertices caused by twist or material-frame rotation, which is not
-    //   captured by centerline translational velocities.
 
     // Every actor with CConservativeStepBounds should have these
     auto const& root = reg.get<CRootTransform const>(e);
-    auto const& prevBounds = reg.get<CBoundingVolume<TimeStep::Previous> const>(e);
-    auto const& currBounds = reg.get<CBoundingVolume<TimeStep::Current> const>(e);
+    auto const& bounds = reg.get<CBoundingVolume const>(e);
 
-    // Start with tight fitting world-space bounds
-    Aabb prevWorldAabb = GetAabb(TransformShape(root.worldFromLocalPrev, prevBounds.localShape));
-    Aabb currWorldAabb = GetAabb(TransformShape(root.worldFromLocal, currBounds.localShape));
+    // Start with tight fitting world-space bounds.
+    Aabb const currWorldAabb = GetAabb(TransformShape(root.worldFromLocal, bounds.localShape));
     Aabb stepBounds = currWorldAabb;
-
-    // Use finite difference to compute a speed value from the change in world-space bounds (max of
-    // any cartesian direction). This indirectly accounts for linear motion, angular motion, and
-    // local deformation (if any).
-    Vec4r deltaMin = currWorldAabb.VGetMin() - prevWorldAabb.VGetMin();
-    Vec4r deltaMax = currWorldAabb.VGetMax() - prevWorldAabb.VGetMax();
-    real predictedMaxSpeed = HMax<3>(Max(Abs(deltaMin), Abs(deltaMax))) / prevTimeStep;
-
-    // Improve the predicted speed for specific actor types.
-    if (reg.all_of<TagRigidActor>(e)) {
-      auto const& rigidState = reg.get<CRigidState<TimeStep::Current> const>(e).value;
-      auto const& rigidVel = reg.get<CRigidVel<TimeStep::Current> const>(e).value;
-      auto const [omega, vSym] = rigidVel.GetOmegaAndVSym();
-
-      // Build the transposed rotation-velocity gradient directly for faster SIMD products.
-      VMatrix3x3r const rotationVelocityGradientT = SimdSymToFull(vSym) - Skew3(omega);
-      Vec4r const aabbCenterOffset = currWorldAabb.VGetCenter() - rigidState.VGetTranslation();
-      Vec4r const aabbCenterVelocity =
-          rigidVel.GetVCom() + DotVecMat3x3(aabbCenterOffset, rotationVelocityGradientT);
-
-      // halfExtents * Abs(rotationVelocityGradientT) is the exact component-wise velocity radius.
-      Vec4r const velocityRadius =
-          DotVecMat3x3(currWorldAabb.VGetHalfExtents(), Abs(rotationVelocityGradientT));
-
-      // Per axis, velocities span centerVelocity +/- velocityRadius, so the maximum absolute
-      // component over the AABB is abs(centerVelocity) + velocityRadius.
-      real const rigidMaxSpeed = HMax<3>(Abs(aabbCenterVelocity) + velocityRadius);
-      predictedMaxSpeed = Max(predictedMaxSpeed, rigidMaxSpeed);
-    }
-
-    if (reg.any_of<TagSoftActor, TagShellActor>(e)) {
-      // Get the velocity of each DoF.
-      auto const& velocityPerDofLocal =
-          reg.get<CVelocitySlice<real, TimeStep::Current> const>(e).value;
-
-      // Use the maximum local-space speed of any DoF from the previous step. World-space speed
-      // should be the same because CRootTransfrom does not have scale.
-      // PERFORMANCE NOTE: For volumetric soft actors, we could check just the boundary DoFs, but
-      // this is already pretty fast.
-      MOCHI_ASSERT(!velocityPerDofLocal.empty());
-      real maxDofSpeedLocal = MaxAbs(MakeSpan(velocityPerDofLocal));
-      predictedMaxSpeed = Max(predictedMaxSpeed, maxDofSpeedLocal);
-    }
-
-    if (reg.all_of<TagRodActor>(e)) {
-      // Get the velocity of each DoF (rods have 4 DoFs per node: 3 displacement + 1 twist).
-      auto const& velocityPerDofLocal =
-          reg.get<CVelocitySlice<real, TimeStep::Current> const>(e).value;
-
-      // Use the maximum local-space speed of any displacement DoF from the previous step.
-      // We only consider displacement DoFs (not twist) for spatial velocity bounds.
-      // Rod DoFs are laid out as [dx0, dy0, dz0, twist0, dx1, dy1, dz1, twist1, ...]
-      MOCHI_ASSERT(!velocityPerDofLocal.empty());
-      real maxDofSpeedLocal = 0_r;
-      int const numDofs = isize(velocityPerDofLocal);
-      for (int i = 0; i < numDofs; i += fem::kNumRodFields) {
-        // Only check the 3 displacement components, skip the twist component
-        for (int j = 0; j < 3; ++j) {
-          maxDofSpeedLocal = Max(maxDofSpeedLocal, Abs(velocityPerDofLocal[i + j]));
-        }
-      }
-      predictedMaxSpeed = Max(predictedMaxSpeed, maxDofSpeedLocal);
-    }
 
     // Exaggerate the speed.
     static real kSpeedScalar = 2_r;
-    predictedMaxSpeed *= kSpeedScalar;
+    real predictedMaxSpeed = kSpeedScalar * outStepBounds.maxGeometrySpeed;
 
     // Add some additional acceleration. This will have the effect of expanding the step bounds even
     // if the actor was not originally moving. The amount of expansion will depend on the time step.
@@ -201,10 +168,9 @@ static void UpdateConservativeStepBounds(entt::registry& reg) {
     static real kAbsPadding = 0.01_r;
     stepBounds = ExpandShape(stepBounds, kAbsPadding);
 
-    // When previous-step history is unavailable or no longer trustworthy, the prediction above can
-    // be unreliable, e.g. a newly-created actor may be far from equilibrium, and an externally
-    // reset actor may have discontinuous state. Apply a finite, actor-size-based relaxation for
-    // this step only, then clear the flag.
+    // A newly-created actor may be far from equilibrium, and an externally reset actor may have a
+    // discontinuous state. Apply a finite, actor-size-based relaxation for this step only, then
+    // clear the flag.
     if (outStepBounds.needsNextStepRelaxation) {
       constexpr real kNextStepRelaxationScale = 3_r; // Empirical value.
       real const actorDiagonal = Norm(currWorldAabb.GetMax() - currWorldAabb.GetMin());
@@ -225,15 +191,13 @@ void mochi::PreStepEcs(entt::registry& reg) {
   ecs::InvokeForEachGlobal(&rigid::UpdateVSym, reg);
   ecs::InvokeForEachGlobal(&articulated::compound::UpdateVSym, reg);
 
-  // Update CBoundingVolume<TimeStep::Current> to reflect any changes since the previous step, e.g.,
-  // due to actor creation, API calls, etc. Must come BEFORE UpdateConservativeStepBounds which
-  // reads CBoundingVolume<Current>.
+  // Update CBoundingVolume to reflect any changes since the previous step, e.g., due to actor
+  // creation or API calls. Must come BEFORE UpdateConservativeStepBounds, which reads it.
   ForEachCurrentBoundsUpdateSystem(
       [&](auto const& system) { ecs::InvokeForEachGlobal(system, reg); });
 
-  // Update CConservativeStepBounds for all dynamic actors.
-  // Must come BEFORE CRootTransform.worldFromLocalPrev or CBoundingVolume<TimeStep::Previous> are
-  // updated for this step.
+  // Update conservative step bounds for all dynamic actors. This also updates velocity-based bounds
+  // for finite time steps.
   UpdateConservativeStepBounds(reg);
 
   // Compute linear and angular velocity about the center-of-mass (static rigid actors only)
@@ -262,16 +226,6 @@ void mochi::PreStepEcs(entt::registry& reg) {
     ecs::InvokeForEachGlobal(
         +[](ecs::Excluded<TagStaticActor>, CRootTransform& root) {
           root.worldFromLocalPrev = root.worldFromLocal;
-        },
-        reg);
-
-    // Set CBoundingVolume<TimeStep::Previous> equal to the current state, except for static and
-    // rigid actors.
-    ecs::InvokeForEachGlobal(
-        +[](ecs::Excluded<TagStaticActor, TagRigidActor>,
-            CBoundingVolume<TimeStep::Current> const& current,
-            CBoundingVolume<TimeStep::Previous>& outPrevious) {
-          outPrevious.localShape = current.localShape;
         },
         reg);
   }
@@ -346,14 +300,14 @@ void mochi::PreStepIslandAsync(entt::registry& reg, CIslandDescendants const& de
 static void UpdateActorQueriesAsync(TaskSemaphore sem, entt::registry& reg, entt::entity e) {
   bool isDeformable = reg.any_of<TagSoftActor, TagBlendedActor, TagShellActor, TagRodActor>(e);
   if (isDeformable) {
-    // Update CBoundingVolume<TimeStep::Current> for actors that deform
+    // Update CBoundingVolume for actors that deform
     // NOTE: Invoke in this thread since CBoundingVolume is NOT a CQuery component and it's read by
     // some of the UpdateQuery systems below.
     ForEachCurrentBoundsUpdateSystem(
         [&](auto const& system) { ecs::TryInvokeOnEntity(system, reg, e); });
 
-    // Writes CQueryElasticEnergy. For soft or soft-skinned actors with elastic energy, it assembles
-    // the energy. Otherwise, it sets the energy to zero.
+    // Writes CQueryElasticEnergy for soft actors, including nested soft actors. It assembles the
+    // energy when stress is enabled and otherwise sets it to zero.
     ecs::TryScheduleInvokeOnEntity(
         sem, "UpdateQueryElasticEnergy", &soft::UpdateQueryElasticEnergy, reg, e);
 
@@ -381,12 +335,16 @@ static void UpdateActorQueriesAsync(TaskSemaphore sem, entt::registry& reg, entt
   // Writes CQueryNodePositions (must happen before queries that read it)
   ecs::TryInvokeOnEntity(&UpdateQueryNodePositions, reg, e);
 
+  // Contact-skinned rods
+  // Writes CQuerySurfaceNodePositions in compact active-node ordering.
+  ecs::TryInvokeOnEntity(&rod::UpdateQuerySurfaceNodePositions, reg, e);
+
   // Rigid & Soft
   // Reads CDisplacementSlice, and others
   // Writes CQuerySurfaceNodePositions (must happen before queries that read it)
   ecs::TryInvokeOnEntity(&UpdateQuerySurfaceNodePositions, reg, e);
 
-  // Soft & Rigid
+  // Soft, Rigid & contact-skinned Rod
   // Reads CQuerySurfaceNodePositions
   // Writes CQuerySurfaceNodeNormals
   ecs::TryScheduleInvokeOnEntity(
@@ -395,7 +353,11 @@ static void UpdateActorQueriesAsync(TaskSemaphore sem, entt::registry& reg, entt
   // Actors with a visual mesh (and embeddings)
   // Writes CQueryVisualNodePositions, and (optionally) CQueryVisualNodeNormals
   ecs::TryScheduleInvokeOnEntity(
-      sem, "UpdateQueryRodVisual", &rod::UpdateQueryRodVisualNodePositionsAndNormals, reg, e);
+      sem,
+      "rod::UpdateQueryVisualNodePositionsAndNormals",
+      &rod::UpdateQueryVisualNodePositionsAndNormals,
+      reg,
+      e);
   // Reads CQueryNodePositions (for non-rod deformable actors)
   ecs::TryScheduleInvokeOnEntity(
       sem, "UpdateQueryVisual", &UpdateQueryVisualNodePositionsAndNormals, reg, e);
@@ -449,7 +411,7 @@ static void PostStepIslandAsync(entt::registry& reg, CIslandDescendants const& d
   //      actors, invalidating the check logic).
   static constexpr bool kVerifyConservativeStepBounds = false;
   if constexpr (kVerifyConservativeStepBounds) {
-    // Update CBoundingVolume<TimeStep::Current> before the check.
+    // Update CBoundingVolume before the check.
     for (auto e : descendants.actors) {
       ForEachCurrentBoundsUpdateSystem(
           [&](auto const& system) { ecs::TryInvokeOnEntity(system, reg, e); });

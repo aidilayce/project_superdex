@@ -219,6 +219,10 @@ template <typename T, typename SZ>
 template <typename T, typename SZ>
 [[nodiscard]] T MaxAbs(Span<T const, SZ> a);
 
+// Return the maximum Euclidean norm of packed 3D vectors whose first components are stride apart.
+template <int kStride>
+[[nodiscard]] real MaxPackedVector3Norm(Span<real const> values);
+
 // Given two Span of equal length, return the max value of abs(a[i] - b[i]) for all i.
 template <typename T, typename SZ>
 [[nodiscard]] T MaxAbsDifference(Span<T const, SZ> a, Span<T const, SZ> b);

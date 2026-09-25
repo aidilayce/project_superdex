@@ -39,6 +39,7 @@ struct SuperDexStudioBotLoader : superdex::robotics::IBotLoader {
       mochi::TransformRT const& bakeTransform,
       mochi::Context* context,
       mochi::Error& error) const override;
+  mochi::ModelData LoadModelData(std::string_view path, mochi::Error& error) const override;
   AssetManager* _manager = nullptr;
 };
 

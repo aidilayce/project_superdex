@@ -126,6 +126,26 @@ MOCHI_API void ApplyMod(
     superdex::Error& error);
 
 /**
+ * @brief Apply an @ref AttachSkin modification to a bot, setting its deformable skin.
+ *
+ * The skin's baked bone indices are treated as identity-by-name against the bot's current links
+ * (recorded in @ref BotPrefab::_skinBoneLinks), so they survive later re-sorts and nested
+ * composition. Errors if the bot already has a skin (a bot supports at most one).
+ *
+ * @param[in,out] botPrefab Bot parameters to modify.
+ * @param[in] mod The @ref AttachSkin modification to apply.
+ * @param[in] loader Bot loader (unused).
+ * @param[in] validate Unused.
+ * @param[in,out] error Error status. Check @ref Error::IsOK for success.
+ */
+MOCHI_API void ApplyMod(
+    BotPrefab& botPrefab,
+    AttachSkin const& mod,
+    IBotLoader const& loader,
+    bool validate,
+    superdex::Error& error);
+
+/**
  * @brief Build a @ref ModBotPrefab recipe into a flat @ref BotPrefab by resolving base and
  * child paths. Recursively calls @ref IBotLoader loading methods for each path reference,
  * supporting nested bots.
@@ -250,6 +270,18 @@ AddToScene(BotPrefab const& botPrefab, Scene* scene, superdex::Error& error);
  * @return Index of the link, or @ref kIndexNone if not found.
  */
 int MOCHI_API FindLinkIndexByName(BotPrefab const& bot, std::string_view name);
+
+/**
+ * @brief Resolve the name used to reference a bot's skin in contact overrides.
+ *
+ * The skin has no independent actor in Mochi: it is folded into the bot's top-level articulated
+ * actor and shares that actor's handle. It is therefore referenced by the top-level actor's name,
+ * which is @ref BotPrefab::name.
+ *
+ * @param[in] botPrefab Bot to query.
+ * @return @ref BotPrefab::name when the bot has a skin, or an empty view when it has no skin.
+ */
+[[nodiscard]] MOCHI_API std::string_view GetBotSkinName(BotPrefab const& botPrefab);
 
 /**
  * @brief Find the indices of all leaf links (links that are not referenced as a parent by any

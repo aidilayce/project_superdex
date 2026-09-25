@@ -20,14 +20,21 @@
 
 #include <mochi_core/utils/defer.h>
 
+#include <algorithm>
 #include <string_view>
 
 namespace superdex::studio {
 
 BotContactFilterBuilder::BotContactFilterBuilder(superdex::robotics::BotPrefab& prefab)
+    : BotContactFilterBuilder(prefab, prefab.contactOverrides) {}
+
+BotContactFilterBuilder::BotContactFilterBuilder(
+    superdex::robotics::BotPrefab& prefab,
+    mochi::DynamicArray<superdex::robotics::BotContactOverride>& overrides)
     : numLinks(mochi::isize(prefab.links)),
       implicitDisabledMask(numLinks * numLinks, false),
-      _prefab(prefab) {
+      _prefab(prefab),
+      _overrides(overrides) {
   // Mirror the rule the articulated-actor pipeline applies on creation.
   for (int a = 0; a < numLinks; ++a) {
     for (int b = a + 1; b < numLinks; ++b) {
@@ -49,7 +56,7 @@ bool BotContactFilterBuilder::DefaultEnabled(int linkA, int linkB) const {
 int BotContactFilterBuilder::FindFilterIndex(int linkA, int linkB) const {
   std::string_view const na(_prefab.links[linkA].name);
   std::string_view const nb(_prefab.links[linkB].name);
-  auto const& filters = _prefab.contactOverrides;
+  auto const& filters = _overrides;
   for (int i = 0; i < mochi::isize(filters); ++i) {
     std::string_view const fa(filters[i].linkA);
     std::string_view const fb(filters[i].linkB);
@@ -66,11 +73,11 @@ bool BotContactFilterBuilder::HasOverride(int linkA, int linkB) const {
 
 bool BotContactFilterBuilder::IsEnabled(int linkA, int linkB) const {
   int const idx = FindFilterIndex(linkA, linkB);
-  return idx != -1 ? _prefab.contactOverrides[idx].enable : DefaultEnabled(linkA, linkB);
+  return idx != -1 ? _overrides[idx].enable : DefaultEnabled(linkA, linkB);
 }
 
 void BotContactFilterBuilder::SetFilter(int linkA, int linkB, bool enable) {
-  auto& filters = _prefab.contactOverrides;
+  auto& filters = _overrides;
   int const idx = FindFilterIndex(linkA, linkB);
   if (enable == DefaultEnabled(linkA, linkB)) {
     // Matches the implicit default: drop any redundant override.
@@ -91,8 +98,19 @@ void BotContactFilterBuilder::SetFilter(int linkA, int linkB, bool enable) {
 }
 
 void BotContactFilterBuilder::SetAll(bool enable) {
-  auto& filters = _prefab.contactOverrides;
-  filters.clear();
+  auto& filters = _overrides;
+  // SetAll governs link<->link pairs only; preserve any skin<->link overrides.
+  std::string_view const skinName = SkinName();
+  filters.erase(
+      std::remove_if(
+          filters.begin(),
+          filters.end(),
+          [&](superdex::robotics::BotContactOverride const& f) {
+            bool const isSkin = !skinName.empty() &&
+                (std::string_view(f.linkA) == skinName || std::string_view(f.linkB) == skinName);
+            return !isSkin;
+          }),
+      filters.end());
   for (int a = 0; a < numLinks; ++a) {
     for (int b = a + 1; b < numLinks; ++b) {
       if (enable != DefaultEnabled(a, b)) {
@@ -104,6 +122,68 @@ void BotContactFilterBuilder::SetAll(bool enable) {
       }
     }
   }
+}
+
+bool BotContactFilterBuilder::HasSkin() const {
+  return _prefab.skin.has_value();
+}
+
+std::string_view BotContactFilterBuilder::SkinName() const {
+  return superdex::robotics::GetBotSkinName(_prefab);
+}
+
+bool BotContactFilterBuilder::SkinDefaultEnabled(int /*link*/) const {
+  // Skin<->link contact is enabled by default; the skin collides with the bot's links unless a
+  // specific pair is explicitly opted out (e.g. the skin's own links, which it wraps).
+  return true;
+}
+
+int BotContactFilterBuilder::FindSkinFilterIndex(int link) const {
+  std::string_view const skinName = SkinName();
+  if (skinName.empty()) {
+    return -1;
+  }
+  std::string_view const ln(_prefab.links[link].name);
+  auto const& filters = _overrides;
+  for (int i = 0; i < mochi::isize(filters); ++i) {
+    std::string_view const fa(filters[i].linkA);
+    std::string_view const fb(filters[i].linkB);
+    if ((fa == skinName && fb == ln) || (fa == ln && fb == skinName)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+bool BotContactFilterBuilder::HasSkinOverride(int link) const {
+  return FindSkinFilterIndex(link) != -1;
+}
+
+bool BotContactFilterBuilder::IsSkinEnabled(int link) const {
+  int const idx = FindSkinFilterIndex(link);
+  return idx != -1 ? _overrides[idx].enable : SkinDefaultEnabled(link);
+}
+
+void BotContactFilterBuilder::SetSkinFilter(int link, bool enable) {
+  auto& filters = _overrides;
+  int const idx = FindSkinFilterIndex(link);
+  if (enable == SkinDefaultEnabled(link)) {
+    // Matches the default (enabled): drop any redundant override.
+    if (idx != -1) {
+      filters.erase(filters.begin() + idx);
+    }
+    return;
+  }
+  if (idx != -1) {
+    filters[idx].enable = enable;
+    return;
+  }
+  std::string_view const skinName = SkinName();
+  superdex::robotics::BotContactOverride nf;
+  nf.linkA = mochi::DynamicString(skinName.data(), skinName.size());
+  nf.linkB = _prefab.links[link].name;
+  nf.enable = enable;
+  filters.push_back(std::move(nf));
 }
 
 BotContactProbe::BotContactProbe(

@@ -32,22 +32,12 @@ namespace mochi::simd_half_test {
 
 inline Span<Half const> GetTestValues(int n) {
   static Half const kValues[] = {
-      kHalfMin,
-      kHalfMax,
-      Half(1.5f),
-      Half(-2.25f),
-      Half(0.5f),
-      Half(-0.125f),
-      Half(3.75f),
-      Half(-4.0f),
-      Half(0.0625f),
-      Half(-7.5f),
-      Half(0.25f),
-      Half(-1.0f),
-      Half(6.5f),
-      Half(-3.5f),
-      Half(0.375f),
-      Half(-8.0f),
+      kHalfMin,       kHalfMax,     Half(1.5f),    Half(-2.25f), Half(0.5f),  Half(-0.125f),
+      Half(3.75f),    Half(-4.0f),  Half(0.0625f), Half(-7.5f),  Half(0.25f), Half(-1.0f),
+      Half(6.5f),     Half(-3.5f),  Half(0.375f),  Half(-8.0f),  Half(2.0f),  Half(-2.0f),
+      Half(4.5f),     Half(-5.25f), Half(0.75f),   Half(-0.25f), Half(9.0f),  Half(-10.0f),
+      Half(0.03125f), Half(-12.5f), Half(0.875f),  Half(-6.0f),  Half(11.5f), Half(-9.5f),
+      Half(0.1875f),  Half(-16.0f),
   };
   MOCHI_ASSERT_VERBOSE(n >= 0 && n <= isize(kValues), "n out of range");
   return {kValues, static_cast<size_t>(n)};
@@ -62,7 +52,6 @@ void TestGet(Span<Half const> values) {
   ASSERT_EQ(V::kSize, isize(values));
   auto v = Load<V>(values.data());
   for (int i = 0; i < V::kSize; ++i) {
-    EXPECT_EQ(values[i], Get(v, i));
     EXPECT_EQ(values[i], v[i]);
   }
 }
@@ -101,16 +90,16 @@ void TestLoadPartialN(Span<Half const> values) {
 template <class V>
 void TestStorePartial(Span<Half const> values) {
   ASSERT_EQ(V::kSize, isize(values));
-  auto v = Load<V>(values.data());
+  auto const v = Load<V>(values.data());
+  auto const sentinel = StaticCast<Half>(911.0f);
   for (int n = 0; n <= V::kSize; ++n) {
-    Half sentinel = StaticCast<Half>(911.0f);
-    Half result[V::kSize] = {};
+    std::array<Half, V::kSize + 2> result{};
+    result.fill(sentinel);
+    Store(result.data() + 1, v, n);
+    EXPECT_EQ(sentinel, result.front());
+    EXPECT_EQ(sentinel, result.back());
     for (int i = 0; i < V::kSize; ++i) {
-      result[i] = sentinel;
-    }
-    Store(result, v, n);
-    for (int i = 0; i < V::kSize; ++i) {
-      EXPECT_EQ(i < n ? values[i] : sentinel, result[i]);
+      EXPECT_EQ(i < n ? values[i] : sentinel, result[i + 1]);
     }
   }
 }
@@ -118,32 +107,42 @@ void TestStorePartial(Span<Half const> values) {
 template <int N, class V>
 void TestStorePartialN(Span<Half const> values) {
   ASSERT_EQ(V::kSize, isize(values));
-  auto v = Load<V>(values.data());
-  Half result[V::kSize] = {};
-  Store<N>(result, v);
+  auto const v = Load<V>(values.data());
+  auto const sentinel = StaticCast<Half>(911.0f);
+  std::array<Half, V::kSize + 2> result{};
+  result.fill(sentinel);
+  Store<N>(result.data() + 1, v);
+  EXPECT_EQ(sentinel, result.front());
+  EXPECT_EQ(sentinel, result.back());
   for (int i = 0; i < V::kSize; ++i) {
-    EXPECT_EQ(i < N ? values[i] : Half{}, result[i]);
+    EXPECT_EQ(i < N ? values[i] : sentinel, result[i + 1]);
   }
 }
 
 template <class V, class SimdOp, class ScalarOp>
 void TestBitwiseOp(SimdOp simdOp, ScalarOp scalarOp) {
-  static_assert(V::kSize <= 16);
-
   // clang-format off
-  uint16_t const kBitsA[16] = {0xFFFF, 0xFF00, 0x0F0F, 0x1234, 0xAAAA, 0x5555, 0x0000, 0xFFFF, 0x1111, 0x2222, 0x3333, 0x4444, 0x5555, 0x6666, 0x7777, 0x8888};
-  uint16_t const kBitsB[16] = {0xFFFF, 0x00FF, 0xF0F0, 0x4321, 0x5555, 0xAAAA, 0xFFFF, 0x0000, 0xEEEE, 0xDDDD, 0xCCCC, 0xBBBB, 0xAAAA, 0x9999, 0x8888, 0x7777};
+  uint16_t const kBitsA[32] = {
+      0xFFFF, 0xFF00, 0x0F0F, 0x1234, 0xAAAA, 0x5555, 0x0000, 0xFFFF,
+      0x1111, 0x2222, 0x3333, 0x4444, 0x5555, 0x6666, 0x7777, 0x8888,
+      0x0001, 0x8000, 0x00F0, 0x0FF0, 0x1357, 0x2468, 0x369C, 0xC963,
+      0x5A5A, 0xA5A5, 0x7FFE, 0x4002, 0xDEAD, 0xBEEF, 0xCAFE, 0xBABE};
+  uint16_t const kBitsB[32] = {
+      0xFFFF, 0x00FF, 0xF0F0, 0x4321, 0x5555, 0xAAAA, 0xFFFF, 0x0000,
+      0xEEEE, 0xDDDD, 0xCCCC, 0xBBBB, 0xAAAA, 0x9999, 0x8888, 0x7777,
+      0xFFFE, 0x7FFF, 0x0F00, 0xF00F, 0xFDB9, 0xECA8, 0x963C, 0x3C96,
+      0xA55A, 0x5AA5, 0x8001, 0xBFFD, 0x2152, 0x4110, 0x3501, 0x4541};
   // clang-format on
 
   Half aVals[V::kSize] = {};
   Half bVals[V::kSize] = {};
   for (int i = 0; i < V::kSize; ++i) {
-    aVals[i] = ReinterpretCast<Half>(kBitsA[i]);
-    bVals[i] = ReinterpretCast<Half>(kBitsB[i]);
+    aVals[i] = ReinterpretCast<Half>(kBitsA[i % 32]);
+    bVals[i] = ReinterpretCast<Half>(kBitsB[i % 32]);
   }
   auto r = simdOp(Load<V>(aVals), Load<V>(bVals));
   for (int i = 0; i < V::kSize; ++i) {
-    EXPECT_EQ(scalarOp(kBitsA[i], kBitsB[i]), GetBits(r[i]));
+    EXPECT_EQ(scalarOp(kBitsA[i % 32], kBitsB[i % 32]), GetBits(r[i]));
   }
 }
 
@@ -266,10 +265,8 @@ void TestAllTrue() {
 
 template <class V>
 void TestStaticCastSpecialValues() {
-  static_assert(V::kSize <= 16);
-
   // clang-format off
-  float const kSpecials[16] = {
+  float const kSpecialPattern[16] = {
       0.0f, -0.0f,
       std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(),
       65504.0f, 5.96046e-8f, 6.103515625e-5f,
@@ -280,7 +277,12 @@ void TestStaticCastSpecialValues() {
   };
   // clang-format on
 
-  auto f = Load<Simd<float, V::kSize>>(kSpecials);
+  float specials[V::kSize];
+  for (int i = 0; i < V::kSize; ++i) {
+    specials[i] = kSpecialPattern[i % 16];
+  }
+
+  auto f = Load<Simd<float, V::kSize>>(specials);
   auto h = StaticCast<V>(f);
   auto back = StaticCast<Simd<float, V::kSize>>(h);
 
@@ -297,10 +299,12 @@ void TestStaticCastSpecialValues() {
 
   // Remaining lanes: NaN stays NaN, everything else round-trips.
   for (int i = 8; i < V::kSize; ++i) {
-    if (std::isnan(kSpecials[i])) {
+    if (std::isnan(specials[i])) {
       EXPECT_TRUE(std::isnan(back[i]));
+    } else if (std::isinf(specials[i])) {
+      EXPECT_EQ(specials[i], back[i]);
     } else {
-      EXPECT_NEAR(kSpecials[i], back[i], 1e-8f);
+      EXPECT_NEAR(specials[i], back[i], 1e-8f);
     }
   }
 }
@@ -416,14 +420,14 @@ void TestExhaustiveConversionHalfToFloat() {
   constexpr auto kMax = std::numeric_limits<uint16_t>::max();
   for (uint32_t base = 0; base <= kMax; base += V::kSize) {
     Half halves[V::kSize] = {};
-    for (int i = 0; i < V::kSize && (base + i) < kMax; ++i) {
+    for (int i = 0; i < V::kSize && (base + i) <= kMax; ++i) {
       halves[i] = ReinterpretCast<Half>(static_cast<uint16_t>(base + i));
     }
     auto v = Load<V>(halves);
     auto floats = StaticCast<Simd<float, V::kSize>>(v);
     float fout[V::kSize] = {};
     Store(fout, floats);
-    for (int i = 0; i < V::kSize && (base + i) < kMax; ++i) {
+    for (int i = 0; i < V::kSize && (base + i) <= kMax; ++i) {
       auto expected = StaticCast<float>(halves[i]);
       if (std::isnan(expected)) {
         EXPECT_TRUE(std::isnan(fout[i]));

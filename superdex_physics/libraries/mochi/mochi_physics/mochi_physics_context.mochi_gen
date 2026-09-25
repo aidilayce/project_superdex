@@ -1,3 +1,17 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 // @brief Main entry point for SuperDex Physics simulation.
 //
 // @details A @ref Context owns all global state for SuperDex Physics: scenes, shapes, threading,
@@ -566,7 +580,7 @@ class Context [no_init, no_destruct, singleton] {
   //
   // @see ShapeHandle, ReleaseShape
   fn CreateTetMeshShape(
-    Span<real const> coordinates [units(m)],
+    Span<real const> coordinates [units("m")],
     Span<int const> connectivity
   ) -> ShapeHandle [pure, virtual, mochi_error];
 
@@ -585,7 +599,7 @@ class Context [no_init, no_destruct, singleton] {
   //
   // @see ShapeHandle, ReleaseShape
   fn CreateTriMeshShape(
-    Span<real const> coordinates [units(m)],
+    Span<real const> coordinates [units("m")],
     Span<int const> connectivity,
   )  -> ShapeHandle [pure, virtual, mochi_error];
   // @brief Create an implicit sphere shape.
@@ -601,7 +615,7 @@ class Context [no_init, no_destruct, singleton] {
   // @note Call on any thread.
   //
   // @see ShapeHandle, ReleaseShape
-  fn CreateSphereShape(Real3 const& center, real radius [units(m)]) -> ShapeHandle [pure, virtual, mochi_error];
+  fn CreateSphereShape(Real3 const& center, real radius [units("m")]) -> ShapeHandle [pure, virtual, mochi_error];
 
   // @brief Create an implicit plane with infinite extents.
   //
@@ -618,7 +632,7 @@ class Context [no_init, no_destruct, singleton] {
   // @note Call on any thread.
   //
   // @see ShapeHandle, ReleaseShape
-  fn CreatePlaneShape(Real3 const& normal, real distance [units(m)]) -> ShapeHandle [pure, virtual, mochi_error];
+  fn CreatePlaneShape(Real3 const& normal, real distance [units("m")]) -> ShapeHandle [pure, virtual, mochi_error];
 
   // @brief Get a view of the shape's main mesh data.
   //
@@ -642,8 +656,9 @@ class Context [no_init, no_destruct, singleton] {
   // @details Returns a triangle mesh (3 nodes per element) representing the shape's surface.
   // The coordinate array contains exactly the surface nodes referenced by the returned connectivity;
   // nodes present in the underlying main mesh but not referenced by any surface triangle are omitted.
-  // Connectivity values are indices into this returned coordinate array. For shapes without a
-  // surface mesh, returns an empty view.
+  // Connectivity values are indices into this returned coordinate array. For polyline shapes with
+  // an authored contact skin, returns that skin. For shapes without a surface mesh, returns an
+  // empty view.
   //
   // @note For triangular mesh shapes, this may differ from @ref GetShapeMesh if the main mesh
   // contains unreferenced nodes. For tetrahedral mesh shapes, this is the boundary surface of the
@@ -657,8 +672,32 @@ class Context [no_init, no_destruct, singleton] {
   // @note Can be called on any thread.
   // @note The returned view will be invalid after the shape handle has been released.
   //
-  // @see MeshDataView, GetShapeMesh, GetShapeVisualMesh, Actor::GetSurfaceMesh
+  // @see MeshDataView, GetShapeMesh, GetShapeContactSkinMesh, GetShapeVisualMesh,
+  // Actor::GetSurfaceMesh
   fn GetShapeSurfaceMesh(ShapeHandle shape) -> MeshDataView [pure, virtual, const, mochi_error, no_capi];
+
+  // @brief Get a view of the shape's contact-skin mesh data, including linear skinning data if
+  // available.
+  //
+  // @details Returns a triangle mesh (3 nodes per element) intended for contact handling.
+  // Coordinates and connectivity are returned in contact-skin node-index space, including any
+  // contact-skin nodes not referenced by the contact-skin connectivity. The mesh includes linear
+  // skinning data for deformation when available. Nonlinear skinning data, such as rod contact-skin
+  // embeddings, is not exposed. For shapes without a contact skin, returns an empty view.
+  //
+  // @param[in] shape Handle to a valid shape.
+  //
+  // @return A non-owning view of the shape's contact-skin mesh data, or an empty view if the shape
+  // has no contact skin.
+  //
+  // @note Can be called on any thread.
+  // @note The returned view will be invalid after the shape handle has been released.
+  // @note When linear contact-skin skinning data is present, skinning indices refer to the node
+  // ordering returned by @ref GetShapeMesh, not to the compact surface-node ordering returned by
+  // @ref GetShapeSurfaceMesh.
+  //
+  // @see MeshDataView, GetShapeMesh, GetShapeSurfaceMesh, GetShapeVisualMesh
+  fn GetShapeContactSkinMesh(ShapeHandle shape) -> MeshDataView [pure, virtual, const, mochi_error, no_capi];
 
   // @brief Get a view of the shape's visual mesh data, including skinning data if available.
   //
@@ -676,8 +715,8 @@ class Context [no_init, no_destruct, singleton] {
   // @note The returned view will be invalid after the shape handle has been released.
   // @note When linear visual-mesh skinning data is present, skinning indices refer to the node
   // ordering returned by @ref GetShapeMesh, not to the compact surface-node ordering returned by
-  // @ref GetShapeSurfaceMesh. Rod visual mesh embeddings are nonlinear and are not exposed through
-  // this linear skinning field.
+  // @ref GetShapeSurfaceMesh. Polyline visual mesh embeddings are nonlinear and are not exposed
+  // through this linear skinning field.
   //
   // @see MeshDataView, GetShapeMesh, GetShapeSurfaceMesh, Actor::GetVisualMesh
   fn GetShapeVisualMesh(ShapeHandle shape) -> MeshDataView [pure, virtual, const, mochi_error, no_capi];
@@ -773,8 +812,9 @@ class Context [no_init, no_destruct, singleton] {
   // in case the file had been modified. All entries for @ref filePath are removed, including every
   // variant produced by different bake scale/transform combinations.
   //
-  // @param[in] filePath Path to a file that may have been loaded. The match is case-sensitive and
-  // must equal the path used at load time exactly.
+  // @param[in] filePath Path to a file that may have been loaded. It is matched against the path
+  // used at load time after lexical normalization, so separator style and "." / ".." segments may
+  // differ. The match is case-sensitive.
   //
   // @note Call on any thread.
   //

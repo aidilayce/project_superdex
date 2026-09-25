@@ -36,6 +36,7 @@ namespace mochi_renderer {
 class MaterialInstance;
 class IInstanceable;
 class Resource;
+class SkinnedModelInstance;
 
 // Filament renderable layer bit reserved for the highlight overlay pass. A renderable tagged with
 // this bit is additionally re-rendered into an isolated overlay target (its normal appearance in
@@ -51,6 +52,7 @@ class SceneObject {
   filament::math::quatf _rotation = {};
   filament::math::float3 _translation = {0.0f, 0.0f, 0.0f};
   bool _internal = false;
+  bool _visible = true;
   bool _showAABB = false;
   SceneObject* _pickProxy = nullptr;
 
@@ -91,6 +93,9 @@ class SceneObject {
   bool GetCastShadows() const;
   bool GetReceiveShadows() const;
   void SetVisible(bool visible);
+  // Whether this object is currently drawn. Scene bounds queries skip hidden objects, so a
+  // representation that is staged but not shown does not influence framing or the ground plane.
+  bool IsVisible() const;
   bool GetVisible() const;
   // Adds/removes this object's renderables from the highlight overlay pass (the reserved
   // @ref kHighlightOverlayLayer bit). Independent of SetVisible, so an object can be both normally
@@ -105,6 +110,12 @@ class SceneObject {
 
   virtual IInstanceable* GetInstanceable() = 0;
   void SetParent(SceneObject* other) const;
+
+  // RTTI-free downcast: returns this as a SkinnedModelInstance when the object is a GPU-skinned
+  // render model (so callers holding a base SceneObject can drive its joints), else nullptr.
+  virtual SkinnedModelInstance* AsSkinnedModelInstance() {
+    return nullptr;
+  }
 
  protected:
   SceneObject(filament::Engine* engine);

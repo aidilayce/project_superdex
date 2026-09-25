@@ -218,13 +218,9 @@ class Simd<Half, 16> {
     }
   }
 
-  [[nodiscard]] static MOCHI_FORCE_INLINE Scalar Get(Simd v, int i) {
+  [[nodiscard]] MOCHI_FORCE_INLINE Scalar operator[](int i) const {
     MOCHI_ASSERT_VERBOSE(i >= 0 && i < kSize, "Index out of range.");
-    if (i < 8) {
-      return Simd<Half, 8>::Get(GetHalf<0>(v), i);
-    } else {
-      return Simd<Half, 8>::Get(GetHalf<1>(v), i - 8);
-    }
+    return i < 8 ? GetHalf<0>(*this)[i] : GetHalf<1>(*this)[i - 8];
   }
 };
 

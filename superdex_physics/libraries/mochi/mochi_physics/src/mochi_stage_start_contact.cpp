@@ -121,7 +121,7 @@ void mochi::AddMissingStageStartCollisions(
       --m;
     }
 
-    // Insert all partitions of this collider, preserving their order.
+    // Fill backward from the last partition to preserve ascending partition order.
     for (int i = rangeEnd; i >= rangeBegin; --i) {
       outCurrentCollisions[m].colliderEntity = colliderEntity;
       outCurrentCollisions[m].collisionResult = {};
@@ -133,6 +133,9 @@ void mochi::AddMissingStageStartCollisions(
     }
   }
   MOCHI_ASSERT_VERBOSE(c == m, "Internal error: merge index mismatch");
+  MOCHI_ASSERT_VERBOSE(
+      std::is_sorted(outCurrentCollisions.begin(), outCurrentCollisions.end()),
+      "Expected sorted active collisions.");
 }
 
 // Explicit template instantiations

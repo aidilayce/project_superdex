@@ -20,6 +20,7 @@
 #include "mochi_articulated_actor_params.h"
 #include "mochi_articulated_body.h"
 #include "mochi_blended.h"
+#include "mochi_constraint.h"
 #include "mochi_contact.h"
 #include "mochi_contact_filter.h"
 #include "mochi_context.h"
@@ -27,6 +28,7 @@
 #include "mochi_ecs_utils.h"
 #include "mochi_group.h"
 #include "mochi_integration.h"
+#include "mochi_point_cloud_contact.h"
 #include "mochi_query.h"
 #include "mochi_rigid.h"
 #include "mochi_rod.h"
@@ -38,6 +40,7 @@
 #include "mochi_solve.h"
 #include "mochi_transmission.h"
 
+#include <mochi_core/articulated_body/articulated_body_hessian.h>
 #include <mochi_core/geometry/geometry_utils.h>
 #include <mochi_core/materials/batched_smith_neo_hookean.h>
 #include <mochi_core/materials/material_params_utils.h>
@@ -137,13 +140,33 @@ static void QueryNodesInVolumeLocalImpl(
     std::function<void(int, Real3)> const& callback,
     Error& error) {
   if (boundaryOnly) {
-    auto const* queryPos = MOCHI_TRY_GET(CQuerySurfaceNodePositions, reg, e, error);
-    MOCHI_ERROR_RETURN(error);
-    Span<Real3 const> positions = Unflatten<Real3 const>(queryPos->nodePositions);
     auto const* surfaceMeshComponent = MOCHI_TRY_GET(CSurfaceMesh, reg, e, error);
     MOCHI_ERROR_RETURN(error);
 
     ActorMeshSource const actorMeshSource = GetActorMeshSource(reg, e);
+    bool const hasEmbeddedSurfaceMesh = surfaceMeshComponent->embedding != nullptr;
+    if (hasEmbeddedSurfaceMesh && actorMeshSource == ActorMeshSource::Simplicial) {
+      auto const& physicsMesh = reg.get<CSimplicialMesh const>(e).mesh;
+      auto const& displacements = reg.get<CFinalDisplacementRef<TimeStep::Current> const>(e).value;
+      auto const referencePositions = physicsMesh->GetNodeCoordinates();
+      auto const displacementVectors = Unflatten<Real3 const>(displacements.GetConstSpan());
+      // All active triangular-mesh nodes are surface nodes; tetrahedral meshes use only boundary
+      // nodes.
+      auto const nodeIndices = physicsMesh->GetNumVolumes() == 0 ? physicsMesh->GetActiveNodes()
+                                                                 : physicsMesh->GetBoundaryNodes();
+      for (int nodeIndex : nodeIndices) {
+        Real3 const position = referencePositions[nodeIndex] + displacementVectors[nodeIndex];
+        if (ContainsPoint(volumeLocal, position)) {
+          callback(nodeIndex, position);
+        }
+      }
+      return;
+    }
+
+    auto const* queryPos = MOCHI_TRY_GET(CQuerySurfaceNodePositions, reg, e, error);
+    MOCHI_ERROR_RETURN(error);
+    Span<Real3 const> positions = Unflatten<Real3 const>(queryPos->nodePositions);
+
     MOCHI_ERROR_IF(
         actorMeshSource != ActorMeshSource::Simplicial &&
             actorMeshSource != ActorMeshSource::Surface,
@@ -247,20 +270,20 @@ class ActorInterfaceImpl : public ActorInterface {
     return transform ? transform->worldFromLocal : TransformRT{};
   }
 
-  static void SetRootTransformImpl(
-      entt::registry& reg,
-      entt::entity e,
-      TransformRT const& worldFromLocal,
-      Error& error) {
-    MOCHI_ERROR_RETURN(error);
+  void SetRootTransformImpl(TransformRT const& worldFromLocal, Error& error) {
     MOCHI_ERROR_IF(
-        (reg.any_of<TagArticulatedLinkActor>(e)),
+        reg.any_of<TagArticulatedLinkActor>(e),
         error,
-        "You cannot set the transform of a link actor directly. Please use the articulated actor's transform and pose instead.");
+        "The transform of a nested link actor cannot be directly set. Please use the articulated actor's transform and pose instead.");
+    MOCHI_ERROR_IF(
+        reg.any_of<TagNestedSoftActor>(e),
+        error,
+        "The transform of a nested soft actor cannot be directly set.");
     MOCHI_ERROR_RETURN(error);
 
-    // Articulated actors: set the root and recompute derived state.
+    // Articulated actors: set the root and recompute derived state (including mesh skinning).
     if (reg.all_of<TagArticulatedActor>(e)) {
+      ScopedSchedulerBinding schedulerBinding(assert_cast<SceneImpl*>(scene));
       articulated::compound::SetArticulatedRootTransform(reg, e, worldFromLocal);
       return;
     }
@@ -278,7 +301,7 @@ class ActorInterfaceImpl : public ActorInterface {
   }
 
   void SetRootTransform(TransformRT const& worldFromLocal, Error& error) override {
-    SetRootTransformImpl(reg, e, worldFromLocal, error);
+    SetRootTransformImpl(worldFromLocal, error);
   }
 
   Real3 GetRigidCenterOfMassLocal(Error& error) const override {
@@ -318,7 +341,7 @@ class ActorInterfaceImpl : public ActorInterface {
     TransformRT rootTransform;
     rigid::RigidStateToRootTransform(
         rbInertia->GetCenterOfMassLocal(), worldFromCom, rootTransform);
-    SetRootTransformImpl(reg, e, rootTransform, error);
+    SetRootTransformImpl(rootTransform, error);
   }
 
   Real6 GetRigidMomentOfInertiaLocal(Error& error) const override {
@@ -346,7 +369,7 @@ class ActorInterfaceImpl : public ActorInterface {
         "Cannot set the velocity of a static actor to any value other than zero.");
     MOCHI_ERROR_IF(
         (!reg.any_of<TagStaticActor, TagRigidActor, TagSoftActor>(e) ||
-         reg.any_of<TagArticulatedLinkActor, TagRomActor, TagSoftSkinnedActor>(e)),
+         reg.any_of<TagArticulatedLinkActor, TagRomActor, TagNestedSoftActor>(e)),
         error,
         "SetVelocity is not supported for this actor type.");
     MOCHI_ERROR_IF_NOT(IsFinite(linearVel), error, "Linear velocity must be finite.");
@@ -469,6 +492,7 @@ class ActorInterfaceImpl : public ActorInterface {
       auto const prevDensity = material->density;
       material->density = density;
       if (density != prevDensity) {
+        ScopedSchedulerBinding schedulerBinding(assert_cast<SceneImpl*>(scene));
         ecs::TryInvokeOnEntity(&soft::UpdateSoftMass, reg, e);
       }
     } else {
@@ -546,6 +570,25 @@ class ActorInterfaceImpl : public ActorInterface {
     MOCHI_ERROR_RETURN(error);
     ValidateContactParams(newParams, error);
     MOCHI_ERROR_RETURN(error);
+
+    if (auto const* pointCloudParams = reg.try_get<CPointCloudColliderParams const>(e)) {
+      ValidatePointCloudColliderParams(*pointCloudParams, newParams, error);
+      MOCHI_ERROR_RETURN(error);
+      real const oldContactThreshold = params->GetPenaltyThresholdDist(/*addPadding*/ true);
+      real const newContactThreshold = newParams.GetPenaltyThresholdDist(/*addPadding*/ true);
+      if (oldContactThreshold != newContactThreshold) {
+        auto const& colliderDiscretization = reg.get<CColliderPointCloudDiscretization const>(e);
+        auto newSpatialHash =
+            CreateSpatialHashTable(*pointCloudParams, colliderDiscretization, newContactThreshold);
+        UpdateSpatialHashTable(
+            ecs::Included<TagUsePointCloudContact>{},
+            colliderDiscretization,
+            reg.get<CFinalDisplacementRef<TimeStep::Current> const>(e),
+            newSpatialHash);
+        reg.get<CSpatialHashTable>(e) = std::move(newSpatialHash);
+      }
+    }
+
     *params = newParams;
   }
 
@@ -585,6 +628,11 @@ class ActorInterfaceImpl : public ActorInterface {
 
     currentDisplacement->value = AsConstView(displacements);
 
+    if (reg.all_of<TagNestedSoftActor>(e)) {
+      ScopedSchedulerBinding schedulerBinding(assert_cast<SceneImpl*>(scene));
+      skinned::SynchronizeAfterExternalChange(reg, e);
+    }
+
     // External state changes invalidate step history.
     InvalidateActorStepHistory(reg, e);
   }
@@ -616,6 +664,7 @@ class ActorInterfaceImpl : public ActorInterface {
     auto prevDensity = softMaterialParams.density;
     soft::SetMaterialParams(params, softMaterialParams);
     if (softMaterialParams.density != prevDensity) {
+      ScopedSchedulerBinding schedulerBinding(assert_cast<SceneImpl*>(scene));
       ecs::TryInvokeOnEntity(&soft::UpdateSoftMass, reg, e);
     }
 
@@ -786,6 +835,8 @@ class ActorInterfaceImpl : public ActorInterface {
       Span<Real3 const> pointsWorld,
       Span<real> outDistances,
       Error& error) const override {
+    ScopedSchedulerBinding schedulerBinding(assert_cast<SceneImpl*>(scene));
+
     auto const numPoints = isize(pointsWorld);
     MOCHI_ERROR_IF(
         numPoints != isize(outDistances), error, "Size mismatch between input and output");
@@ -913,13 +964,13 @@ class ActorInterfaceImpl : public ActorInterface {
   }
 
   Aabb GetAabbLocal(Error& error) const override {
-    auto const* bv = MOCHI_TRY_GET(CBoundingVolume<TimeStep::Current>, reg, e, error);
+    auto const* bv = MOCHI_TRY_GET(CBoundingVolume, reg, e, error);
     MOCHI_ERROR_RETURN(error, {});
     return GetAabb(bv->localShape);
   }
 
   Aabb GetAabbWorld(Error& error) const override {
-    auto const* bv = MOCHI_TRY_GET(CBoundingVolume<TimeStep::Current>, reg, e, error);
+    auto const* bv = MOCHI_TRY_GET(CBoundingVolume, reg, e, error);
     MOCHI_ERROR_RETURN(error, {});
     return GetAabb(TransformShape(GetRootTransform(), bv->localShape));
   }
@@ -1198,6 +1249,8 @@ class ActorInterfaceImpl : public ActorInterface {
   }
 
   void SetArticulatedPoseFromLinks(Span<TransformRT const> worldFromLinks, Error& error) override {
+    ScopedSchedulerBinding schedulerBinding(assert_cast<SceneImpl*>(scene));
+
     MOCHI_ERROR_RETURN_IF_NOT_ARTICULATED();
 
     auto const& links = reg.get<CGroupMembers const>(e).actors;
@@ -1245,6 +1298,8 @@ class ActorInterfaceImpl : public ActorInterface {
   }
 
   void SetArticulatedPoseFromJoints(Span<real const> pose, Error& error) override {
+    ScopedSchedulerBinding schedulerBinding(assert_cast<SceneImpl*>(scene));
+
     MOCHI_ERROR_RETURN_IF_NOT_ARTICULATED();
 
     // If necessary, convert dofs to pose
@@ -1264,6 +1319,8 @@ class ActorInterfaceImpl : public ActorInterface {
   }
 
   void SetArticulatedJointVelocities(Span<real const> velocities, Error& error) override {
+    ScopedSchedulerBinding schedulerBinding(assert_cast<SceneImpl*>(scene));
+
     MOCHI_ERROR_RETURN_IF_NOT_ARTICULATED();
     articulated::compound::SetArticulatedJointVelocities(reg, e, velocities, error);
     MOCHI_ERROR_RETURN(error);
@@ -1616,6 +1673,11 @@ class ActorInterfaceImpl : public ActorInterface {
     // Destroy controller constraints
     auto const& constraints = reg.get<CControllerConstraints>(e).impl;
     for (auto const& constraint : constraints) {
+      auto& constraintInfo =
+          reg.get<CConstraintInfo>(GetEntityUnchecked(constraint.constraint->GetHandle()));
+      MOCHI_ASSERT_VERBOSE(
+          constraintInfo.isActorOwned, "Pose-controller constraints must be actor-owned.");
+      constraintInfo.isActorOwned = false;
       scene->DestroyConstraint(constraint.constraint);
     }
 
@@ -1778,8 +1840,32 @@ class ActorInterfaceImpl : public ActorInterface {
   }
 
   void SetZeroDisplacementsAndVelocities(Error& error) override {
-    mochi::SetZeroDisplacements(reg, e, error);
-    mochi::SetZeroVelocities(reg, e, error);
+    MOCHI_ERROR_RETURN(error);
+    MOCHI_PROFILE_SCOPE();
+
+    auto* currDispl = reg.try_get<CDisplacementSlice<real, TimeStep::Current>>(e);
+    MOCHI_ERROR_IF(
+        currDispl == nullptr, error, "CDisplacementSlice<real, TimeStep::Current> required.");
+    auto* prevDispl = reg.try_get<CDisplacementSlice<real, TimeStep::Previous>>(e);
+    MOCHI_ERROR_IF(
+        prevDispl == nullptr, error, "CDisplacementSlice<real, TimeStep::Previous> required.");
+    auto* currVel = reg.try_get<CVelocitySlice<real, TimeStep::Current>>(e);
+    MOCHI_ERROR_IF(currVel == nullptr, error, "CVelocitySlice<real, TimeStep::Current> required.");
+    auto* prevVel = reg.try_get<CVelocitySlice<real, TimeStep::Previous>>(e);
+    MOCHI_ERROR_IF(prevVel == nullptr, error, "CVelocitySlice<real, TimeStep::Previous> required.");
+    MOCHI_ERROR_RETURN(error);
+    currDispl->value.SetZero();
+    prevDispl->value.SetZero();
+    currVel->value.SetZero();
+    prevVel->value.SetZero();
+
+    if (reg.all_of<TagNestedSoftActor>(e)) {
+      ScopedSchedulerBinding schedulerBinding(assert_cast<SceneImpl*>(scene));
+      skinned::SynchronizeAfterExternalChange(reg, e);
+    }
+
+    // External state changes invalidate step history.
+    InvalidateActorStepHistory(reg, e);
   }
 
   Span<real const> GetElementsDeformationGradient(Error& error) const override {
@@ -1788,6 +1874,8 @@ class ActorInterfaceImpl : public ActorInterface {
   }
 
   void SetNodePositionsLocal(Span<real const> positionsLocal, Error& error) override {
+    ScopedSchedulerBinding schedulerBinding(assert_cast<SceneImpl*>(scene));
+
     mochi::SetNodePositionsLocal(reg, e, positionsLocal, error);
   }
 
@@ -1822,7 +1910,7 @@ class ActorInterfaceImpl : public ActorInterface {
       entt::entity e,
       Error& error) {
     MOCHI_ERROR_IF(
-        reg.any_of<TagSoftSkinnedActor>(e),
+        reg.any_of<TagNestedSoftActor>(e),
         error,
         "Boundary condition setters are not supported for nested soft actors.");
   }
@@ -2305,11 +2393,16 @@ class ActorInterfaceImpl : public ActorInterface {
 #undef MOCHI_ERROR_RETURN_IF_NO_CONTACT_QUERY
 
   QueryHandle RegisterQuery(QueryType type, Error& error) override {
+    // Bind scheduler because static actors force kComputeImmediately to true.
+    ScopedSchedulerBinding schedulerBinding(assert_cast<SceneImpl*>(scene));
+
     constexpr bool kComputeImmediately = false;
     return mochi::RegisterQuery(reg, e, type, kComputeImmediately, error);
   }
 
   QueryHandle RegisterQueryAndCompute(QueryType type, Error& error) override {
+    ScopedSchedulerBinding schedulerBinding(assert_cast<SceneImpl*>(scene));
+
     constexpr bool kComputeImmediately = true;
     return mochi::RegisterQuery(reg, e, type, kComputeImmediately, error);
   }
@@ -2345,7 +2438,7 @@ class ActorInterfaceImpl : public ActorInterface {
     if (auto const* composition = reg.try_get<CSkinnedComposition const>(e)) {
       return composition->articulatedHandle;
     }
-    MOCHI_ERROR_SET(error, "Actor is not an articulated link or soft skinned actor");
+    MOCHI_ERROR_SET(error, "Actor is not a nested link or nested soft actor.");
     return {};
   }
 
@@ -2356,8 +2449,7 @@ class ActorInterfaceImpl : public ActorInterface {
   MOCHI_ERROR_RETURN(error, __VA_ARGS__);
 
   bool IsNestedSoftActor() const override {
-    // Check if this soft actor is nested within a soft skinned articulation
-    return reg.all_of<TagSoftSkinnedActor>(e);
+    return reg.all_of<TagNestedSoftActor>(e);
   }
 
   Span<real const> GetArticulatedJacobian(Error& error) const override {
@@ -2875,16 +2967,42 @@ void diffsim::SetArticulatedPoseFromJointsBackward(
   // controller target pose to the provided pose with zero target velocity. The input pose can
   // therefore own state, current-target, and previous-target gradients. Only add target gradients
   // that are still owned by SetArticulatedPoseFromJoints; later target setters may overwrite them.
-  AsView(outGradPose) = reg.get<CDiffStateGrad const>(e).value;
+  auto outGrad = AsView(outGradPose);
+  outGrad = reg.get<CDiffStateGrad const>(e).value;
+
+  // A pose reset also updates the link velocities as v_link = J(q) * v_joint. Account for
+  // d(v_link)/dq = dJ(q)/dq * v_joint using the articulation Hessian.
+  auto const& jacobian = reg.get<CArticulatedJacobian const>(e).value;
+  int const linkDofs = jacobian.Rows();
+  auto const dt = static_cast<real>(reg.ctx<CSceneTime const>().DeltaTime());
+  ColumnVector<real> linkVelocityGrad(
+      dt * reg.get<CDiffDerivedStepGrad const>(e).value.BottomRows(linkDofs));
+  DynamicArray<real> jointVelocity(outGrad.Rows());
+  actor->GetArticulatedJointVelocities(jointVelocity, ErrorAssert{});
+
+  auto const* joints = reg.get<CArticulatedBodyShape const>(e).shape->GetJointsData();
+  articulated::JacobianDerivativeDoubleContract(
+      joints->dofInfo,
+      joints->jointAxes,
+      reg.get<CArticulatedParents const>(e),
+      reg.get<CArticulatedRestTransforms const>(e),
+      reg.get<CRootTransform const>(e).worldFromLocal,
+      reg.get<CArticulatedJointTransforms<TimeStep::Current> const>(e),
+      reg.get<CArticulatedLinkTransforms<TimeStep::Current> const>(e),
+      linkVelocityGrad,
+      jacobian,
+      jointVelocity,
+      outGrad);
+
   if (reg.all_of<CControllerConstraints>(e)) {
     auto const& targetPoseGrad = reg.get<CDiffTargetPoseGrad const>(e);
     auto const& owner = reg.get<CTargetOwners const>(e);
     if (owner.newPoseOwner == TargetOwner::PoseFromJoints) {
-      AsView(outGradPose) += AsConstView(targetPoseGrad.current);
+      outGrad += AsConstView(targetPoseGrad.current);
     }
     if (owner.oldPoseStep == owner.newPoseStep &&
         owner.oldPoseOwner == TargetOwner::PoseFromJoints) {
-      AsView(outGradPose) += AsConstView(targetPoseGrad.previous);
+      outGrad += AsConstView(targetPoseGrad.previous);
     }
   }
 
@@ -3191,7 +3309,7 @@ ActorInterfacePtr CreateActorInterface(entt::registry& reg, entt::entity e, Scen
   return std::make_unique<ActorInterfaceImpl>(reg, e, scene);
 }
 
-MOCHI_API real experimental::GetContactForceWorldBatch(
+real experimental::GetContactForceWorldBatch(
     Span<Actor const* const> actors,
     Span<Actor const* const> colliders,
     Error& error) {

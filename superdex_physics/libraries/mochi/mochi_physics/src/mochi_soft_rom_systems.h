@@ -125,10 +125,10 @@ inline void EntityGetSolution(
 
 // Assemble a soft ROM by reading the full DOF CActorSnle, projecting to the reduced DOFs.
 // Must be called AFTER the regular soft actor assembly.
-MOCHI_API void AssembleFullToReduced(
+void AssembleFullToReduced(
     AssemblyParams const& params,
     ecs::Included<TagSoftActor, TagRomActor>,
-    ecs::OptionalTag<TagSoftSkinnedActor> isSkinned,
+    ecs::OptionalTag<TagNestedSoftActor> isNestedSoft,
     ecs::OptionalTag<TagUseGravity> hasGravityTag,
     ecs::OptionalTag<TagUseInertia> hasInertiaTag,
     ecs::OptionalTag<TagUseStress> hasStressTag,
@@ -139,14 +139,14 @@ MOCHI_API void AssembleFullToReduced(
     CActorSnle& actorSnle);
 
 // Assemble and project the volume terms.
-MOCHI_API void AssembleAndProjectBody(
+void AssembleAndProjectBody(
     AssemblyParams const& params, // External parameter
     ecs::Included<TagSoftActor, TagRomActor>,
     ecs::CtxGlobal<CSceneGravity const> sceneGravity,
     ecs::OptionalTag<TagUseGravity> hasGravityTag,
     ecs::OptionalTag<TagUseInertia> hasInertiaTag,
     ecs::OptionalTag<TagUseStress> hasStressTag,
-    ecs::OptionalTag<TagSoftSkinnedActor> isSkinned,
+    ecs::OptionalTag<TagNestedSoftActor> isNestedSoft,
     CSkinnedEnergy const& skinnedEnergy,
     CRomProjectionStrategy const& projectionStrategy,
     CLocal2GlobalMap const& l2g,
@@ -168,7 +168,7 @@ void AssembleAndProjectAsyncContact(
     AssemblyParams const& params, // External parameter
     entt::entity e,
     ecs::Included<TagSoftActor, TagRomActor, TagUseContact>,
-    ecs::Excluded<TagSoftSkinnedActor>,
+    ecs::Excluded<TagNestedSoftActor>,
     ecs::OptionalTag<TagQueryActiveContacts> queryActiveContacts,
     ecs::CtxGlobal<CSimulationParams const> simParams,
     ContactAssemblyReg reg,
@@ -247,7 +247,7 @@ void PreStagePipeline(entt::registry& reg, Span<entt::entity const> entities);
 
 // Updates velocity in ROM space by taking finite differences between the current and stage-start
 // ROM state as raw vectors. Called every time the solution is set.
-MOCHI_API void UpdateCurrentRomVelocity(
+void UpdateCurrentRomVelocity(
     ecs::Included<TagSoftActor, TagRomActor>,
     ecs::OptionalTag<TagRomActorFixRigidTransformInSolve> isRigidTransformFixedInSolve,
     CRomCommonProperties const& props,
