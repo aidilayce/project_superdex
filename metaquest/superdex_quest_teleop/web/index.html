@@ -36,6 +36,12 @@
       font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; color: #cfd3dc; pointer-events: none;
       text-shadow: 0 1px 2px #000; z-index: 2; }
     #desc { color: #b8bdc8; text-shadow: 0 1px 2px #000; }
+    #replaybar { display: none; position: absolute; left: 12px; right: 12px; bottom: 44px; z-index: 2;
+      align-items: center; gap: 10px; background: rgba(20,22,28,.82); border: 1px solid #444a57;
+      border-radius: 10px; padding: 8px 12px; }
+    #replaybar input[type=range] { flex: 1; accent-color: #1f6feb; }
+    #replaytime { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; min-width: 150px; text-align: right; }
+    #replaybar button, #replaybar select { padding: 4px 10px; }
     #banner { display: none; position: absolute; top: 72px; left: 50%; transform: translateX(-50%);
       max-width: min(760px, calc(100% - 32px)); background: #3a1f1f; border: 1px solid #c0392b;
       border-radius: 10px; padding: 14px 18px; z-index: 3; box-shadow: 0 8px 30px rgba(0,0,0,.5); }
@@ -55,6 +61,14 @@
     <button id="enter-vr" class="xr">Enter VR</button>
     <button id="enter-ar" class="xr">Enter passthrough</button>
     <span id="desc"></span>
+  </div>
+  <div id="replaybar">
+    <button id="replayplay" title="Play/pause (Space)">❚❚</button>
+    <button id="replayback" title="Step back (←)">◀</button>
+    <button id="replayfwd" title="Step forward (→)">▶</button>
+    <input id="replayslider" type="range" min="0" max="0" value="0" step="1" title="Timeline">
+    <span id="replaytime">0.00 s</span>
+    <select id="replayspeed" title="Playback speed"></select>
   </div>
   <div id="banner"><button id="banner-close" title="Dismiss">✕</button><div id="banner-text"></div></div>
   <div id="status">loading…</div>

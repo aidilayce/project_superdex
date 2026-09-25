@@ -249,10 +249,26 @@ export class SkinnedHand {
         mesh.castShadow = true;
         mesh.receiveShadow = true;
         this.bones = JOINT_NAMES.map((name) => root.getObjectByName(name) || null);
+        this.materials = [].concat(mesh.material);
+        this.mesh = mesh;
         this.group.add(root);
         resolve(this);
       }, undefined, reject);
     });
+  }
+
+  // Translucent while the simulated hand passes through objects to catch up
+  // with the tracked one (unstick mode), opaque otherwise.
+  setGhost(on) {
+    if (!this.materials || this.ghost === on) return;
+    this.ghost = on;
+    for (const m of this.materials) {
+      m.transparent = on;
+      m.opacity = on ? 0.35 : 1.0;
+      m.depthWrite = !on;
+      m.needsUpdate = true;
+    }
+    this.mesh.castShadow = !on;
   }
 
   // joints: Float32Array view of 25 x [px py pz qx qy qz qw] in the parent frame.

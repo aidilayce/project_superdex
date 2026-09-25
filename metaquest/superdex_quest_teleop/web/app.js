@@ -14,7 +14,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
 import { SkinnedHand } from './hands.js';
 import { buildKitchen, makeIsland } from './kitchen.js';
-import { ENVIRONMENTS, MaterialLibrary, buildEnvironment, spongeMaterial } from './environments.js';
+import { ENVIRONMENTS, MaterialLibrary, buildColliderView, buildEnvironment, spongeMaterial } from './environments.js';
 import { makeSkinMaterial } from './skin.js';
 
 const CONFIG = window.SUPERDEX || {};
@@ -126,6 +126,9 @@ let pack = CONFIG.pack || null;
 let materials = new MaterialLibrary(pack);
 let envName = ENVIRONMENTS.includes(CONFIG.sceneEnvironment) ? CONFIG.sceneEnvironment : 'kitchen_sink';
 let envObject = null;
+let envLayout = null;      // the server's physical environment (colliders)
+let colliderView = null;   // debug wireframes of those colliders (K)
+let showColliders = false;
 let tableHeight = DESKTOP_TABLE_HEIGHT;
 let studioHdr = null;
 let kitchenHdr = null;
@@ -175,7 +178,8 @@ function rebuildEnvironment() {
   kitchen.room.visible = !environmentDome;
   island.group.visible = islandRoom;
   if (!islandRoom) {
-    envObject = buildEnvironment(envName, materials, pack);
+    const params = envLayout && envLayout.name === envName ? envLayout.params : {};
+    envObject = buildEnvironment(envName, materials, pack, params);
     envObject.group.visible = !inPassthrough;
     workspace.add(envObject.group);
     envObject.setHeight(tableHeight);
@@ -188,8 +192,39 @@ function setEnvironment(name) {
   envName = name;
   rebuildEnvironment();
 }
+// The environment is physical: switching asks the server to rebuild the
+// scene in it, and the visuals follow its geometry message.
 function nextEnvironment() {
-  setEnvironment(ENVIRONMENTS[(ENVIRONMENTS.indexOf(envName) + 1) % ENVIRONMENTS.length]);
+  const next = ENVIRONMENTS[(ENVIRONMENTS.indexOf(envName) + 1) % ENVIRONMENTS.length];
+  if (connected) {
+    command('set_environment', { environment: next });
+    flash(`switching to ${next.replace('_', ' ')}…`);
+  } else {
+    setEnvironment(next);
+  }
+}
+function applyServerEnvironment(layout) {
+  envLayout = layout || null;
+  if (colliderView) { workspace.remove(colliderView); colliderView = null; }
+  if (!layout) return;
+  colliderView = buildColliderView(layout);
+  colliderView.visible = showColliders;
+  workspace.add(colliderView);
+  if (ENVIRONMENTS.includes(layout.name)) setEnvironment(layout.name);
+}
+function toggleColliders() {
+  showColliders = !showColliders;
+  if (colliderView) colliderView.visible = showColliders;
+  flash(showColliders ? 'showing the physics colliders' : 'colliders hidden');
+}
+// The headset reports its counter height so the simulated floor matches the
+// real one (objects dropped off the counter land on it).
+let sentCounterHeight = null;
+function reportCounterHeight() {
+  if (!renderer.xr.isPresenting || !Number.isFinite(tableHeight)) return;
+  if (sentCounterHeight !== null && Math.abs(sentCounterHeight - tableHeight) < 0.005) return;
+  sentCounterHeight = tableHeight;
+  command('set_counter_height', { height: tableHeight });
 }
 function setPack(newPack) {
   if (!newPack) return;
@@ -212,6 +247,8 @@ function setAnchor(m) {
   tableHeight = p.y;
   island.setHeight(p.y);
   if (envObject) envObject.setHeight(p.y);
+  if (colliderView) colliderView.children.forEach((c) => { if (c.isGridHelper) c.position.y = -p.y; });
+  reportCounterHeight();
 }
 setAnchor(new THREE.Matrix4().makeTranslation(0, DESKTOP_TABLE_HEIGHT, 0));
 rebuildEnvironment();
@@ -415,6 +452,7 @@ function buildGeometry(msg) {
           loadRenderGeometry(a.render.url).then((geometry) => {
             const smooth = new THREE.Mesh(geometry, skin);
             smooth.quaternion.fromArray(a.render.rotation);
+            smooth.scale.setScalar(a.render.scale || 1);
             smooth.frustumCulled = false;
             holder.remove(mesh);
             holder.add(smooth);
@@ -434,6 +472,7 @@ function applyFrame(buffer) {
   offset += (4 - (offset % 4)) % 4;
   const f = new Float32Array(buffer, offset);
   lastHeader = header;
+  if (replay) updateReplayTime(header.step);
   let k = 0;
   for (let i = 0; i < header.num_actors; i++, k += 7) {
     const a = actors[i];
@@ -460,7 +499,10 @@ function applyFrame(buffer) {
   k += 6 * header.num_contacts;
   for (const side of header.hand_joints || []) {
     const hand = skinnedHands[side];
-    if (hand && handView === 'skin') hand.setJoints(f.subarray(k, k + 175));
+    if (hand && handView === 'skin') {
+      hand.setJoints(f.subarray(k, k + 175));
+      hand.setGhost((header.passing || []).includes(side));
+    }
     k += 175;
   }
 }
@@ -516,17 +558,21 @@ function connect() {
       if (currentScene) sel.value = currentScene.id;
       applyEnvironment(msg.environment);
       if (msg.pack && !pack) setPack(msg.pack);
+      if (msg.replay) setupReplay(msg.replay);
     } else if (msg.type === 'environment') {
       applyEnvironment(msg.environment);
     } else if (msg.type === 'assets') {
       setPack(msg.pack);
     } else if (msg.type === 'geometry') {
       buildGeometry(msg);
+      applyServerEnvironment(msg.environment);
     } else if (msg.type === 'status') {
       if (msg.error) flash(`error: ${msg.error}`);
       if (msg.message) flash(msg.message);
       if (msg.saved) flash(`saved ${msg.saved_steps} steps -> ${msg.saved}`);
       if ('recording' in msg) statusInfo = msg;
+      if (msg.replay) updateReplayStatus(msg.replay);
+      if (msg.calibrated) showCalibrationResult(msg.calibrated);
       const rec = document.getElementById('rec');
       rec.classList.toggle('on', !!statusInfo.recording);
       rec.textContent = statusInfo.recording ? '■ Stop' : '● Record';
@@ -540,6 +586,47 @@ function send(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
 function command(cmd, extra = {}) { send({ type: 'cmd', cmd, ...extra }); }
+
+// --------------------------------------------------------------------------
+// Replay of a recorded episode (python -m superdex_quest_teleop.replay)
+// --------------------------------------------------------------------------
+
+let replay = null;  // {num_steps, time_step, ...} in replay mode
+let scrubbing = false;
+function setupReplay(info) {
+  replay = info;
+  document.getElementById('replaybar').style.display = 'flex';
+  for (const id of ['rec', 'envbutton', 'enter-ar']) document.getElementById(id).style.display = 'none';
+  const slider = document.getElementById('replayslider');
+  slider.max = Math.max(0, info.num_steps - 1);
+  slider.oninput = () => { scrubbing = true; command('replay_seek', { step: Number(slider.value) }); };
+  slider.onchange = () => { scrubbing = false; };
+  const speed = document.getElementById('replayspeed');
+  speed.innerHTML = '';
+  for (const v of info.speeds || [0.25, 0.5, 1, 2]) {
+    const o = document.createElement('option');
+    o.value = v; o.textContent = `${v}×`;
+    speed.appendChild(o);
+  }
+  speed.value = 1;
+  speed.onchange = () => command('replay_speed', { speed: Number(speed.value) });
+  document.getElementById('replayplay').onclick = () => command('replay_toggle');
+  document.getElementById('replayback').onclick = () => command('replay_step', { delta: -1 });
+  document.getElementById('replayfwd').onclick = () => command('replay_step', { delta: 1 });
+}
+function updateReplayStatus(r) {
+  if (!replay) setupReplay(r);
+  document.getElementById('replayplay').textContent = r.playing ? '❚❚' : '▶';
+  const speed = document.getElementById('replayspeed');
+  if (Number(speed.value) !== r.speed) speed.value = r.speed;
+}
+function updateReplayTime(step) {
+  const slider = document.getElementById('replayslider');
+  if (!scrubbing) slider.value = step;
+  const t = step * replay.time_step, total = (replay.num_steps - 1) * replay.time_step;
+  document.getElementById('replaytime').textContent =
+    `${t.toFixed(2)} / ${total.toFixed(2)} s  #${step}`;
+}
 
 // --------------------------------------------------------------------------
 // Desktop controls and Cam view
@@ -584,12 +671,15 @@ document.getElementById('envbutton').onclick = () => nextEnvironment();
 document.getElementById('handview').onclick = () => setHandView(handView === 'skin' ? 'robot' : 'skin');
 window.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'SELECT') return;
-  if (e.code === 'Space') { command('record_toggle'); e.preventDefault(); }
+  if (e.code === 'Space') { command(replay ? 'replay_toggle' : 'record_toggle'); e.preventDefault(); }
+  if (replay && e.key === 'ArrowLeft') command('replay_step', { delta: e.shiftKey ? -10 : -1 });
+  if (replay && e.key === 'ArrowRight') command('replay_step', { delta: e.shiftKey ? 10 : 1 });
   if (e.key === 'r') command('reset');
   if (e.key === 'c') showContacts = !showContacts;
   if (e.key === 'v') setCamView(!camView);
   if (e.key === 'h') setHandView(handView === 'skin' ? 'robot' : 'skin');
   if (e.key === 'e') nextEnvironment();
+  if (e.key === 'k') toggleColliders();
   if (e.key === 'n') command('next_scene');
   if (e.key === 'p') command('prev_scene');
 });
@@ -606,6 +696,7 @@ window.addEventListener('resize', () => {
 let xrSession = null;
 let xrMode = null;
 let needsRecenter = false;
+let calibrateOnStart = false;
 let tableOffset = 0;
 let lastHandsSeen = 0;
 
@@ -666,10 +757,13 @@ async function startXR(mode) {
   renderer.xr.setFoveation(1.0);  // cheaper periphery on Quest
   await renderer.xr.setSession(xrSession);
   needsRecenter = true;
+  calibrateOnStart = true;
   lastHandsSeen = performance.now();
   send({ type: 'hello', role: 'headset' });
+  sentCounterHeight = null;
   xrSession.addEventListener('end', () => {
     xrSession = null;
+    if (calib.active) stopCalibration();
     xrMode = null;
     inPassthrough = false;
     rebuildEnvironment();
@@ -737,6 +831,9 @@ makeButton('Table ▼', 0.047, -0.10, () => { tableOffset -= 0.03; anchor.elemen
 makeButton('Ghost', -0.047, -0.15, () => { showGhost = !showGhost; });
 makeButton('Hands', -0.047, -0.20, () => setHandView(handView === 'skin' ? 'robot' : 'skin'));
 makeButton('Env ▶', 0.047, -0.20, () => nextEnvironment());
+makeButton('Colliders', -0.047, -0.25, () => toggleColliders());
+makeButton('Calibrate', 0.047, -0.25, () => startCalibration());
+makeButton('Skip', 0.0, -0.30, () => { if (calib.active) stopCalibration('Skipped: using the current hand size'); });
 makeButton('Exit VR', 0.047, -0.15, () => { if (xrSession) xrSession.end(); });
 const infoCanvas = document.createElement('canvas');
 infoCanvas.width = 512; infoCanvas.height = 200;
@@ -778,6 +875,110 @@ function pokeButtons(tips, dt) {
       }
     }
   }
+}
+
+// --------------------------------------------------------------------------
+// Hand-size calibration: on entering VR the operator holds both hands open
+// for a moment; the server scales the simulated hands to their size.
+// --------------------------------------------------------------------------
+
+const CALIB_FRAMES = 36;       // open-hand frames per side (~0.5 s)
+const CALIB_TIMEOUT_MS = 20000;
+const calib = { active: false, samples: { left: [], right: [] }, started: 0, resultUntil: 0 };
+const calibCanvas = document.createElement('canvas');
+calibCanvas.width = 768; calibCanvas.height = 256;
+const calibTex = new THREE.CanvasTexture(calibCanvas);
+calibTex.colorSpace = THREE.SRGBColorSpace;
+const calibPanel = new THREE.Mesh(new THREE.PlaneGeometry(0.36, 0.12),
+  new THREE.MeshBasicMaterial({ map: calibTex, transparent: true, toneMapped: false, depthTest: false }));
+calibPanel.renderOrder = 20;
+calibPanel.position.set(0, 0.34, -0.12);  // above the counter, facing the operator
+calibPanel.visible = false;
+workspace.add(calibPanel);
+
+function drawCalib(title, line, progress = null) {
+  const ctx = calibCanvas.getContext('2d');
+  ctx.clearRect(0, 0, 768, 256);
+  ctx.fillStyle = 'rgba(20,22,28,0.88)';
+  ctx.beginPath(); ctx.roundRect(0, 0, 768, 256, 26); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 44px system-ui, sans-serif'; ctx.fillText(title, 32, 70);
+  ctx.fillStyle = '#d6d9e0'; ctx.font = '32px system-ui, sans-serif'; ctx.fillText(line, 32, 128);
+  if (progress !== null) {
+    ctx.fillStyle = '#3a3f4b'; ctx.beginPath(); ctx.roundRect(32, 170, 704, 34, 17); ctx.fill();
+    ctx.fillStyle = '#1f6feb'; ctx.beginPath(); ctx.roundRect(32, 170, Math.max(34, 704 * progress), 34, 17); ctx.fill();
+  }
+  calibTex.needsUpdate = true;
+}
+function startCalibration() {
+  calib.active = true;
+  calib.samples = { left: [], right: [] };
+  calib.started = performance.now();
+  calibPanel.visible = true;
+  drawCalib('Hand size calibration', 'Hold both hands open, palms down, fingers spread', 0);
+}
+function stopCalibration(message) {
+  calib.active = false;
+  if (message) { drawCalib('Hand size calibration', message); calib.resultUntil = performance.now() + 3500; }
+  else calibPanel.visible = false;
+}
+// Fingers straight: each finger's knuckle-to-tip distance is close to the sum
+// of its bones (the thumb is ignored, its tracking is the least reliable).
+function isOpenHand(p) {
+  for (const m of [5, 10, 15, 20]) {
+    let along = 0;
+    for (let j = m + 1; j < m + 4; j++) {
+      along += Math.hypot(p[3 * (j + 1)] - p[3 * j], p[3 * (j + 1) + 1] - p[3 * j + 1], p[3 * (j + 1) + 2] - p[3 * j + 2]);
+    }
+    const a = 3 * (m + 1), b = 3 * (m + 4);
+    const straight = Math.hypot(p[b] - p[a], p[b + 1] - p[a + 1], p[b + 2] - p[a + 2]);
+    if (along < 1e-3 || straight / along < 0.93) return false;
+  }
+  return true;
+}
+function handLength(p) {  // wrist -> middle knuckle -> along the middle finger to its tip
+  let len = Math.hypot(p[33] - p[0], p[34] - p[1], p[35] - p[2]);
+  for (let j = 11; j < 14; j++) len += Math.hypot(p[3 * (j + 1)] - p[3 * j], p[3 * (j + 1) + 1] - p[3 * j + 1], p[3 * (j + 1) + 2] - p[3 * j + 2]);
+  return len;
+}
+function updateCalibration(message, now) {
+  if (!calib.active) {
+    if (calibPanel.visible && calib.resultUntil && now > calib.resultUntil) { calibPanel.visible = false; calib.resultUntil = 0; }
+    return;
+  }
+  for (const side of ['left', 'right']) {
+    const h = message[side];
+    if (h.tracked && isOpenHand(h.p) && calib.samples[side].length < CALIB_FRAMES) calib.samples[side].push(h.p.slice());
+  }
+  const n = Math.min(calib.samples.left.length, calib.samples.right.length);
+  const one = Math.max(calib.samples.left.length, calib.samples.right.length);
+  const timedOut = now - calib.started > CALIB_TIMEOUT_MS;
+  if (n >= CALIB_FRAMES || (timedOut && one >= CALIB_FRAMES)) {
+    // Per side, the frame of median hand length (robust to tracking blips).
+    const hands = {};
+    for (const side of ['left', 'right']) {
+      const frames = calib.samples[side];
+      if (frames.length < CALIB_FRAMES) continue;
+      const sorted = frames.map((p) => [handLength(p), p]).sort((a, b) => a[0] - b[0]);
+      hands[side] = sorted[sorted.length >> 1][1];
+    }
+    command('calibrate_hands', { hands });
+    stopCalibration('Measuring…');
+    calib.resultUntil = now + 6000;
+  } else if (timedOut) {
+    stopCalibration('No open hands seen: using the default size (Calibrate to retry)');
+  } else {
+    const missing = ['left', 'right'].filter((s) => !message[s].tracked);
+    drawCalib('Hand size calibration',
+      missing.length ? `Show your ${missing.join(' and ')} hand${missing.length > 1 ? 's' : ''}, open, fingers spread`
+        : 'Hold both hands open, palms down, fingers spread', n / CALIB_FRAMES);
+  }
+}
+function showCalibrationResult(c) {
+  const lengths = Object.values(c.hand_length_cm || {});
+  const len = lengths.length ? ` (hand ${lengths[0].toFixed(1)} cm)` : '';
+  calibPanel.visible = true;
+  drawCalib('Hands calibrated', `Simulated hands scaled ${c.scale.toFixed(2)}×${len}`);
+  calib.resultUntil = performance.now() + 3500;
 }
 
 // --------------------------------------------------------------------------
@@ -826,7 +1027,11 @@ renderer.setAnimationLoop((time, frame) => {
   if (frame && xrSession) {
     const refSpace = renderer.xr.getReferenceSpace();
     const viewer = frame.getViewerPose(refSpace);
-    if (viewer && needsRecenter) { recenter(viewer); needsRecenter = false; }
+    if (viewer && needsRecenter) {
+      recenter(viewer);
+      needsRecenter = false;
+      if (calibrateOnStart) { calibrateOnStart = false; startCalibration(); }
+    }
     _inv.copy(anchor).invert();
     const message = { type: 'hands', left: { tracked: false }, right: { tracked: false } };
     const tips = [];
@@ -850,6 +1055,7 @@ renderer.setAnimationLoop((time, frame) => {
       _mat.decompose(_pos, _quat, _scl);
       message.head = [_pos.x, _pos.y, _pos.z, _quat.x, _quat.y, _quat.z, _quat.w];
     }
+    updateCalibration(message, now);
     if (now - lastSend >= SEND_PERIOD_MS) { send(message); lastSend = now; }
     pokeButtons(tips, dt);
   } else if (camView) {
@@ -872,7 +1078,7 @@ renderer.setAnimationLoop((time, frame) => {
   const tracked = h ? Object.entries(h.tracked).map(([s, t]) => `${s}:${t ? 'tracked' : '—'}`).join(' ') : '';
   document.getElementById('status').textContent =
     `${lines.slice(0, 3).join('   ')}   hands ${tracked}${h && h.head ? '   headset connected' : ''}\n` +
-    (now < flashUntil ? flashText : 'Space: record  R: reset  V: cam view  H: hands  E: environment  N/P: scene  C: contacts');
+    (now < flashUntil ? flashText : 'Space: record  R: reset  V: cam view  H: hands  E: environment  K: colliders  N/P: scene  C: contacts');
   renderer.render(scene, camera);
 });
 

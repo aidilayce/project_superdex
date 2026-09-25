@@ -19,7 +19,6 @@ import json
 import struct
 
 import numpy as np
-import pytest
 from aiohttp import WSMsgType
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -92,7 +91,12 @@ def test_headset_protocol_and_recording(roots, tmp_path):
                     elif data.get("saved"):
                         saved = data["saved"]
                 await asyncio.sleep(0.005)
-            assert geometry is not None and len(geometry["actors"]) == 40
+            assert geometry is not None
+            assert geometry["environment"]["name"] == "kitchen_sink"
+            scene_actors = [a for a in geometry["actors"] if a["mesh"] != "env"]
+            assert len(scene_actors) == 39  # the cube and 2 x 19 hand links
+            assert len(geometry["actors"]) - 39 == len(geometry["environment"]["boxes"]) + len(
+                geometry["environment"]["planes"]) + 1  # + the floor
             renders = [a["render"]["url"] for a in geometry["actors"] if a.get("render")]
             assert len(renders) == 38  # every link of both hands has a smooth mesh
             assert (await client.get(renders[0])).status == 200

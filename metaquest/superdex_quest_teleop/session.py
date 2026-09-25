@@ -32,7 +32,8 @@ from . import hand_skeleton as hs
 from .hand_rig import HandUnit
 from .recorder import EpisodeRecorder
 from .retarget import RetargetConfig
-from .scenes import TABLE_NAME, AssetRoots, SceneSpec, build_scene
+from .scenes import TABLE_NAME, AssetRoots, SceneSpec, build_scene, forget_scene, workspace_for
+from .workspace import DEFAULT_COUNTER_HEIGHT, is_environment_actor
 
 Q = physics.QueryType
 
@@ -60,6 +61,22 @@ class ActorRecord:
     mass: float
 
 
+# Deformables stream (and record) their visual mesh every step unless it is
+# huge: the t-shirt's subdivided visual mesh has 57k vertices (0.7 MB per
+# frame) over a 3.6k-node simulation mesh, which then streams instead.
+MAX_VISUAL_NODES = 20000
+
+
+def _usable_visual_mesh(actor: physics.Actor) -> bool:
+    visual = actor.get_visual_mesh()
+    if visual.is_empty() or visual.nodes_per_element != 3:
+        return False
+    surface = actor.get_surface_mesh()
+    if visual.get_num_nodes() <= MAX_VISUAL_NODES:
+        return True
+    return surface.is_empty() or surface.nodes_per_element != 3
+
+
 def _kind(actor: physics.Actor) -> str:
     return str(actor.get_type()).rsplit(".", 1)[-1]
 
@@ -82,6 +99,10 @@ class TeleopSession:
         hand_variant: str = "lowpoly",
         retarget_config: RetargetConfig | None = None,
         display_hand_models: dict[str, Path] | None = None,
+        environment: str = "kitchen_sink",
+        counter_height: float = DEFAULT_COUNTER_HEIGHT,
+        time_budget: float | None = None,
+        hand_scale: float = 1.0,
     ) -> None:
         if contact_mode not in CONTACT_MODES:
             raise ValueError(f"contact_mode must be one of {CONTACT_MODES}")
@@ -91,11 +112,13 @@ class TeleopSession:
         self.min_contact_force = min_contact_force
         self.keep_self_contacts = keep_self_contacts
         self.time_step = spec.time_step
-        self.scene = build_scene(spec, roots)
+        self.scene = build_scene(spec, roots, environment, counter_height, time_budget)
+        self.environment = environment
+        self.workspace = workspace_for(self.scene)
         self.hands: dict[str, HandUnit] = {
             side: HandUnit(
                 self.scene, roots, side, HAND_SPAWN[side], hand_variant, retarget_config,
-                (display_hand_models or {}).get(side),
+                (display_hand_models or {}).get(side), spec.time_step, hand_scale,
             )
             for side in sides
         }
@@ -109,6 +132,16 @@ class TeleopSession:
 
         self._render_models = render_models_for(self.scene)
         self._collect_actors()
+        scene_handles = [r.actor.get_handle() for r in self.actors if not r.hand_side]
+        static_boxes = []
+        for r in self.actors:
+            if r.is_static and r.mesh_kind != "plane":
+                box = r.actor.get_aabb_world()
+                lo, hi = np.asarray(list(box.min)), np.asarray(list(box.max))
+                if np.all(np.isfinite(lo)) and np.all(np.isfinite(hi)) and np.all(hi - lo < 50.0):
+                    static_boxes.append((lo, hi))
+        for hand in self.hands.values():
+            hand.set_scene_actors(scene_handles, static_boxes)
         self._register_queries()
         self.last_contacts: dict = _empty_contacts()
 
@@ -131,7 +164,9 @@ class TeleopSession:
             mesh_kind = "none"
             if name == TABLE_NAME:
                 mesh_kind = "plane"
-            elif deformable and not actor.get_visual_mesh().is_empty():
+            elif is_environment_actor(name):
+                mesh_kind = "env"  # the client draws the environment itself
+            elif deformable and _usable_visual_mesh(actor):
                 mesh_kind = "visual"
             elif not actor.get_surface_mesh().is_empty():
                 mesh_kind = "surface"
@@ -211,6 +246,8 @@ class TeleopSession:
         for side, hand in self.hands.items():
             hand.set_input(inputs[side])
         self.scene.step(self.time_step)
+        for hand in self.hands.values():
+            hand.update_unstick()
         self.step_count += 1
         self.sim_time += self.time_step
         data = self.gather(head, with_contacts or self.recorder is not None)
@@ -270,6 +307,7 @@ class TeleopSession:
             hands[side] = {
                 "display_joints": hand.display.joints(link_pose),
                 "tracked": hand.tracked,
+                "passing_through": hand.passing_through,
                 "joints": frame.joints,
                 "joint_rotations": frame.rotations if frame.rotations is not None
                 else np.full((hs.NUM_JOINTS, 4), np.nan),
@@ -351,6 +389,7 @@ class TeleopSession:
                     entry["render"] = {
                         "url": f"/hand_assets/{model}",
                         "rotation": [float(np.sin(np.pi / 4)), 0.0, 0.0, float(np.cos(np.pi / 4))],
+                        "scale": self.hands[r.hand_side].scale,
                     }
             model = self._render_models.get(r.name)
             if model is not None:
@@ -403,10 +442,14 @@ class TeleopSession:
             "keep_self_contacts": self.keep_self_contacts,
             "precision": physics.PRECISION_NAME,
             "hand_bot": "oculus_xr (Meta XR Hand)",
+            "hand_scale": {s: h.scale for s, h in self.hands.items()},
             "hand_link_names": {s: h.link_names for s, h in self.hands.items()},
             "hand_dof_names": hand.kinematics.dof_names if hand else [],
             "joint_names": list(hs.JOINT_NAMES),
             "scene_description": self.spec.description,
+            "environment": self.environment,
+            "counter_height": self.workspace.counter_height if self.workspace else float("nan"),
+            "environment_layout": self.environment_message(),
         }
         meta.update(metadata or {})
         self.recorder = EpisodeRecorder(
@@ -434,10 +477,19 @@ class TeleopSession:
         path = rec.close()
         return path, rec.num_steps
 
+    def set_counter_height(self, height: float) -> None:
+        """Move the floor to ``height`` below the work surface."""
+        if self.workspace is not None:
+            self.workspace.set_counter_height(height)
+
+    def environment_message(self) -> dict | None:
+        return self.workspace.message() if self.workspace is not None else None
+
     def close(self) -> None:
         self.stop_recording()
         for hand in self.hands.values():
             hand.destroy()
+        forget_scene(self.scene)
         physics.destroy_scene(self.scene)
 
 

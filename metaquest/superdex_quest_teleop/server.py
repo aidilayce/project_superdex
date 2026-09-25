@@ -44,7 +44,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import queue
+import signal
 import ssl
 import struct
 import subprocess
@@ -54,11 +56,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from aiohttp import WSMsgType, web
+from aiohttp import WSCloseCode, WSMsgType, web
 
 from . import hand_skeleton as hs
 from .scenes import AssetRoots, SceneSpec, scene_registry
 from .session import TeleopSession
+from .workspace import DEFAULT_COUNTER_HEIGHT, ENVIRONMENTS
 
 log = logging.getLogger("superdex_quest_teleop")
 
@@ -83,8 +86,10 @@ class ServerConfig:
     # Backdrop: an HDRI (.hdr), a 360 photo (.jpg/.png) or a model (.glb).
     # A file overrides the 3D environment's backdrop (see scene_environment).
     environment: Path | None = None
-    # 3D environment the client builds around the table: "kitchen_sink",
-    # "kitchen_island" or "studio" (switchable in the client).
+    # Physical 3D environment around the work surface: "kitchen_sink",
+    # "kitchen_island" or "studio" (colliders on the server, matching visuals
+    # in the client; switchable with the Env button), or "table" for a bare
+    # infinite tabletop plane.
     scene_environment: str = "kitchen_sink"
     # Fetch the CC0 Poly Haven asset pack (HDRIs, PBR materials, props) in
     # the background if it isn't cached yet; without it the environments use
@@ -103,6 +108,12 @@ class ServerConfig:
     hand_variant: str = "lowpoly"
     stream_hz: float = 60.0
     num_threads: int = -1
+    # Cap each step's Newton solve at this fraction of the time step so heavy
+    # scenes stay real time (None: solve to the engine's tolerances).
+    time_budget: float | None = 0.8
+    # Uniform size of the simulated hands (1: the Meta XR hand asset); set by
+    # the in-headset calibration (calibrate_hands) or --hand-scale.
+    hand_scale: float = 1.0
     synthetic: bool = False  # drive the right hand with a scripted grasp
     autostart_record: bool = False
 
@@ -128,6 +139,9 @@ class PhysicsRunner(threading.Thread):
         self._last_input_time = 0.0
         self._synthetic = None
         self._geometry_message: dict | None = None
+        self.environment = config.scene_environment
+        self.counter_height = DEFAULT_COUNTER_HEIGHT
+        self.hand_scale = config.hand_scale
         self.ready = threading.Event()
 
     # Thread-safe entry points ----------------------------------------------
@@ -156,7 +170,8 @@ class PhysicsRunner(threading.Thread):
     def run(self) -> None:
         import superdex.physics as physics
 
-        if not physics.is_initialized():
+        self._owns_physics = not physics.is_initialized()
+        if self._owns_physics:
             physics.initialize(num_worker_threads=self.config.num_threads)
         physics.enable_file_cache(True)
         try:
@@ -218,6 +233,11 @@ class PhysicsRunner(threading.Thread):
         if self.session is not None:
             self._finish_recording()
             self.session.close()
+            self.session = None
+        # Tear SuperDex down on the thread that initialized it: its task
+        # scheduler otherwise deadlocks in the interpreter's exit handler.
+        if self._owns_physics:
+            physics.shutdown()
 
     def _drain_commands(self) -> None:
         while True:
@@ -245,6 +265,17 @@ class PhysicsRunner(threading.Thread):
                         self._finish_recording()
                     else:
                         self._record_start(cmd.get("metadata"))
+                elif name == "set_environment":
+                    env = cmd.get("environment")
+                    if env not in ENVIRONMENTS and env != "table":
+                        raise ValueError(f"unknown environment {env!r}")
+                    if env != self.environment:
+                        self.environment = env
+                        self._reset()
+                elif name == "calibrate_hands":
+                    self._calibrate_hands(cmd.get("hands") or {})
+                elif name == "set_counter_height":
+                    self._set_counter_height(float(cmd["height"]))
                 elif name == "stop":
                     self.running = False
                 else:
@@ -269,6 +300,10 @@ class PhysicsRunner(threading.Thread):
             keep_self_contacts=self.config.keep_self_contacts,
             hand_variant=self.config.hand_variant,
             display_hand_models=self._display_models(),
+            environment=self.environment,
+            counter_height=self.counter_height,
+            time_budget=self.config.time_budget,
+            hand_scale=self.hand_scale,
         )
         self._synthetic = None
         if self.config.synthetic:
@@ -285,11 +320,49 @@ class PhysicsRunner(threading.Thread):
             "scene": {"id": spec.id, "name": spec.name, "description": spec.description,
                       "time_step": spec.time_step},
             "actors": [_jsonable_actor(a) for a in session.geometry()],
+            "environment": session.environment_message(),
         }
         self.session = session
         log.info("loaded %s in %.1fs (%d actors)", spec.name, time.monotonic() - t0, len(session.actors))
         self.publish("geometry", self._geometry_message)
         self.publish("status", self.status())
+
+    def _calibrate_hands(self, measured: dict) -> None:
+        """Scale the simulated hands to the operator's (median open-hand
+        skeletons from the headset), then rebuild the scene with them."""
+        from .calibration import calibrate
+
+        if self.session is None:
+            return
+        references = {}
+        for side, hand in self.session.hands.items():
+            # The bot's rest skeleton at unit scale.
+            references[side] = hand.retargeter.synthesize_skeleton(np.zeros(hand.kinematics.num_dofs)) / hand.scale
+        joints = {side: np.asarray(v, np.float64) for side, v in measured.items()
+                  if side in references and v is not None and len(v) == 3 * hs.NUM_JOINTS}
+        scale, report = calibrate(joints, references)
+        lengths = ", ".join(f"{s} {v:.1f} cm" for s, v in report["hand_length_cm"].items())
+        log.info("hand calibration: scale %.3f (hand length %s; per side %s)", scale, lengths,
+                 {s: round(v, 3) for s, v in report["per_side"].items()})
+        changed = abs(scale - self.hand_scale) > 0.01
+        self.hand_scale = scale
+        if changed:
+            self._reset()
+        self.publish("status", {"type": "status", "calibrated": {"scale": scale, **report},
+                                "message": f"hands calibrated: {scale:.2f}x the Meta XR hand ({lengths})"})
+
+    def _set_counter_height(self, height: float) -> None:
+        """The operator's counter height (measured by the headset on recenter):
+        the floor collider moves to match the floor they stand on."""
+        if not np.isfinite(height) or abs(height - self.counter_height) < 0.005:
+            return
+        self.counter_height = height
+        if self.session is not None:
+            self.session.set_counter_height(height)
+            if self._geometry_message is not None:
+                self._geometry_message["environment"] = self.session.environment_message()
+            log.info("counter height %.2f m", self.session.workspace.counter_height
+                     if self.session.workspace else height)
 
     def _display_models(self) -> dict[str, Path] | None:
         folder = self.config.hand_models
@@ -330,6 +403,8 @@ class PhysicsRunner(threading.Thread):
             "recording": bool(s and s.recorder),
             "file": str(s.recorder.path) if s and s.recorder else None,
             "contact_mode": self.config.contact_mode,
+            "environment": self.environment,
+            "hand_scale": self.hand_scale,
         }
 
     def _encode_frame(self, session: TeleopSession, data: dict) -> bytes:
@@ -353,6 +428,8 @@ class PhysicsRunner(threading.Thread):
             "num_contacts": int(len(points)),
             "total_contacts": int(len(contacts["force"])),
             "tracked": {side: bool(h["tracked"]) for side, h in data["hands"].items()},
+            # Hands in unstick mode (passing through objects to catch up).
+            "passing": [side for side, h in data["hands"].items() if h.get("passing_through")],
         }
         head_pose = data.get("head_pose")
         if head_pose is not None and np.all(np.isfinite(head_pose)):
@@ -397,12 +474,13 @@ def parse_hands(message: dict) -> tuple[dict[str, hs.HandFrame], np.ndarray | No
 
 
 class TeleopServer:
-    def __init__(self, config: ServerConfig, roots: AssetRoots | None = None) -> None:
+    def __init__(self, config: ServerConfig, roots: AssetRoots | None = None, runner_factory=None) -> None:
         self.config = config
         self.roots = roots or AssetRoots()
         self.clients: dict[web.WebSocketResponse, asyncio.Queue] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
-        self.runner = PhysicsRunner(config, self.roots, self._publish_threadsafe)
+        # The simulation thread (replay.py substitutes an episode player).
+        self.runner = (runner_factory or PhysicsRunner)(config, self.roots, self._publish_threadsafe)
 
     # Physics thread -> event loop.
     def _publish_threadsafe(self, kind: str, payload) -> None:
@@ -513,7 +591,8 @@ class TeleopServer:
              "out_dir": str(Path(self.config.out_dir).resolve()),
              "synthetic": self.config.synthetic,
              "environment": self._environment_info(),
-             "pack": self._pack_info()}
+             "pack": self._pack_info(),
+             "replay": self.runner.replay_info() if hasattr(self.runner, "replay_info") else None}
         )
         geometry = self.runner.geometry_message()
         if geometry is not None:
@@ -584,7 +663,11 @@ class TeleopServer:
 
         async def on_cleanup(app: web.Application) -> None:
             self.runner.submit({"cmd": "stop"})
-            await asyncio.get_running_loop().run_in_executor(None, self.runner.join, 10.0)
+            # A long step or saving a large episode can take a while; a second
+            # Ctrl-C force-quits.
+            await asyncio.get_running_loop().run_in_executor(None, self.runner.join, 60.0)
+            if self.runner.is_alive():
+                log.warning("physics thread did not stop in time")
 
         app.on_startup.append(on_startup)
         app.on_cleanup.append(on_cleanup)
@@ -598,9 +681,13 @@ class TeleopServer:
         ctx.load_cert_chain(cert, key)
         return ctx
 
-    async def serve(self) -> None:
-        """Serve HTTP (and HTTPS) until cancelled."""
-        runner = web.AppRunner(self.make_app())
+    async def serve(self, stop: asyncio.Event | None = None) -> None:
+        """Serve HTTP (and HTTPS) until ``stop`` is set (Ctrl-C by default)."""
+        stop = stop or asyncio.Event()
+        self._install_signal_handlers(stop)
+        # Open WebSockets never finish on their own: don't let aiohttp wait
+        # its default 60 s for them on shutdown (they are closed below).
+        runner = web.AppRunner(self.make_app(), shutdown_timeout=2.0)
         await runner.setup()
         sites = [web.TCPSite(runner, self.config.host, self.config.http_port)]
         try:
@@ -613,15 +700,39 @@ class TeleopServer:
         try:
             for site in sites:
                 await site.start()
-            await asyncio.Event().wait()
+            print("  quit           : Ctrl-C (saves an open recording; press twice to force)")
+            await stop.wait()
+            log.info("shutting down...")
         finally:
+            for ws in list(self.clients):
+                await ws.close(code=WSCloseCode.GOING_AWAY, message=b"server shutting down")
             await runner.cleanup()
 
+    def _install_signal_handlers(self, stop: asyncio.Event) -> None:
+        """First Ctrl-C: clean shutdown (the open recording is saved). Second:
+        exit immediately."""
+        loop = asyncio.get_running_loop()
+
+        def on_signal(*_args) -> None:
+            if stop.is_set():
+                print("\nforced quit", flush=True)
+                os._exit(130)
+            print("\nstopping (Ctrl-C again to force quit)...", flush=True)
+            loop.call_soon_threadsafe(stop.set)
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, on_signal)
+            except (NotImplementedError, RuntimeError, ValueError):
+                # Windows / non-main thread: plain handler (wakes the loop via
+                # call_soon_threadsafe).
+                try:
+                    signal.signal(sig, on_signal)
+                except ValueError:
+                    pass
+
     def run(self) -> None:
-        try:
-            asyncio.run(self.serve())
-        except KeyboardInterrupt:
-            pass
+        asyncio.run(self.serve())
 
 
 def ensure_self_signed_cert(cert_dir: Path, addresses: list[str] | None = None) -> tuple[Path, Path]:

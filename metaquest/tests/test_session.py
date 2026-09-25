@@ -38,9 +38,9 @@ def test_scene_builds_and_settles(roots, scene_id):
         actors = []
         scene.for_each_actor(lambda a: actors.append(a))
         for actor in actors:
-            if actor.get_name() != "table":
+            if not actor.is_static():  # the kitchen colliders, floor and walls
                 box = actor.get_aabb_world()
-                assert box.min[1] > -0.01, actor.get_name()  # nothing sank through the table
+                assert box.min[1] > -0.01, actor.get_name()  # nothing sank through the counter
                 assert abs(box.min[0]) < 0.6 and abs(box.min[2]) < 0.6
     finally:
         physics.destroy_scene(scene)

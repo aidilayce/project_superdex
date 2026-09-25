@@ -23,8 +23,8 @@ from pathlib import Path
 from .scenes import AssetRoots, default_repo_root, scene_registry
 from .server import ServerConfig, TeleopServer, lan_addresses
 from .session import CONTACT_MODES
+from .workspace import ENVIRONMENTS
 
-ENVIRONMENTS = ("kitchen_sink", "kitchen_island", "studio")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -42,10 +42,11 @@ def main(argv: list[str] | None = None) -> None:
                         help="HTTPS port with a self-signed certificate (Quest over Wi-Fi)")
     parser.add_argument("--no-https", action="store_true", help="serve plain HTTP only")
     parser.add_argument("--environment", default="kitchen_sink",
-                        help="3D environment around the table: kitchen_sink (default), "
-                        "kitchen_island or studio (switchable with the Env button); or a file "
-                        "shown as backdrop: an .hdr, an equirectangular 360 photo (.jpg/.png, e.g. "
-                        "of your own kitchen) or a .glb/.gltf model")
+                        help="physical 3D environment: kitchen_sink (default: countertop, sink, "
+                        "cabinets, floor), kitchen_island or studio (switchable with the Env button), "
+                        "table (a bare infinite tabletop); or a file shown as backdrop around the "
+                        "island: an .hdr, an equirectangular 360 photo (.jpg/.png, e.g. of your own "
+                        "kitchen) or a .glb/.gltf model")
     parser.add_argument("--no-download", action="store_true",
                         help="don't fetch the CC0 Poly Haven asset pack (textures, HDRIs, props)")
     parser.add_argument("--asset-dir", type=Path, default=None,
@@ -66,6 +67,13 @@ def main(argv: list[str] | None = None) -> None:
                         help="Meta XR hand collision mesh resolution")
     parser.add_argument("--threads", type=int, default=-1, help="SuperDex worker threads (-1 = auto)")
     parser.add_argument("--stream-hz", type=float, default=60.0, help="state streaming rate to clients")
+    parser.add_argument("--time-budget", type=float, default=0.8,
+                        help="cap each step's solve at this fraction of the time step so heavy "
+                        "scenes (cloth) stay real time; 0 disables (exact but may run slower "
+                        "than real time)")
+    parser.add_argument("--hand-scale", type=float, default=1.0,
+                        help="size of the simulated hands relative to the Meta XR hand asset "
+                        "(normally set by the in-headset calibration when you enter VR)")
     parser.add_argument("--synthetic", action="store_true",
                         help="drive the right hand with a scripted grasp (no headset needed)")
     parser.add_argument("--record", action="store_true", help="start recording immediately")
@@ -88,7 +96,7 @@ def main(argv: list[str] | None = None) -> None:
 
     environment = None
     scene_environment = args.environment
-    if args.environment not in ENVIRONMENTS:
+    if args.environment not in ENVIRONMENTS + ("table",):
         environment = Path(args.environment).expanduser().resolve()
         if not environment.is_file():
             parser.error(f"unknown environment {args.environment!r}: use one of "
@@ -115,6 +123,8 @@ def main(argv: list[str] | None = None) -> None:
         hand_variant=args.hand_mesh,
         stream_hz=args.stream_hz,
         num_threads=args.threads,
+        time_budget=args.time_budget if args.time_budget > 0 else None,
+        hand_scale=args.hand_scale,
         synthetic=args.synthetic,
         autostart_record=args.record,
     )

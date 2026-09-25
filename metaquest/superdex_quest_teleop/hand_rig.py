@@ -33,23 +33,48 @@ import superdex.robotics as robotics
 
 from . import hand_skeleton as hs
 from .hand_display import HandDisplayRig
-from .hand_model import BotKinematics, matrix_to_quat
+from .hand_model import BotKinematics, matrix_to_quat, quat_to_matrix, rotvec_from_matrix, rotvec_to_matrix
 from .retarget import MetaXrHandRetargeter, RetargetConfig, RetargetResult
 from .scenes import AssetRoots
 
 # Physical profile applied to both sides (see the visionOS HandUnit: the
 # checked-in left/right assets differ by 98x in density and 100x in contact
-# penalty, so both sides use the right hand's published values). A hand-side
-# Coulomb coefficient of 2.0 combines geometrically with the engine default
-# of 0.5 on props to an effective hand/prop friction of 1.0.
+# penalty, so both sides use the right hand's published values). The pair
+# friction is the geometric mean of both sides' coefficients: 1.0 on the hand
+# gives 0.7 against the engine default of 0.5 and 0.95 against a 0.9 sponge,
+# in the range of skin on plastic/foam (2.0 made objects cling to fingers).
 HAND_DENSITY = 980.0
 HAND_PENALTY = 1e8
-HAND_FRICTION = 2.0
+HAND_FRICTION = 1.0
 
-# Pose controller gains (visionOS HandUnit at life scale).
+# Pose controller gains: (stiffness, damping, saturation). The wrist spring
+# is not saturated: SuperDex's saturated tracking lets a hand pressed into the
+# counter sink through it (instead, see the unstick logic below).
 WRIST_POS_GAINS = (2000.0, 60.0)
 WRIST_ROT_GAINS = (50.0, 1.5)
-FINGER_JOINT_GAINS = (0.5, 0.05, 0.6)  # stiffness, damping, saturation
+# Finger joints [N m/rad]: up to 0.64 N m per joint, about twice the visionOS
+# gains (0.5/0.6) for a firmer squeeze. Much stiffer fingers overpower small
+# objects (a 3 cm sphere squirts out of a closing grasp).
+FINGER_JOINT_GAINS = (0.8, 0.06, 0.8)
+
+# Target rate limits: real hands rarely exceed these, tracking glitches
+# (a hand jumping 20 cm in one frame, fingers flipping) do. Unlimited jumps
+# yank the pose controller and make the solver report explosions.
+MAX_WRIST_SPEED = 4.0  # [m/s]
+MAX_WRIST_ANGULAR_SPEED = 25.0  # [rad/s]
+MAX_JOINT_SPEED = 30.0  # [rad/s]
+
+# Unstick: when the simulated hand stays far from the tracked one (caught on
+# or in an object, or pushed deep into the counter), it stops colliding with
+# the scene until it has caught up, then collides again.
+UNSTICK_DISTANCE = 0.12  # [m] wrist error that counts as stuck
+UNSTICK_ANGLE = 1.2  # [rad]
+UNSTICK_AFTER = 0.5  # [s] continuously stuck before passing through
+RESTICK_DISTANCE = 0.03  # [m] back within this: collide again
+RESTICK_ANGLE = 0.3  # [rad]
+# ...and only once no link is buried this deep in the static environment
+# (a hand that caught up inside the counter would be shoved out violently).
+RESTICK_MAX_BURY = 0.01  # [m]
 
 SMOOTHER_FRAMES = 5
 
@@ -59,6 +84,27 @@ def hand_bot_path(roots: AssetRoots, side: str, variant: str = "lowpoly") -> str
         roots.assets / "bots" / "hands" / "oculus_xr" / side
         / f"oculus_xr_hand_{variant}_{side}.superdex_bot"
     )
+
+
+def _scaled(t: physics.TransformRT, s: float) -> physics.TransformRT:
+    return physics.TransformRT(rotation=t.rotation, translation=[float(v) * s for v in t.translation])
+
+
+def scale_bot_prefab(prefab, scale: float) -> None:
+    """Uniformly scale a bot prefab in place: collision shapes, render
+    models and joint offsets (mass follows from the density)."""
+    if scale == 1.0:
+        return
+    for link in prefab.links:
+        link.shape_scale = [float(v) * scale for v in link.shape_scale]
+        link.shape_translation = [float(v) * scale for v in link.shape_translation]
+        link.render_model_scale = [float(v) * scale for v in link.render_model_scale]
+        link.render_model_translation = [float(v) * scale for v in link.render_model_translation]
+        link.parent_joint_from_link = _scaled(link.parent_joint_from_link, scale)
+        if link.center_of_mass is not None:
+            link.center_of_mass = [float(v) * scale for v in link.center_of_mass]
+    for joint in prefab.joints:
+        joint.parent_link_from_joint = _scaled(joint.parent_link_from_joint, scale)
 
 
 def _to_transform(m: np.ndarray) -> physics.TransformRT:
@@ -86,16 +132,23 @@ class HandUnit:
         variant: str = "lowpoly",
         retarget_config: RetargetConfig | None = None,
         display_model: Path | None = None,
+        time_step: float = 1.0 / 60.0,
+        scale: float = 1.0,
     ) -> None:
         self.side = side
         self.scene = scene
+        self.time_step = time_step
         prefab = robotics.load_bot_prefab_from_file(hand_bot_path(roots, side, variant))
         for link in prefab.links:
             link.has_gravity = False  # the pose controller has no gravity term
             link.density = HAND_DENSITY
             link.contact.penalty_coefficient = HAND_PENALTY
             link.contact.coulomb_friction_coefficient = HAND_FRICTION
+        # Hand-size calibration: the operator's hand size (see calibration.py).
+        self.scale = float(scale)
+        scale_bot_prefab(prefab, self.scale)
         self.kinematics = BotKinematics(prefab)
+        self.kinematics.scale = self.scale
         self.retargeter = MetaXrHandRetargeter(self.kinematics, side, retarget_config)
         # 25 WebXR-convention joint poses for the skinned display hand.
         self.display = HandDisplayRig(self.retargeter, display_model)
@@ -146,6 +199,12 @@ class HandUnit:
             )
         )
 
+        self._cmd_root: np.ndarray | None = None  # rate-limited wrist target
+        self._cmd_q: np.ndarray | None = None  # rate-limited joint targets
+        self.passing_through = False  # unstick mode: no contact with the scene
+        self._stuck_time = 0.0
+        self._scene_actors: list[physics.ActorHandle] = []
+        self._static_boxes = np.zeros((0, 2, 3))  # (lo, hi) of static colliders
         self._frames: deque[np.ndarray] = deque(maxlen=SMOOTHER_FRAMES)
         self._placed = False
         self._reset_targets = True
@@ -199,9 +258,9 @@ class HandUnit:
         if result is None:
             return
         self.last_result = result
-        targets = physics.DynamicArrayTransformRT(
-            [_to_transform(m) for m in result.world_from_links]
-        )
+        root, q = self._rate_limit(result.world_from_root, result.qpos)
+        links, _ = self.kinematics.forward(q)
+        targets = physics.DynamicArrayTransformRT([_to_transform(root @ m) for m in links])
         if not self._placed:
             # First acquisition: move the idle hand onto the tracked one.
             self.actor.set_articulated_pose_from_links(targets)
@@ -215,6 +274,74 @@ class HandUnit:
             self._reset_targets = False
         else:
             self.actor.set_articulated_target_link_transforms(targets)
+
+    def _rate_limit(self, root: np.ndarray, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Move the commanded wrist pose and joint angles toward the retargeted
+        ones by at most the speed limits per step (the first time: jump)."""
+        if self._cmd_root is None or not self._placed:
+            self._cmd_root, self._cmd_q = root.copy(), q.copy()
+            return self._cmd_root, self._cmd_q
+        dt = self.time_step
+        out = self._cmd_root.copy()
+        step = root[:3, 3] - out[:3, 3]
+        dist = float(np.linalg.norm(step))
+        limit = MAX_WRIST_SPEED * dt
+        out[:3, 3] += step if dist <= limit else step * (limit / dist)
+        rel = rotvec_from_matrix(out[:3, :3].T @ root[:3, :3])
+        angle = float(np.linalg.norm(rel))
+        limit = MAX_WRIST_ANGULAR_SPEED * dt
+        if angle > limit:
+            rel *= limit / angle
+        out[:3, :3] = out[:3, :3] @ rotvec_to_matrix(rel)
+        dq = np.clip(q - self._cmd_q, -MAX_JOINT_SPEED * dt, MAX_JOINT_SPEED * dt)
+        self._cmd_root, self._cmd_q = out, self._cmd_q + dq
+        return self._cmd_root, self._cmd_q
+
+    # ------------------------------------------------------------------ unstick
+
+    def set_scene_actors(self, handles: list[physics.ActorHandle], static_boxes=None) -> None:
+        """Actors the hand stops touching while it passes through (everything
+        but the hands), and the bounds (lo, hi) of the static box colliders it
+        must be out of before it collides again."""
+        self._scene_actors = list(handles)
+        if static_boxes is not None and len(static_boxes):
+            self._static_boxes = np.asarray(static_boxes, np.float64).reshape(-1, 2, 3)
+
+    def _buried(self) -> float:
+        """Deepest overlap [m] of a link's bounds with a static box."""
+        if not len(self._static_boxes):
+            return 0.0
+        lo = np.array([list(a.get_aabb_world().min) for a in self.link_actors])[:, None]
+        hi = np.array([list(a.get_aabb_world().max) for a in self.link_actors])[:, None]
+        overlap = np.minimum(hi, self._static_boxes[None, :, 1]) - np.maximum(lo, self._static_boxes[None, :, 0])
+        return float(max(np.max(np.min(overlap, axis=-1)), 0.0))
+
+    def update_unstick(self) -> None:
+        """Call after each step: switch contact off while the simulated hand is
+        stuck far from the tracked one, and back on once it has caught up."""
+        if self._cmd_root is None or not self.tracked:
+            self._stuck_time = 0.0
+            return
+        wrist = self.link_poses()[0]
+        err = float(np.linalg.norm(wrist[:3] - self._cmd_root[:3, 3]))
+        rot = quat_to_matrix(wrist[3:])
+        ang = float(np.linalg.norm(rotvec_from_matrix(rot.T @ self._cmd_root[:3, :3])))
+        if not self.passing_through:
+            stuck = err > UNSTICK_DISTANCE or ang > UNSTICK_ANGLE
+            self._stuck_time = self._stuck_time + self.time_step if stuck else 0.0
+            if self._stuck_time >= UNSTICK_AFTER:
+                self._set_scene_contact(False)
+        elif err < RESTICK_DISTANCE and ang < RESTICK_ANGLE and self._buried() < RESTICK_MAX_BURY:
+            self._set_scene_contact(True)
+            self._stuck_time = 0.0
+
+    def _set_scene_contact(self, enable: bool) -> None:
+        handle = self.actor.get_handle()
+        for other in self._scene_actors:
+            self.scene.enable_actor_contact_symmetric(
+                handle, other, enable, physics.IncludeNestedActors.YES
+            )
+        self.passing_through = not enable
 
     def link_poses(self) -> np.ndarray:
         """Current world poses of the links, (num_links, 7) [px py pz qx qy qz qw]."""

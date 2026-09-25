@@ -89,6 +89,17 @@ def rotvec_to_matrix(r: np.ndarray) -> np.ndarray:
     )
 
 
+def rotvec_from_matrix(m: np.ndarray) -> np.ndarray:
+    """Rotation vector (axis * angle, angle in [0, pi]) of a rotation matrix."""
+    q = matrix_to_quat(m)  # [x, y, z, w]
+    if q[3] < 0.0:
+        q = -q
+    s = float(np.linalg.norm(q[:3]))
+    if s < 1e-12:
+        return 2.0 * q[:3]
+    return q[:3] * (2.0 * math.atan2(s, float(q[3])) / s)
+
+
 def right_jacobian_so3(r: np.ndarray) -> np.ndarray:
     theta2 = float(np.dot(r, r))
     if theta2 < 1e-10:

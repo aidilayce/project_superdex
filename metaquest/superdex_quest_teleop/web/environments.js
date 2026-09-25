@@ -288,11 +288,20 @@ function fallbackProps(parent, spots) {
 // ("sponge in front of the sink"). The countertop is the physics table.
 // --------------------------------------------------------------------------
 
-function buildKitchenSink(lib, pack) {
+// Defaults of workspace.py's kitchen_sink_layout (the server sends the
+// authoritative numbers with every scene; its colliders use the same ones).
+const SINK_DEFAULTS = {
+  front: 0.3, back: -0.62, left: -1.4, right: 1.4, slab: 0.035,
+  sink: [0.32, 0.82, -0.46, -0.06], sink_depth: 0.2,
+};
+
+function buildKitchenSink(lib, pack, params = {}) {
   const g = new THREE.Group();
-  const front = 0.3, back = -0.62, left = -1.4, right = 1.4, slab = 0.035;
-  // Sink opening (right of the workspace, behind the reach area).
-  const sx0 = 0.4, sx1 = 0.98, sz0 = -0.5, sz1 = -0.08, depth = 0.21;
+  const P = { ...SINK_DEFAULTS, ...params };
+  const { front, back, left, right, slab } = P;
+  // Sink opening, to the operator's right within reach.
+  const [sx0, sx1, sz0, sz1] = P.sink;
+  const depth = P.sink_depth;
   const counter = lib.get('countertop');
   box(g, lib, counter, [sx0 - left, slab, front - back], [(left + sx0) / 2, -slab / 2, (front + back) / 2]);
   box(g, lib, counter, [right - sx1, slab, front - back], [(sx1 + right) / 2, -slab / 2, (front + back) / 2]);
@@ -404,8 +413,9 @@ function buildKitchenSink(lib, pack) {
     kitchenFloor.position.y = -height;
   }
 
-  const spots = [[-1.05, 0, -0.42, 0.3], [-0.72, 0, -0.5, 1.2], [1.2, 0, -0.35, 2.0], [-1.25, 0, -0.1, 0.8],
-    [1.15, 0, 0.05, 0.4], [-0.45, 0, -0.52, 2.6]];
+  // Decorative props (display only: kept out of reach, since they don't collide).
+  const spots = [[-1.05, 0, -0.42, 0.3], [-0.78, 0, -0.5, 1.2], [1.2, 0, -0.35, 2.0], [-1.25, 0, -0.1, 0.8],
+    [1.2, 0, 0.1, 0.4], [-1.3, 0, -0.5, 2.6]];
   if (!addProps(g, pack, spots)) fallbackProps(g, spots);
   return { group: g, setHeight, lamp: [cx - 0.6, 1.4, -0.1] };
 }
@@ -414,9 +424,10 @@ function buildKitchenSink(lib, pack) {
 // Studio: just the table in SuperDex Studio's HDR.
 // --------------------------------------------------------------------------
 
-function buildStudio(lib) {
+function buildStudio(lib, params = {}) {
   const g = new THREE.Group();
-  const top = box(g, lib, 'tabletop', [1.4, 0.04, 0.9], [0, -0.02, 0]);
+  const width = params.width || 1.4, depthZ = params.depth || 0.9;
+  const top = box(g, lib, 'tabletop', [width, 0.04, depthZ], [0, -0.02, 0]);
   top.receiveShadow = true;
   const legs = new THREE.Group();
   g.add(legs);
@@ -432,9 +443,34 @@ function buildStudio(lib) {
   return { group: g, setHeight, background: 'studio' };
 }
 
-export function buildEnvironment(name, lib, pack) {
-  if (name === 'studio') return buildStudio(lib);
-  return buildKitchenSink(lib, pack);
+export function buildEnvironment(name, lib, pack, params = {}) {
+  if (name === 'studio') return buildStudio(lib, params);
+  return buildKitchenSink(lib, pack, params);
+}
+
+// Wireframes of the server's static colliders (debug view, key C): what the
+// simulated hands and objects actually touch.
+export function buildColliderView(layout) {
+  const group = new THREE.Group();
+  if (!layout) return group;
+  const material = new THREE.LineBasicMaterial({ color: 0x00e5ff, transparent: true, opacity: 0.8, depthTest: false });
+  for (const b of layout.boxes || []) {
+    // Colliders reaching below the floor are drawn down to it.
+    const bottom = Math.max(b.center[1] - b.size[1] / 2, -layout.counter_height);
+    const top = b.center[1] + b.size[1] / 2;
+    if (top <= bottom) continue;
+    const geometry = new THREE.EdgesGeometry(new THREE.BoxGeometry(b.size[0], top - bottom, b.size[2]));
+    const lines = new THREE.LineSegments(geometry, material);
+    lines.position.set(b.center[0], (top + bottom) / 2, b.center[2]);
+    lines.renderOrder = 10;
+    group.add(lines);
+  }
+  const floor = new THREE.GridHelper(4, 16, 0x00e5ff, 0x00e5ff);
+  floor.position.y = -layout.counter_height;
+  floor.material.transparent = true;
+  floor.material.opacity = 0.5;
+  group.add(floor);
+  return group;
 }
 
 // --------------------------------------------------------------------------

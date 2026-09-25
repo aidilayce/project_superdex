@@ -37,6 +37,8 @@ from pathlib import Path
 import numpy as np
 import superdex.physics as physics
 
+from .workspace import DEFAULT_COUNTER_HEIGHT, Workspace
+
 TABLE_NAME = "table"
 
 
@@ -77,6 +79,9 @@ class SceneSpec:
     time_step: float = 1.0 / 60.0
     # Solver tweaks for deformables (line search as in the rope/cloth examples).
     robust_solver: bool = False
+    # Newton iterations per step (0: engine default). Interactive shells use 2
+    # like example_tshirt_on_plane.py.
+    newton_iters: int = 0
 
 
 # ----------------------------------------------------------------------------
@@ -196,6 +201,18 @@ def _use_robust_solver(scene: physics.Scene) -> None:
     params = scene.get_solver_params()
     params.non_linear_solver.line_search_type = physics.LineSearchType.WOLFE_STRONG
     params.experimental_eval.implicit_normal_force_for_dissipation = True
+    scene.set_solver_params(params)
+
+
+def _tune_solver(scene: physics.Scene, spec: SceneSpec, time_budget: float | None) -> None:
+    params = scene.get_solver_params()
+    # An inner linear solve that stops short is corrected by the next Newton
+    # iteration or step; at teleop rates its warnings only flood the terminal.
+    params.linear_solver.verbosity = physics.VerbosityLevel.ERROR
+    if spec.newton_iters > 0:
+        params.non_linear_solver.max_iter = spec.newton_iters
+    if time_budget is not None and time_budget > 0.0:
+        params.non_linear_solver.max_elapsed_time_seconds = float(time_budget * spec.time_step)
     scene.set_solver_params(params)
 
 
@@ -347,18 +364,19 @@ def add_free_rope(
         torsional_stiffness=shear * polar,
         flexural_stiffness=[youngs * second, youngs * second],
     )
-    return physics.experimental.create_rod_actor(
-        scene,
-        physics.experimental.RodActorParams(
-            name=name,
-            shape=physics.create_model_shape(model),
-            material=material,
-            contact=physics.ContactParams(
-                penalty_coefficient=1e8, coulomb_friction_coefficient=0.5
-            ),
-            use_visual_mesh_contact=True,
-        ),
+    params = dict(
+        name=name,
+        shape=physics.create_model_shape(model),
+        material=material,
+        contact=physics.ContactParams(penalty_coefficient=1e8, coulomb_friction_coefficient=0.5),
     )
+    # Contact on the tube surface: `use_contact_skin` on current SuperDex,
+    # `use_visual_mesh_contact` on the 1.0.0 wheels.
+    try:
+        rod = physics.experimental.RodActorParams(**params, use_contact_skin=True)
+    except TypeError:
+        rod = physics.experimental.RodActorParams(**params, use_visual_mesh_contact=True)
+    return physics.experimental.create_rod_actor(scene, rod)
 
 
 def add_cloth(
@@ -367,8 +385,13 @@ def add_cloth(
     name: str = "tshirt",
     size: float = 0.45,
     height: float = 0.06,
+    radius: float = 0.003,
+    self_contact: bool = True,
 ) -> physics.Actor:
-    """The t-shirt shell from example_tshirt_on_plane.py, scaled to ``size``."""
+    """The t-shirt shell from example_tshirt_on_plane.py, scaled to ``size``.
+
+    ``radius`` is the point-cloud contact radius; ``self_contact`` lets the
+    garment collide with itself (folds), the most expensive part."""
     path = roots.physics_assets / "garments" / "tshirt_visual_subdiv_2.mochi.h5"
     probe = physics.load_shape_from_file(file_path=str(path))
     box = physics.get_shape_aabb(probe)
@@ -389,7 +412,44 @@ def add_cloth(
             translation=[-center[0], height - lo[2] * scale, center[1]],
         ),
     )
-    params.point_cloud_collider.radius = 0.003
+    params.point_cloud_collider.radius = radius
+    params.point_cloud_collider.self_contact = self_contact
+    return physics.experimental.create_shell_actor(scene, params)
+
+
+def add_towel(
+    scene: physics.Scene,
+    name: str = "towel",
+    size: tuple[float, float] = (0.3, 0.3),
+    cells: int = 24,
+    height: float = 0.01,
+    center: tuple[float, float] = (0.0, 0.0),
+) -> physics.Actor:
+    """A flat cotton dish towel: a ``cells`` x ``cells`` triangle-grid shell
+    lying on the counter (light enough for real time on any machine)."""
+    n = cells + 1
+    u, v = np.meshgrid(np.linspace(-0.5, 0.5, n), np.linspace(-0.5, 0.5, n), indexing="ij")
+    nodes = np.stack([u.ravel() * size[0], np.zeros(n * n), v.ravel() * size[1]], axis=1)
+    tris = []
+    for i in range(cells):
+        for j in range(cells):
+            a, b, c, d = i * n + j, (i + 1) * n + j, (i + 1) * n + j + 1, i * n + j + 1
+            # Alternate the diagonal so the fabric has no preferred shear.
+            tris += [[a, d, b], [b, d, c]] if (i + j) % 2 == 0 else [[a, d, c], [a, c, b]]
+    shape = physics.create_tri_mesh_shape(
+        coordinates=nodes.astype(np.float32).ravel(),
+        connectivity=np.asarray(tris, np.int32).ravel(),
+    )
+    # Cotton terry: ~1 mm effective thickness, ~300 g/m^2.
+    material = physics.experimental.shell_material_params_from3d_isotropic(2e5, 0.3, 300.0, 0.001)
+    params = physics.experimental.ShellActorParams(
+        name=name,
+        shape=shape,
+        material=material,
+        contact=physics.ContactParams(coulomb_friction_coefficient=0.8),
+        world_from_local=physics.TransformRT(translation=[center[0], height, center[1]]),
+    )
+    params.point_cloud_collider.radius = 0.004
     params.point_cloud_collider.self_contact = True
     return physics.experimental.create_shell_actor(scene, params)
 
@@ -430,14 +490,12 @@ _PREFAB_SCENES: tuple[tuple[str, str, str, str, dict], ...] = (
 
 def _prefab_builder(relative: str, **kwargs) -> Callable[[physics.Scene, AssetRoots], None]:
     def build(scene: physics.Scene, roots: AssetRoots) -> None:
-        add_table(scene)
         add_prefab(scene, roots.assets / "prefabs" / relative, **kwargs)
 
     return build
 
 
 def _build_rigid_cube(scene: physics.Scene, roots: AssetRoots) -> None:
-    add_table(scene)
     add_rigid_mesh(
         scene, "cube", roots.assets / "cube" / "cube_fine_mesh.mochi.h5",
         size=0.057, position=(0.0, 0.0, 0.0), density=400.0,
@@ -446,7 +504,6 @@ def _build_rigid_cube(scene: physics.Scene, roots: AssetRoots) -> None:
 
 
 def _build_soft_cube(scene: physics.Scene, roots: AssetRoots) -> None:
-    add_table(scene)
     add_soft_mesh(
         scene, "soft_cube", roots.physics_assets / "cube" / "cube_fine_mesh.mochi.json",
         size=0.06, position=(0.0, 0.0, 0.0), youngs=3e4, density=100.0,
@@ -454,7 +511,6 @@ def _build_soft_cube(scene: physics.Scene, roots: AssetRoots) -> None:
 
 
 def _build_soft_duck(scene: physics.Scene, roots: AssetRoots) -> None:
-    add_table(scene)
     add_soft_mesh(
         scene, "soft_duck", roots.physics_assets / "duck" / "duck_730.mochi.h5",
         size=0.12, position=(0.0, 0.0, 0.0), youngs=2e4, density=200.0,
@@ -462,19 +518,20 @@ def _build_soft_duck(scene: physics.Scene, roots: AssetRoots) -> None:
 
 
 def _build_rope(scene: physics.Scene, roots: AssetRoots) -> None:
-    add_table(scene)
     add_free_rope(scene)
 
 
 def _build_cloth(scene: physics.Scene, roots: AssetRoots) -> None:
-    add_table(scene)
     add_cloth(scene, roots)
+
+
+def _build_towel(scene: physics.Scene, roots: AssetRoots) -> None:
+    add_towel(scene)
 
 
 def _build_kitchen_sponge(scene: physics.Scene, roots: AssetRoots) -> None:
     """A kitchen sponge (soft foam block) and a paper cup on the countertop,
     in front of the sink of the kitchen_sink environment."""
-    add_table(scene)
     add_soft_box(
         scene, "sponge", roots.physics_assets / "cube" / "cube_fine_mesh.mochi.json",
         size=(0.095, 0.032, 0.065), position=(0.05, 0.0, 0.0), youngs=1.2e4, density=80.0,
@@ -485,7 +542,6 @@ def _build_kitchen_sponge(scene: physics.Scene, roots: AssetRoots) -> None:
 
 def _build_medley(scene: physics.Scene, roots: AssetRoots) -> None:
     """A tabletop mix of rigid and deformable objects."""
-    add_table(scene)
     prefabs = roots.assets / "prefabs"
     add_prefab(scene, prefabs / "sphere" / "sphere.mochi_prefab", "sphere", (-0.12, 0.0, 0.0))
     add_prefab(scene, prefabs / "paper_cups" / "paper_cup.mochi_prefab", "cup", (0.12, 0.0, -0.05))
@@ -516,9 +572,14 @@ _BUILTIN: tuple[SceneSpec, ...] = (
     SceneSpec("free_rope", "Free Rope", "deformable",
               "The visionOS free rope: lift, drag and coil a 60 cm rod.", _build_rope,
               robust_solver=True),
+    # One Newton iteration per step (example_tshirt_on_plane.py uses 2) keeps
+    # the 3.6k-node garment with self contact near real time.
     SceneSpec("cloth", "T-shirt Cloth", "deformable",
-              "A 45 cm t-shirt shell with self contact (heavier to simulate).",
-              _build_cloth, time_step=1.0 / 30.0, robust_solver=True),
+              "A 45 cm t-shirt shell with self contact (the heaviest scene).",
+              _build_cloth, time_step=1.0 / 30.0, robust_solver=True, newton_iters=1),
+    SceneSpec("dish_towel", "Dish Towel", "deformable",
+              "Fold, wring and wipe with a 30 cm cotton towel (light cloth).",
+              _build_towel, robust_solver=True, newton_iters=2),
     SceneSpec("medley", "Tabletop Medley", "mixed",
               "Sphere, cup, block, peg, cube and a soft duck together.", _build_medley,
               robust_solver=True),
@@ -574,10 +635,41 @@ def scene_registry(roots: AssetRoots | None = None) -> dict[str, SceneSpec]:
     return {spec.id: spec for spec in specs}
 
 
-def build_scene(spec: SceneSpec, roots: AssetRoots) -> physics.Scene:
+def build_scene(
+    spec: SceneSpec,
+    roots: AssetRoots,
+    environment: str = "kitchen_sink",
+    counter_height: float = DEFAULT_COUNTER_HEIGHT,
+    time_budget: float | None = None,
+) -> physics.Scene:
+    """Create the scene: the physical environment (``environment``: one of
+    workspace.ENVIRONMENTS, or "table" for a bare infinite tabletop plane),
+    then the scene's objects on the work surface at y = 0.
+
+    ``time_budget`` caps the Newton solve of a step at this fraction of the
+    time step (wall clock), trading accuracy for real time in heavy scenes."""
     scene = physics.create_scene(spec.name)
     scene.set_gravity([0.0, -9.8, 0.0])
     if spec.robust_solver:
         _use_robust_solver(scene)
+    _tune_solver(scene, spec, time_budget)
+    if environment == "table":
+        add_table(scene)
+    else:
+        _workspaces[scene.get_handle().value] = Workspace(scene, environment, counter_height)
     spec.build(scene, roots)
     return scene
+
+
+_workspaces: dict[int, Workspace] = {}
+
+
+def workspace_for(scene: physics.Scene) -> Workspace | None:
+    return _workspaces.get(scene.get_handle().value)
+
+
+def forget_scene(scene: physics.Scene) -> None:
+    """Drop the per-scene registries (call before destroying the scene)."""
+    handle = scene.get_handle().value
+    _workspaces.pop(handle, None)
+    _render_models.pop(handle, None)

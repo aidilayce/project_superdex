@@ -12,8 +12,10 @@ synthetic manipulation data. It follows the same idea as Isaac Sim's
 The Vision Pro example has two scenes (Box and Blocks, Free Rope). This one
 builds its scenes from the whole SuperDex asset library: every prefab in
 `assets/prefabs/`, plus rigid and deformable objects from
-`superdex_physics/assets` (soft duck, soft cube, rope, t-shirt cloth). A new
-prefab added to `assets/prefabs/` shows up as a scene automatically.
+`superdex_physics/assets` (soft duck, soft cube, rope, t-shirt cloth), plus a
+kitchen sponge and a dish towel. A new prefab added to `assets/prefabs/` shows
+up as a scene automatically. The scenes stand in a **physical 3D kitchen**:
+objects can be put in the sink, pushed off the counter and dropped on the floor.
 
 ```text
  Meta Quest (browser, WebXR)                     PC running SuperDex (Python)
@@ -54,6 +56,14 @@ uv run --no-project python -m superdex_quest_teleop --list-scenes
 The PC serves everything the headset needs, including a bundled copy of
 three.js, so the headset doesn't need internet access.
 
+**Latest SuperDex.** `uv pip install superdex` installs the 1.0.0 wheels from
+PyPI. The teleop works with them and with the current `main` branch, which is
+faster (about 20–40 % per step here) and fixes a t-shirt solver explosion.
+To use `main`, build it from source as described in the repository README
+(`uv sync --extra core`, Clang 17+), or build wheels with
+`tools/build_wheels.py --fast --skip-fp64 --only superdex_python --only
+superdex_robotics --only superdex_lab` and install those.
+
 ## Run
 
 ```bash
@@ -89,14 +99,34 @@ Then open `http://localhost:8080/` in the Quest browser.
 `--synthetic` and a scripted Quest-format hand reaches, grasps, lifts and
 releases the object, which exercises the whole pipeline.
 
+**Quit** with `Ctrl-C` in the terminal. The open recording is saved first, and
+the server exits within a second. Press `Ctrl-C` again to force quit.
+
 ### In the headset
 
 When the session starts, the virtual table (the physics origin) is placed
 0.42 m in front of your eyes and 0.5 m below them, facing where you look. By
-default it is the stone countertop of a kitchen, next to the sink. Your real
-hands appear as small blue joint spheres ("ghost"). The simulated Meta XR hands follow them
-physically: they stop at objects instead of passing through, so what you see
-matches the forces being recorded.
+default it is the stone countertop of a kitchen, next to the sink. The
+simulated floor is put at your real floor (the headset reports the counter
+height). Your real hands appear as small blue joint spheres ("ghost"). The
+simulated Meta XR hands follow them physically: they stop at objects instead
+of passing through, so what you see matches the forces being recorded.
+
+**Hand-size calibration.** Right after you enter VR, a panel asks you to hold
+both hands open, palms down, fingers spread. After about half a second of open
+hands, the PC scales the simulated hands to your size and rebuilds the scene
+(the panel shows the scale and your hand length). Quest hand tracking already
+fits its skeleton to your hand; the calibration compares its bone lengths with
+the Meta XR hand's (palm, knuckle width, four fingers). **Calibrate** on the
+panel repeats it and **Skip** keeps the current size. `--hand-scale` sets the
+size without a headset, and recordings store it (`hand_scale` in the metadata).
+
+**When a hand gets stuck.** If the simulated hand stays more than 12 cm behind
+your real hand for half a second (caught on an object, or pushed deep into the
+counter), it stops colliding and turns translucent. It collides again once it
+has caught up and is out of the counter. Tracking glitches (a hand jumping
+20 cm in one frame) can't yank the simulated hand: its targets move at most
+4 m/s, 25 rad/s at the wrist and 30 rad/s per finger joint.
 
 A button panel floats to the left of the table. Poke a button with an index
 fingertip:
@@ -111,7 +141,9 @@ fingertip:
 | Contacts | Show or hide contact points and force vectors |
 | Ghost | Show or hide your tracked joints |
 | Hands | Switch between skinned hands and the Meta XR robot-hand meshes |
-| Env ▶ | Next 3D environment |
+| Env ▶ | Next 3D environment (rebuilds the scene in it) |
+| Colliders | Show or hide the physics colliders of the environment |
+| Calibrate / Skip | Redo or skip the hand-size calibration |
 | Exit VR | Leave the immersive session |
 
 The panel also shows the scene, the simulation's real-time factor, the
@@ -125,8 +157,8 @@ is connected; otherwise it shows the default operator viewpoint. Dragging the
 view returns to orbiting.
 
 Keys: `Space` records, `R` resets, `V` toggles Cam view, `E` switches the
-environment, `H` switches the hand view, `N`/`P` changes scene, `C` toggles
-contacts.
+environment, `K` shows the physics colliders, `H` switches the hand view,
+`N`/`P` changes scene, `C` toggles contacts.
 
 ### Look: environments, materials and hands
 
@@ -136,14 +168,23 @@ this client builds its look from the assets SuperDex does ship plus CC0 assets
 from [Poly Haven](https://polyhaven.com), the library SuperDex Studio already
 uses for its lighting.
 
-**3D environments** (display only; physics sees the table plane). Switch with
-**Env** or `E`, or choose one with `--environment`:
+**Physical 3D environments.** The environment is part of the simulation. The
+server builds static colliders (`workspace.py`) and sends their layout to the
+client, which builds the textured kitchen from the same numbers. What you see
+is what the hands and objects collide with; press `K` to overlay the
+colliders. Switch with **Env** or `E` (this rebuilds the scene), or choose one
+with `--environment`:
 
-| Environment | What it is |
-| :-- | :-- |
-| `kitchen_sink` (default) | Stone countertop (the physics table) with an undermount stainless sink, gooseneck faucet, soap bottle, tiled backsplash, window, wood cabinets with handles, floor and walls, plus kitchen props. It matches the SuperDex "sponge by the sink" shot |
-| `kitchen_island` | A kitchen with the table as a butcher-block island |
-| `studio` | A table in SuperDex Studio's HDR, as a blurred backdrop |
+| Environment | What it is | Colliders |
+| :-- | :-- | :-- |
+| `kitchen_sink` (default) | Stone countertop with an undermount stainless sink to your right, gooseneck faucet, soap bottle, tiled backsplash, window, wood cabinets with handles, floor and walls, plus decorative kitchen props. It matches the SuperDex "sponge by the sink" shot | Countertop around the sink opening, a 20 cm deep basin, faucet, soap bottle, base and upper cabinets, window sill, backsplash and side walls, floor |
+| `kitchen_island` | A kitchen with the work surface as a butcher-block island | Island top and body, floor: things fall off every side |
+| `studio` | A table in SuperDex Studio's HDR, as a blurred backdrop | Table top and legs, floor |
+| `table` | The bare infinite tabletop plane of earlier versions | One plane |
+
+Collisions with the environment are recorded like any other contact (its
+actors are named `env/...`, e.g. `env/sink_bottom`, `env/floor`). The
+decorative props on the far counters are display only.
 
 **Poly Haven asset pack.** On first start, the server downloads a CC0 pack
 into `~/.superdex_quest_teleop/assets` in the background, and connected
@@ -249,17 +290,19 @@ you. On Quest 3, **Enter passthrough** shows your real kitchen.
 | `--synthetic` | off | Scripted right hand instead of the headset |
 | `--http-port N` / `--https-port N` | `8080` / `8443` | Listening ports |
 | `--no-https` | off | Serve plain HTTP only |
-| `--environment NAME\|FILE` | `kitchen_sink` | `kitchen_sink`, `kitchen_island`, `studio`, or a backdrop file (`.hdr`, 360° photo, `.glb`) |
+| `--environment NAME\|FILE` | `kitchen_sink` | `kitchen_sink`, `kitchen_island`, `studio`, `table`, or a backdrop file (`.hdr`, 360° photo, `.glb`) shown around the island |
 | `--no-download` | off | Don't fetch the Poly Haven asset pack |
 | `--asset-dir DIR` / `--asset-resolution` | `~/.superdex_quest_teleop/assets` / `1k` | Asset pack location and texture resolution |
 | `--hand-models DIR` | WebXR generic hand | Rigged, textured `left.glb`/`right.glb` (e.g. from `bedlam_hands`) |
+| `--hand-scale S` | `1` | Size of the simulated hands (normally set by the in-headset calibration) |
+| `--time-budget F` | `0.8` | Cap each step's solve at this fraction of the time step, so heavy scenes stay real time. `0`: solve to the engine's tolerances even if slower than real time |
 | `--threads N` | `-1` | SuperDex worker threads |
 
 ## Scenes
 
-The table is a static plane at y = 0. Z-up prefabs are rotated into the
-Y-up physics frame (as in the visionOS prefab gallery) and centered on the
-table using their measured bounds.
+The work surface is at y = 0 (the countertop of the chosen environment). Z-up
+prefabs are rotated into the Y-up physics frame (as in the visionOS prefab
+gallery) and centered on it using their measured bounds.
 
 | id | Kind | Content |
 | :-- | :-- | :-- |
@@ -276,7 +319,8 @@ table using their measured bounds.
 | `cube` | rigid | 5.7 cm puzzle-cube-sized block |
 | `soft_cube`, `soft_duck` | soft | Foam cube, soft duck |
 | `free_rope` | rod | The visionOS free rope |
-| `cloth` | shell | T-shirt with self contact (1/30 s step). Heavy |
+| `cloth` | shell | 45 cm t-shirt with self contact (1/30 s step, one Newton iteration) |
+| `dish_towel` | shell | 30 cm cotton towel (light: 4× real time) |
 | `medley` | mixed | Sphere, cup, block, peg, cube and a soft duck |
 
 To add a scene, drop a prefab into `assets/prefabs/<name>/`, or add a
@@ -286,15 +330,19 @@ The loop runs at the scene's fixed step and paces itself to wall-clock time.
 If a step takes longer than its duration, the simulation runs in slow motion
 rather than skipping steps. The HUD shows the real-time factor (RTF).
 
-These are real-time factors measured on a 4-core cloud VM with one hand
-grasping and recording on:
+Heavy scenes stay real time with the solve time budget (`--time-budget`,
+default 0.8 of the step): a step's Newton iterations stop when the budget is
+spent. Real-time factors measured on a 4-core cloud VM with one hand grasping
+(1.0.0 wheel / current `main`):
 
-* **Real time:** `sphere`, `cube`, `paper_cup`, `nine_hole_peg_test`,
-  `functional_dexterity_test`.
-* **0.8–0.9×:** `soft_cube`, `free_rope`, `soft_duck`.
-* **0.6–0.8×:** `box_and_blocks`, `duck_lamp`, `medley`.
-* **Much slower than real time:** `paper_cup_pyramid`, `shape_box`, `chain`,
-  `cloth`.
+* **Real time and faster:** `sphere` (3.7× / 5.3×), `kitchen_sponge`
+  (2.4× / 3.2×), `dish_towel` (2.4× / 4×), `cube`, `paper_cup`,
+  `nine_hole_peg_test`, `functional_dexterity_test`, `medley` (1.05× / 1.4×).
+* **About real time:** `cloth` (0.95× / 1.13×; it was 0.15–0.26× before the
+  t-shirt used one Newton iteration and streamed its 3.6k-node simulation mesh
+  instead of its 57k-vertex subdivided visual mesh), `soft_cube`,
+  `free_rope`, `soft_duck`.
+* **Slower than real time:** `paper_cup_pyramid`, `shape_box`, `chain`.
 
 More cores help. Recording costs a few microseconds per contact point, so
 contact-dense moments slow the loop down while recording.
@@ -302,8 +350,8 @@ contact-dense moments slow the loop down while recording.
 ## Recorded data
 
 Each episode is one HDF5 file, `<out>/<scene>_<timestamp>.h5`. With T steps,
-N actors (objects, the table and 19 links per hand) and K contact points in
-total:
+N actors (objects, the environment colliders and 19 links per hand) and K
+contact points in total:
 
 | Dataset | Shape | Content |
 | :-- | :-- | :-- |
@@ -332,7 +380,8 @@ total:
 
 The root attributes hold the scene id and name, the time step and a JSON
 `metadata` string. The metadata includes the hand link and DoF names, the
-Quest joint names and the recording options.
+Quest joint names, the recording options, the environment with its collider
+layout, the counter height and the hand scale.
 
 Contact samples live on one actor's surface. Which actor owns a sample
 depends on the collider pair: for example, a rigid link against a soft body is
@@ -347,6 +396,42 @@ applies to each object:
 ```bash
 python metaquest/tools/inspect_episode.py recordings/cube_20260101_120000.h5
 ```
+
+### Viewing an episode
+
+**Replay in 3D.** Play an episode back in the same viewer, in a desktop
+browser or in the headset:
+
+```bash
+cd metaquest
+uv run --no-project python -m superdex_quest_teleop.replay ../recordings/kitchen_sponge_20260925_101500.h5
+```
+
+Then open `http://localhost:8080/`. You see the objects, the deforming bodies,
+the hands and the recorded contact points with their force vectors (`C`),
+with a timeline: play/pause (`Space`), scrub, step (`←`/`→`, with `Shift` 10
+steps) and change the speed. Nothing is simulated: the scene is rebuilt only
+for its meshes, and everything that moves comes from the file.
+
+**In Python.** Episodes are plain HDF5:
+
+```python
+import h5py, json
+with h5py.File("recordings/kitchen_sponge_20260925_101500.h5") as f:
+    meta = json.loads(f.attrs["metadata"])
+    names = [n.decode() for n in f["actors/name"][:]]
+    pose = f["actors/pose"][:]                       # (T, N, 7)
+    t = 100                                          # contacts of step 100:
+    rows = slice(*f["contacts/step_offset"][t:t + 2])
+    force = f["contacts/force"][rows]                # (k, 3) N
+    point = f["contacts/pos_owner"][rows]            # (k, 3) m
+    owner = [names[i] for i in f["contacts/owner"][rows]]
+```
+
+**Other tools.** Any HDF5 viewer opens the files, for example
+[HDFView](https://www.hdfgroup.org/downloads/hdfview/),
+[myHDF5](https://myhdf5.hdfgroup.org/) in the browser, the VS Code "H5Web"
+extension, or `h5ls -r file.h5` on the command line.
 
 ## Retargeting
 
@@ -370,10 +455,18 @@ the visionOS AnyDex pipeline:
    27 DoFs. It takes about 2.5 ms per hand.
 
 The physical hand (`hand_rig.py`) ports the visionOS `HandUnit`: 5-frame
-keypoint smoothing, a wrist spring (2000 N/m, 50 N·m/rad), finger joint PD
-(0.5 N·m/rad, saturated at 0.6 rad), gravity compensation, a uniform hand
-friction/penalty profile on both sides, and no teleporting on tracking
-reacquisition.
+keypoint smoothing, a wrist spring (2000 N/m, 50 N·m/rad), gravity
+compensation, a uniform hand penalty profile on both sides, and no teleporting
+on tracking reacquisition. It differs from the visionOS values in three ways:
+
+* **Finger joints** are stiffer: 0.8 N·m/rad, saturated at 0.8 rad (up to
+  0.64 N·m per joint, twice the visionOS grip). Much stiffer fingers squeeze
+  small objects out of an open-loop grasp.
+* **Friction:** the hand's Coulomb coefficient is 1.0, giving 0.7 against
+  most objects (the pair uses the geometric mean). The visionOS 2.0 made
+  objects cling to the fingers.
+* **Targets** are rate limited, and a stuck hand passes through objects until
+  it catches up (see *When a hand gets stuck*).
 
 ## Tests
 
@@ -387,6 +480,11 @@ The tests cover:
 * retargeting round trips and invariance to hand size;
 * every scene builds and settles;
 * a scripted Quest-format grasp lifts the cube;
+* objects land in the sink, on the counter and on the floor, which follows the
+  counter height; the island and studio table have edges;
+* hand-size calibration and the scaled hand bot;
+* the unstick logic, and rate limiting of tracking jumps;
+* an episode replays frame-exactly;
 * per-point forces reconstruct the total contact force;
 * soft-body node forces are recorded;
 * the full WebSocket protocol, driven the way the headset drives it.

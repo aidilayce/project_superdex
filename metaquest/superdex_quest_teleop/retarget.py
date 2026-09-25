@@ -154,7 +154,8 @@ class MetaXrHandRetargeter:
             self._point_joint.append(joint)
         for f, link in enumerate(_TIP_LINKS):
             self._point_links.append(k.link_index(link))
-            offsets.append(np.array([0.0, _TIP_LENGTHS[side][f], 0.0]))
+            # Distal link -> fingertip, scaled with a calibrated (scaled) hand.
+            offsets.append(np.array([0.0, _TIP_LENGTHS[side][f] * getattr(kinematics, "scale", 1.0), 0.0]))
             self._point_joint.append(hs.FINGER_TIPS[f])
         self._point_offsets = np.asarray(offsets)
         self._point_of_joint = {j: i for i, j in enumerate(self._point_joint)}
