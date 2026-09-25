@@ -39,9 +39,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--https-port", type=int, default=8443,
                         help="HTTPS port with a self-signed certificate (Quest over Wi-Fi)")
     parser.add_argument("--no-https", action="store_true", help="serve plain HTTP only")
-    parser.add_argument("--environment", type=Path, default=None,
-                        help="backdrop instead of the built-in kitchen: a .glb/.gltf model or an "
-                        "equirectangular 360 photo (.jpg/.png), e.g. of your own kitchen")
+    parser.add_argument("--environment", default="auto",
+                        help="auto (default): a CC0 kitchen HDRI from Poly Haven, downloaded once; "
+                        "procedural: the built-in kitchen; or a file: an .hdr, an equirectangular "
+                        "360 photo (.jpg/.png, e.g. of your own kitchen) or a .glb/.gltf model")
+    parser.add_argument("--hand-models", type=Path, default=None,
+                        help="directory with left.glb/right.glb: rigged, textured hands whose bones "
+                        "use the 25 WebXR joint names (default: WebXR generic-hand with skin shading)")
     parser.add_argument("--out", type=Path, default=Path("recordings"), help="episode output directory")
     parser.add_argument("--contacts", choices=CONTACT_MODES, default="hand",
                         help="hand: contacts involving the hands; all: also object/object and object/table")
@@ -73,14 +77,21 @@ def main(argv: list[str] | None = None) -> None:
     if args.scene not in registry:
         parser.error(f"unknown scene {args.scene!r}; use --list-scenes")
 
-    if args.environment is not None and not args.environment.is_file():
-        parser.error(f"environment file not found: {args.environment}")
+    environment = None
+    if args.environment not in ("auto", "procedural"):
+        environment = Path(args.environment).expanduser().resolve()
+        if not environment.is_file():
+            parser.error(f"environment file not found: {args.environment}")
+    if args.hand_models is not None and not (args.hand_models / "right.glb").exists():
+        parser.error(f"{args.hand_models} must contain left.glb and right.glb")
     config = ServerConfig(
         host=args.host,
         http_port=args.http_port,
         https_port=args.https_port,
         https=not args.no_https,
-        environment=args.environment.resolve() if args.environment else None,
+        environment=environment,
+        environment_auto=args.environment == "auto",
+        hand_models=args.hand_models.resolve() if args.hand_models else None,
         out_dir=args.out,
         scene=args.scene,
         contact_mode=args.contacts,

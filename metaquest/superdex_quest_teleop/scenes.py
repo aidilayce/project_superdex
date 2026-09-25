@@ -27,6 +27,7 @@ code (see ``discover_prefab_scenes``).
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from collections.abc import Callable
@@ -109,6 +110,36 @@ def _world_bounds(actors: list[physics.Actor]) -> tuple[np.ndarray, np.ndarray]:
 
 
 _PREFAB_ROTATION = physics.Quaternion.rotation_x(-math.pi / 2)
+
+# Textured render models of prefab actors, per scene handle:
+# {actor name: GLB path}. Filled by add_prefab, read by the session.
+_render_models: dict[int, dict[str, Path]] = {}
+
+
+def prefab_render_models(prefab_path: Path, prefix: str) -> dict[str, Path]:
+    """Actor name -> render GLB for a prefab loaded under ``prefix`` (the
+    PrefabParams name), following nested prefabs ("prefab/<nested>/<actor>")."""
+    out: dict[str, Path] = {}
+    try:
+        doc = json.loads(Path(prefab_path).read_text())
+    except (OSError, ValueError):
+        return out
+    base = Path(prefab_path).parent
+    for actors in (doc.get("actors") or {}).values():
+        for actor in actors if isinstance(actors, list) else []:
+            model = actor.get("renderModel")
+            name = actor.get("name")
+            if model and name and (base / model).exists():
+                out[f"{prefix}/{name}"] = (base / model).resolve()
+    for nested in doc.get("prefabs") or []:
+        path = nested.get("path")
+        if path and nested.get("name"):
+            out.update(prefab_render_models(base / path, f"{prefix}/{nested['name']}"))
+    return out
+
+
+def render_models_for(scene: physics.Scene) -> dict[str, Path]:
+    return _render_models.get(scene.get_handle().value, {})
 _placement_cache: dict[str, np.ndarray] = {}
 
 
@@ -146,6 +177,9 @@ def add_prefab(
 ) -> None:
     """Add a prefab centered on the table, then shifted by ``offset``."""
     placement = prefab_placement(prefab_path, clearance) + np.asarray(offset)
+    _render_models.setdefault(scene.get_handle().value, {}).update(
+        prefab_render_models(prefab_path, name)
+    )
     physics.prefab.add_to_scene(
         prefab_path=str(prefab_path),
         root_path=str(prefab_path.parent),

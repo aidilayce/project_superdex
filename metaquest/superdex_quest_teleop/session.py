@@ -81,6 +81,7 @@ class TeleopSession:
         keep_self_contacts: bool = False,
         hand_variant: str = "lowpoly",
         retarget_config: RetargetConfig | None = None,
+        display_hand_models: dict[str, Path] | None = None,
     ) -> None:
         if contact_mode not in CONTACT_MODES:
             raise ValueError(f"contact_mode must be one of {CONTACT_MODES}")
@@ -93,7 +94,8 @@ class TeleopSession:
         self.scene = build_scene(spec, roots)
         self.hands: dict[str, HandUnit] = {
             side: HandUnit(
-                self.scene, roots, side, HAND_SPAWN[side], hand_variant, retarget_config
+                self.scene, roots, side, HAND_SPAWN[side], hand_variant, retarget_config,
+                (display_hand_models or {}).get(side),
             )
             for side in sides
         }
@@ -103,6 +105,9 @@ class TeleopSession:
         self._input = {side: hs.HandFrame.untracked() for side in sides}
         self._head_pose = np.full(7, np.nan)
         self.recorder: EpisodeRecorder | None = None
+        from .scenes import render_models_for
+
+        self._render_models = render_models_for(self.scene)
         self._collect_actors()
         self._register_queries()
         self.last_contacts: dict = _empty_contacts()
@@ -261,7 +266,9 @@ class TeleopSession:
         hands = {}
         for side, hand in self.hands.items():
             frame = hand.last_input
+            link_pose = hand.link_poses()
             hands[side] = {
+                "display_joints": hand.display.joints(link_pose),
                 "tracked": hand.tracked,
                 "joints": frame.joints,
                 "joint_rotations": frame.rotations if frame.rotations is not None
@@ -269,7 +276,7 @@ class TeleopSession:
                 "joint_radii": frame.radii if frame.radii is not None
                 else np.full(hs.NUM_JOINTS, np.nan),
                 "target_qpos": hand.target_qpos(),
-                "link_pose": hand.link_poses(),
+                "link_pose": link_pose,
                 "residual": hand.last_result.residual if hand.last_result else np.nan,
             }
         return {
@@ -345,6 +352,18 @@ class TeleopSession:
                         "url": f"/hand_assets/{model}",
                         "rotation": [float(np.sin(np.pi / 4)), 0.0, 0.0, float(np.cos(np.pi / 4))],
                     }
+            model = self._render_models.get(r.name)
+            if model is not None:
+                # Upstream prefab GLBs are Y-up exports of Z-up actor frames,
+                # like the hand GLBs: rotate +90 deg about X into the actor.
+                try:
+                    rel = model.relative_to((self.roots.assets / "prefabs").resolve())
+                    entry["render"] = {
+                        "url": f"/prefab_assets/{rel.as_posix()}",
+                        "rotation": [float(np.sin(np.pi / 4)), 0.0, 0.0, float(np.cos(np.pi / 4))],
+                    }
+                except ValueError:
+                    pass
             if r.mesh_kind in ("surface", "visual"):
                 view = r.actor.get_visual_mesh() if r.mesh_kind == "visual" else r.actor.get_surface_mesh()
                 coords = np.asarray(view.coordinates, np.float32)

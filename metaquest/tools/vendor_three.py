@@ -35,6 +35,7 @@ FILES = (
     "examples/jsm/loaders/GLTFLoader.js",
     "examples/jsm/utils/BufferGeometryUtils.js",
     "examples/jsm/environments/RoomEnvironment.js",
+    "examples/jsm/loaders/RGBELoader.js",
     "LICENSE",
 )
 DEST = Path(__file__).resolve().parents[1] / "superdex_quest_teleop" / "web" / "vendor" / "three"

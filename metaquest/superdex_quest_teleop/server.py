@@ -80,9 +80,14 @@ class ServerConfig:
     https_port: int = 8443
     https: bool = True
     cert_dir: Path = Path.home() / ".superdex_quest_teleop"
-    # Optional backdrop: a .glb/.gltf model or an equirectangular 360 photo
-    # (.jpg/.png) of a kitchen; default is the built-in procedural kitchen.
+    # Backdrop: an HDRI (.hdr), a 360 photo (.jpg/.png) or a model (.glb).
+    # None with environment_auto fetches a CC0 kitchen HDRI from Poly Haven
+    # in the background (cached); otherwise the procedural kitchen is used.
     environment: Path | None = None
+    environment_auto: bool = True
+    # Rigged display hands: a directory with left.glb / right.glb whose bones
+    # carry the 25 WebXR joint names (default: WebXR generic-hand).
+    hand_models: Path | None = None
     out_dir: Path = Path("recordings")
     scene: str = "box_and_blocks"
     contact_mode: str = "hand"
@@ -256,6 +261,7 @@ class PhysicsRunner(threading.Thread):
             min_contact_force=self.config.min_contact_force,
             keep_self_contacts=self.config.keep_self_contacts,
             hand_variant=self.config.hand_variant,
+            display_hand_models=self._display_models(),
         )
         self._synthetic = None
         if self.config.synthetic:
@@ -277,6 +283,12 @@ class PhysicsRunner(threading.Thread):
         log.info("loaded %s in %.1fs (%d actors)", spec.name, time.monotonic() - t0, len(session.actors))
         self.publish("geometry", self._geometry_message)
         self.publish("status", self.status())
+
+    def _display_models(self) -> dict[str, Path] | None:
+        folder = self.config.hand_models
+        if folder is None:
+            return None
+        return {side: folder / f"{side}.glb" for side in hs.SIDES if (folder / f"{side}.glb").exists()}
 
     def _reset(self) -> None:
         if self.session is not None:
@@ -338,12 +350,15 @@ class PhysicsRunner(threading.Thread):
         head_pose = data.get("head_pose")
         if head_pose is not None and np.all(np.isfinite(head_pose)):
             header["head"] = [round(float(v), 5) for v in head_pose]
+        sides = [side for side in hs.SIDES if side in data["hands"]]
+        header["hand_joints"] = sides
         head = json.dumps(header, separators=(",", ":")).encode()
         pad = (-(4 + len(head))) % 4
         payload = np.concatenate(
             [pose.reshape(-1)]
             + [v.reshape(-1) for v in verts]
             + [np.asarray(points, np.float32).reshape(-1), np.asarray(forces, np.float32).reshape(-1)]
+            + [np.asarray(data["hands"][side]["display_joints"], np.float32).reshape(-1) for side in sides]
         ).astype("<f4")
         return struct.pack("<I", len(head)) + head + b"\0" * pad + payload.tobytes()
 
@@ -411,6 +426,8 @@ class TeleopServer:
             "httpPort": self.config.http_port,
             "httpsPort": self.config.https_port if self.config.https else None,
             "environment": self._environment_info(),
+            "handModels": self._hand_model_urls(),
+            "ibl": "/ibl/studio_small_08_1k.hdr" if self._ibl_dir().exists() else None,
         }
         html = html.replace("{{THREE_BASE}}", base).replace("{{CLIENT_CONFIG}}", json.dumps(client))
         return web.Response(text=html, content_type="text/html",
@@ -420,8 +437,32 @@ class TeleopServer:
         env = self.config.environment
         if env is None:
             return None
-        kind = "model" if env.suffix.lower() in (".glb", ".gltf") else "panorama"
-        return {"url": f"/environment/{env.name}", "kind": kind}
+        suffix = env.suffix.lower()
+        kind = "model" if suffix in (".glb", ".gltf") else "hdr" if suffix == ".hdr" else "panorama"
+        return {"url": f"/environment/{env.name}", "kind": kind, "name": env.stem}
+
+    def _ibl_dir(self) -> Path:
+        return self.roots.repo / "superdex_studio" / "assets" / "ibl"
+
+    def _hand_model_urls(self) -> dict[str, str]:
+        if self.config.hand_models is not None:
+            return {side: f"/hand_models/{side}.glb" for side in hs.SIDES
+                    if (self.config.hand_models / f"{side}.glb").exists()}
+        return {side: f"/vendor/webxr-input-profiles/generic-hand/{side}.glb" for side in hs.SIDES}
+
+    def _fetch_environment(self) -> None:
+        """Background: download a CC0 kitchen HDRI, then tell the clients."""
+        from .environment import fetch_kitchen_hdri
+
+        try:
+            path = fetch_kitchen_hdri()
+        except Exception as exc:  # noqa: BLE001 - offline is fine
+            log.warning("no kitchen HDRI (%s); using the procedural kitchen. Fetch one later with "
+                        "`python -m superdex_quest_teleop.environment` or pass --environment", exc)
+            return
+        self.config.environment = path
+        log.info("environment: %s", path)
+        self._publish_threadsafe("status", {"type": "environment", "environment": self._environment_info()})
 
     async def _environment(self, request: web.Request) -> web.StreamResponse:
         env = self.config.environment
@@ -441,7 +482,8 @@ class TeleopServer:
         await ws.send_json(
             {"type": "hello", "scenes": self.runner.scene_list(),
              "out_dir": str(Path(self.config.out_dir).resolve()),
-             "synthetic": self.config.synthetic}
+             "synthetic": self.config.synthetic,
+             "environment": self._environment_info()}
         )
         geometry = self.runner.geometry_message()
         if geometry is not None:
@@ -491,14 +533,22 @@ class TeleopServer:
         app.router.add_static("/static/", WEB_DIR)
         if (WEB_DIR / "vendor").exists():
             app.router.add_static("/vendor/", WEB_DIR / "vendor")
-        # Render meshes of the Meta XR hand (read-only, hand assets only).
+        # Render meshes of the Meta XR hand and of the prefabs (read-only).
         hand_dir = self.roots.assets / "bots" / "hands" / "oculus_xr"
         if hand_dir.exists():
             app.router.add_static("/hand_assets/", hand_dir)
+        if (self.roots.assets / "prefabs").exists():
+            app.router.add_static("/prefab_assets/", self.roots.assets / "prefabs")
+        if self._ibl_dir().exists():
+            app.router.add_static("/ibl/", self._ibl_dir())
+        if self.config.hand_models is not None:
+            app.router.add_static("/hand_models/", self.config.hand_models)
 
         async def on_startup(app: web.Application) -> None:
             self.loop = asyncio.get_running_loop()
             self.runner.start()
+            if self.config.environment is None and self.config.environment_auto:
+                threading.Thread(target=self._fetch_environment, daemon=True).start()
 
         async def on_cleanup(app: web.Application) -> None:
             self.runner.submit({"cmd": "stop"})

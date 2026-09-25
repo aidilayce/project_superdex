@@ -37,7 +37,7 @@ def _decode(frame: bytes):
 
 def test_headset_protocol_and_recording(roots, tmp_path):
     async def scenario():
-        server = TeleopServer(ServerConfig(scene="cube", out_dir=tmp_path), roots)
+        server = TeleopServer(ServerConfig(scene="cube", out_dir=tmp_path, environment_auto=False), roots)
         async with TestClient(TestServer(server.make_app())) as client:
             index = await client.get("/")
             html = await index.text()
@@ -48,7 +48,12 @@ def test_headset_protocol_and_recording(roots, tmp_path):
             assert lan.status == 302 and lan.headers["Location"] == "https://192.168.1.20:8443/"
             for path in ("/static/app.js", "/static/kitchen.js", "/static/skin.js",
                          "/vendor/three/build/three.module.js",
-                         "/vendor/three/examples/jsm/loaders/GLTFLoader.js"):
+                         "/vendor/three/examples/jsm/loaders/GLTFLoader.js",
+                         "/vendor/three/examples/jsm/loaders/RGBELoader.js",
+                         "/static/hands.js",
+                         "/vendor/webxr-input-profiles/generic-hand/right.glb",
+                         "/ibl/studio_small_08_1k.hdr",
+                         "/prefab_assets/sphere/render/sphere.glb"):
                 assert (await client.get(path)).status == 200, path
             ws = await client.ws_connect("/ws")
             await ws.send_json({"type": "hello", "role": "headset"})
@@ -74,7 +79,8 @@ def test_headset_protocol_and_recording(roots, tmp_path):
                 if msg.type == WSMsgType.BINARY:
                     header, payload = _decode(msg.data)
                     expected = header["num_actors"] * 7 + 3 * sum(c for _, c in header["deformables"])
-                    assert len(payload) == expected + 6 * header["num_contacts"]
+                    assert header["hand_joints"] == ["left", "right"]
+                    assert len(payload) == expected + 6 * header["num_contacts"] + 2 * 25 * 7
                     frames += 1
                     if frames == 120:
                         assert header["tracked"]["right"] and not header["tracked"]["left"]

@@ -11,6 +11,8 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+import { SkinnedHand } from './hands.js';
 import { buildKitchen, makeIsland } from './kitchen.js';
 import { makeSkinMaterial } from './skin.js';
 
@@ -71,8 +73,20 @@ const background = new THREE.Color(0xb9c6d2);
 scene.background = background;
 const pmrem = new THREE.PMREMGenerator(renderer);
 scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.04).texture;
-scene.add(new THREE.HemisphereLight(0xfff6ea, 0x8a7a68, 0.45));
-const sun = new THREE.DirectionalLight(0xfff1dc, 1.1);
+let photoEnvironment = false;
+// Image-based lighting from SuperDex Studio's own HDR (Poly Haven, CC0),
+// replaced by the kitchen HDRI's light once that loads.
+if (CONFIG.ibl) {
+  new RGBELoader().load(CONFIG.ibl, (hdr) => {
+    if (photoEnvironment) return;
+    hdr.mapping = THREE.EquirectangularReflectionMapping;
+    scene.environment = pmrem.fromEquirectangular(hdr).texture;
+    hdr.dispose();
+  });
+}
+const hemi = new THREE.HemisphereLight(0xfff6ea, 0x8a7a68, 0.35);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xfff1dc, 0.9);
 sun.position.set(-1.0, 2.6, -1.2);
 scene.add(sun);
 
@@ -80,6 +94,15 @@ const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerH
 camera.position.set(0, 1.55, 0.85);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, DESKTOP_TABLE_HEIGHT, -0.05);
+// ?cam=px,py,pz,tx,ty,tz: start the desktop view at a given camera/target.
+const camParam = new URLSearchParams(location.search).get('cam');
+if (camParam) {
+  const v = camParam.split(',').map(Number);
+  if (v.length === 6 && v.every(Number.isFinite)) {
+    camera.position.set(v[0], v[1], v[2]);
+    controls.target.set(v[3], v[4], v[5]);
+  }
+}
 controls.update();
 
 // Physics frame (Y-up, meters, table top at y = 0). Its placement in the room
@@ -108,28 +131,47 @@ function setAnchor(m) {
 }
 setAnchor(new THREE.Matrix4().makeTranslation(0, DESKTOP_TABLE_HEIGHT, 0));
 
-// Optional user-supplied backdrop (e.g. a scan or a 360 photo of a kitchen).
-if (CONFIG.environment) {
-  const env = CONFIG.environment;
-  if (env.kind === 'panorama') {
+// Backdrop: a photographed kitchen (HDRI, auto-fetched from Poly Haven by
+// the PC), a 360 photo or a model of the user's own kitchen. The HDRI also
+// lights the scene, so objects and hands match the room they appear in.
+let environmentDome = null;
+function applyEnvironment(env) {
+  if (!env || (environmentDome && environmentDome.userData.url === env.url)) return;
+  const place = (object) => {
+    if (environmentDome) kitchen.group.remove(environmentDome);
+    environmentDome = object;
+    environmentDome.userData.url = env.url;
+    kitchen.room.visible = false;
+    kitchen.group.add(object);
+    flash(`environment: ${env.name || env.url}`);
+  };
+  const dome = (texture) => {
+    const sphere = new THREE.SphereGeometry(25, 64, 32);
+    sphere.scale(-1, 1, 1);  // faces inward, image not mirrored
+    const mesh = new THREE.Mesh(sphere, new THREE.MeshBasicMaterial({ map: texture }));
+    mesh.position.y = 1.5;   // roughly the camera height of room HDRIs
+    return mesh;
+  };
+  const fail = () => banner(`Could not load the environment ${env.url}.`);
+  if (env.kind === 'hdr') {
+    new RGBELoader().load(env.url, (hdr) => {
+      hdr.mapping = THREE.EquirectangularReflectionMapping;
+      scene.environment = pmrem.fromEquirectangular(hdr).texture;
+      photoEnvironment = true;
+      hemi.intensity = 0.1;
+      sun.intensity = 0.35;
+      place(dome(hdr));
+    }, undefined, fail);
+  } else if (env.kind === 'panorama') {
     new THREE.TextureLoader().load(env.url, (texture) => {
       texture.colorSpace = THREE.SRGBColorSpace;
-      const sphere = new THREE.SphereGeometry(20, 64, 32);
-      sphere.scale(-1, 1, 1);  // faces inward, image not mirrored
-      const dome = new THREE.Mesh(sphere, new THREE.MeshBasicMaterial({ map: texture, toneMapped: false }));
-      dome.position.y = 1.6;
-      kitchen.room.visible = false;
-      kitchen.group.add(dome);
-      flash(`environment: ${env.url}`);
-    }, undefined, () => banner(`Could not load the environment panorama ${env.url}.`));
+      place(dome(texture));
+    }, undefined, fail);
   } else {
-    new GLTFLoader().load(env.url, (gltf) => {
-      kitchen.room.visible = false;
-      kitchen.group.add(gltf.scene);
-      flash(`environment: ${env.url}`);
-    }, undefined, () => banner(`Could not load the environment model ${env.url}.`));
+    new GLTFLoader().load(env.url, (gltf) => place(gltf.scene), undefined, fail);
   }
 }
+applyEnvironment(CONFIG.environment);
 
 const actorRoot = new THREE.Group();
 workspace.add(actorRoot);
@@ -172,6 +214,38 @@ let statusInfo = { recording: false };
 const skin = makeSkinMaterial();
 const gltfLoader = new GLTFLoader();
 const renderMeshCache = new Map();  // url -> Promise<BufferGeometry>
+
+const renderSceneCache = new Map();  // url -> Promise<Object3D>
+function loadRenderScene(url) {
+  if (!renderSceneCache.has(url)) {
+    renderSceneCache.set(url, new Promise((resolve, reject) => {
+      gltfLoader.load(url, (gltf) => resolve(gltf.scene), undefined, reject);
+    }));
+  }
+  return renderSceneCache.get(url).then((s) => s.clone(true));
+}
+
+// Continuous skinned hands posed from the simulated Meta XR hands.
+const HAND_MODELS = CONFIG.handModels || {
+  left: '/vendor/webxr-input-profiles/generic-hand/left.glb',
+  right: '/vendor/webxr-input-profiles/generic-hand/right.glb',
+};
+const skinnedHands = {};
+for (const side of ['left', 'right']) {
+  if (!HAND_MODELS[side]) continue;
+  const hand = new SkinnedHand(HAND_MODELS[side]);
+  skinnedHands[side] = hand;
+  workspace.add(hand.group);
+  hand.ready.catch((err) => banner(`Could not load the ${side} hand model: ${err.message || err}`));
+}
+let handView = 'skin';  // 'skin': skinned hands; 'robot': Meta XR link meshes
+function setHandView(view) {
+  handView = view;
+  for (const a of actors) if (a && a.hand && a.object) a.object.visible = view === 'robot';
+  for (const h of Object.values(skinnedHands)) h.group.visible = view === 'skin' && !!h.bones;
+  const b = document.getElementById('handview');
+  if (b) b.textContent = view === 'skin' ? 'Hands: skin' : 'Hands: robot';
+}
 
 function loadRenderGeometry(url) {
   if (!renderMeshCache.has(url)) {
@@ -222,8 +296,8 @@ function buildGeometry(msg) {
   document.getElementById('desc').textContent = msg.scene.description || '';
   document.getElementById('scene').value = msg.scene.id;
   for (const a of msg.actors) {
-    const entry = { object: null, deformable: a.deformable };
     const hand = a.hand !== '';
+    const entry = { object: null, deformable: a.deformable, hand };
     if (a.mesh === 'surface' || a.mesh === 'visual') {
       const g = new THREE.BufferGeometry();
       g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(a.positions), 3));
@@ -248,6 +322,16 @@ function buildGeometry(msg) {
         actorRoot.add(holder);
         entry.object = holder;
         if (hand && /bone_00_wrist_root$/.test(a.name)) holder.add(makeForearm(a.hand));
+        if (!hand && a.render) {
+          // Upstream textured PBR model of this prefab actor.
+          loadRenderScene(a.render.url).then((model) => {
+            model.quaternion.fromArray(a.render.rotation);
+            model.traverse((o) => { if (o.isMesh) o.frustumCulled = false; });
+            holder.remove(mesh);
+            holder.add(model);
+          }).catch(() => {});
+        }
+        if (hand) holder.visible = handView === 'robot';
         if (hand && a.render) {
           // Swap the coarse collision mesh for the smooth render mesh.
           loadRenderGeometry(a.render.url).then((geometry) => {
@@ -295,6 +379,12 @@ function applyFrame(buffer) {
   const points = f.subarray(k, k + 3 * n);
   const forces = f.subarray(k + 3 * header.num_contacts, k + 3 * header.num_contacts + 3 * n);
   updateContacts(points, forces, n);
+  k += 6 * header.num_contacts;
+  for (const side of header.hand_joints || []) {
+    const hand = skinnedHands[side];
+    if (hand && handView === 'skin') hand.setJoints(f.subarray(k, k + 175));
+    k += 175;
+  }
 }
 
 const _m = new THREE.Matrix4();
@@ -346,6 +436,9 @@ function connect() {
         sel.appendChild(o);
       }
       if (currentScene) sel.value = currentScene.id;
+      applyEnvironment(msg.environment);
+    } else if (msg.type === 'environment') {
+      applyEnvironment(msg.environment);
     } else if (msg.type === 'geometry') {
       buildGeometry(msg);
     } else if (msg.type === 'status') {
@@ -406,12 +499,14 @@ document.getElementById('scene').onchange = (e) => command('load_scene', { scene
 document.getElementById('reset').onclick = () => command('reset');
 document.getElementById('rec').onclick = () => command('record_toggle');
 document.getElementById('camview').onclick = () => setCamView(!camView);
+document.getElementById('handview').onclick = () => setHandView(handView === 'skin' ? 'robot' : 'skin');
 window.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'SELECT') return;
   if (e.code === 'Space') { command('record_toggle'); e.preventDefault(); }
   if (e.key === 'r') command('reset');
   if (e.key === 'c') showContacts = !showContacts;
   if (e.key === 'v') setCamView(!camView);
+  if (e.key === 'h') setHandView(handView === 'skin' ? 'robot' : 'skin');
   if (e.key === 'n') command('next_scene');
   if (e.key === 'p') command('prev_scene');
 });
@@ -557,6 +652,7 @@ makeButton('Contacts', 0.047, -0.05, () => { showContacts = !showContacts; });
 makeButton('Table ▲', -0.047, -0.10, () => { tableOffset += 0.03; anchor.elements[13] += 0.03; setAnchor(anchor); });
 makeButton('Table ▼', 0.047, -0.10, () => { tableOffset -= 0.03; anchor.elements[13] -= 0.03; setAnchor(anchor); });
 makeButton('Ghost', -0.047, -0.15, () => { showGhost = !showGhost; });
+makeButton('Hands', -0.047, -0.20, () => setHandView(handView === 'skin' ? 'robot' : 'skin'));
 makeButton('Exit VR', 0.047, -0.15, () => { if (xrSession) xrSession.end(); });
 const infoCanvas = document.createElement('canvas');
 infoCanvas.width = 512; infoCanvas.height = 200;
@@ -692,7 +788,7 @@ renderer.setAnimationLoop((time, frame) => {
   const tracked = h ? Object.entries(h.tracked).map(([s, t]) => `${s}:${t ? 'tracked' : '—'}`).join(' ') : '';
   document.getElementById('status').textContent =
     `${lines.slice(0, 3).join('   ')}   hands ${tracked}${h && h.head ? '   headset connected' : ''}\n` +
-    (now < flashUntil ? flashText : 'Space: record  R: reset  V: cam view  N/P: next/prev scene  C: contacts');
+    (now < flashUntil ? flashText : 'Space: record  R: reset  V: cam view  H: hand view  N/P: next/prev scene  C: contacts');
   renderer.render(scene, camera);
 });
 

@@ -32,6 +32,7 @@ import superdex.physics as physics
 import superdex.robotics as robotics
 
 from . import hand_skeleton as hs
+from .hand_display import HandDisplayRig
 from .hand_model import BotKinematics, matrix_to_quat
 from .retarget import MetaXrHandRetargeter, RetargetConfig, RetargetResult
 from .scenes import AssetRoots
@@ -84,6 +85,7 @@ class HandUnit:
         spawn: tuple[float, float, float],
         variant: str = "lowpoly",
         retarget_config: RetargetConfig | None = None,
+        display_model: Path | None = None,
     ) -> None:
         self.side = side
         self.scene = scene
@@ -95,6 +97,8 @@ class HandUnit:
             link.contact.coulomb_friction_coefficient = HAND_FRICTION
         self.kinematics = BotKinematics(prefab)
         self.retargeter = MetaXrHandRetargeter(self.kinematics, side, retarget_config)
+        # 25 WebXR-convention joint poses for the skinned display hand.
+        self.display = HandDisplayRig(self.retargeter, display_model)
 
         # Neutral spawn: palm down, fingers pointing away from the operator.
         world_from_root = np.eye(4)

@@ -93,11 +93,10 @@ releases the object, which exercises the whole pipeline.
 
 When the session starts, the virtual table (the physics origin) is placed
 0.42 m in front of your eyes and 0.5 m below them, facing where you look. It
-is drawn as the butcher-block top of an island in a kitchen. Your real hands
-appear as small blue joint spheres ("ghost"). The simulated Meta XR hands
-(skin-textured, with forearms) follow them physically. They stop at objects
-instead of passing through, so what you see matches the forces being
-recorded.
+is drawn as a butcher-block kitchen island. Your real hands appear as small
+blue joint spheres ("ghost"). The simulated Meta XR hands follow them
+physically: they stop at objects instead of passing through, so what you see
+matches the forces being recorded.
 
 A button panel floats to the left of the table. Poke a button with an index
 fingertip:
@@ -111,6 +110,7 @@ fingertip:
 | Table ▲ / ▼ | Raise or lower the table by 3 cm |
 | Contacts | Show or hide contact points and force vectors |
 | Ghost | Show or hide your tracked joints |
+| Hands | Switch between skinned hands and the Meta XR robot-hand meshes |
 | Exit VR | Leave the immersive session |
 
 The panel also shows the scene, the simulation's real-time factor, the
@@ -122,26 +122,57 @@ view looks through the operator's eyes: it follows the headset live while one
 is connected; otherwise it shows the default operator viewpoint. Dragging the
 view returns to orbiting.
 
-Keys: `Space` records, `R` resets, `V` toggles Cam view, `N`/`P` changes
-scene, `C` toggles contacts.
+Keys: `Space` records, `R` resets, `V` toggles Cam view, `H` switches the
+hand view, `N`/`P` changes scene, `C` toggles contacts.
 
-### Environment
+### Look: scenes, lighting and hands
 
-By default, the scene is a procedural kitchen: counters with a sink and a
-cooktop, cabinets, a tiled backsplash, a window, a fridge, shelves and pendant
-lights. The physics table is the kitchen island. Passthrough mode hides the
-kitchen so you see your real room.
+**Where realism comes from.** The realistic videos in the SuperDex README were
+rendered in Unreal Engine 5 with *SuperDex Teleop*, which is not released yet
+(announced for Q4 2026); the public repository ships no Unreal scenes. This
+client uses everything the repository does ship, plus CC0/MIT assets:
 
-To use your own kitchen instead, pass either of these to `--environment`:
+* **Objects:** every prefab is drawn with its upstream textured PBR render
+  model (`assets/prefabs/*/render/*.glb`: the wooden box and blocks,
+  pegboards, printed paper cups, shape sorter, chain, sphere). The physics
+  still uses the collision meshes.
+* **Lighting:** image-based lighting from SuperDex Studio's HDR
+  (`superdex_studio/assets/ibl/studio_small_08_1k.hdr`, Poly Haven, CC0).
+* **Kitchen:** with the default `--environment auto`, the PC downloads a CC0
+  kitchen HDRI from [Poly Haven](https://polyhaven.com/hdris/indoor) once
+  (cached in `~/.superdex_quest_teleop/environments`). It becomes both the
+  photographic 360° backdrop and the light that falls on the objects and
+  hands. Until it's available (or offline), a procedural kitchen is shown.
+  Pick a different HDRI with
+  `python -m superdex_quest_teleop.environment --list` and `--id <asset>`
+  (add `--resolution 4k` for a sharper backdrop).
+* **Your own kitchen:** pass `--environment` a 360° photo of your kitchen
+  (`.jpg`/`.png`, taken from where you stand), an `.hdr`, or a `.glb`/`.gltf`
+  model (origin on the floor under the table center, -Z facing away from you).
+  On Quest 3, **Enter passthrough** shows your real room.
+* **Hands:** each hand is one continuous skinned mesh (the WebXR
+  `generic-hand` model, MIT). Every frame the PC turns the *simulated* Meta
+  XR hand's link poses into the 25 WebXR joint poses the mesh is rigged to,
+  so the skin shows exactly where physics put the fingers. The skin has a
+  UV-mapped albedo, a normal map with pores and creases, a subtle sheen and
+  fingernails. The forearm fades out toward the elbow. Press **H** (or poke
+  *Hands*) to see the Meta XR robot-hand meshes that actually collide.
 
-* an equirectangular 360° photo (`.jpg` or `.png`, for example from a phone's
-  panorama mode or a 360 camera), taken from where you stand;
-* a `.glb` or `.gltf` model, whose origin is placed on the floor under the
-  table center with -Z facing away from you.
+**BEDLAM-style hands.** BEDLAM renders SMPL-X bodies with scanned skin
+textures in Unreal. Those textures are licensed for registered,
+non-commercial research use, so they are not bundled here. You can use them
+(or any textured hand) with `--hand-models DIR`, where `DIR` holds `left.glb`
+and `right.glb`:
 
-```bash
-uv run --no-project python -m superdex_quest_teleop --environment ~/my_kitchen_360.jpg
-```
+1. Rig the hand mesh with 25 bones named like the WebXR joints (`wrist`,
+   `thumb-metacarpal`, …, `pinky-finger-tip`). Orient each bone -Z along the
+   bone toward the fingertip, +Y on the back of the hand. In Blender you can
+   start from `web/vendor/webxr-input-profiles/generic-hand/*.glb` and
+   transfer weights to your mesh.
+2. Bake or assign the albedo, normal and roughness textures (for example a
+   BEDLAM/SMPL-X skin texture) to its UVs, and export as glTF binary.
+
+Models that bring their own textures are shown with their own materials.
 
 ### Troubleshooting
 
@@ -167,7 +198,8 @@ uv run --no-project python -m superdex_quest_teleop --environment ~/my_kitchen_3
 | `--synthetic` | off | Scripted right hand instead of the headset |
 | `--http-port N` / `--https-port N` | `8080` / `8443` | Listening ports |
 | `--no-https` | off | Serve plain HTTP only |
-| `--environment FILE` | built-in kitchen | 360° photo or `.glb` model shown around the table |
+| `--environment auto\|procedural\|FILE` | `auto` | `auto`: CC0 kitchen HDRI from Poly Haven. `procedural`: the built-in kitchen. `FILE`: your `.hdr`, 360° photo or `.glb` |
+| `--hand-models DIR` | WebXR generic hand | Rigged, textured `left.glb`/`right.glb` (e.g. BEDLAM-style hands) |
 | `--threads N` | `-1` | SuperDex worker threads |
 
 ## Scenes
