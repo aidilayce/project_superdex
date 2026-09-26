@@ -124,8 +124,17 @@ class RetargetResult:
 
     qpos: np.ndarray  # (num_dofs,) bot DoFs
     world_from_root: np.ndarray  # 4x4 wrist target
-    world_from_links: list[np.ndarray]  # 4x4 per link, FK-consistent
     residual: float  # RMS target error [m]
+    kinematics: BotKinematics | None = None
+
+    @property
+    def world_from_links(self) -> list[np.ndarray]:
+        """4x4 per link, FK-consistent (computed on first use)."""
+        cached = self.__dict__.get("_links")
+        if cached is None:
+            links, _ = self.kinematics.forward(self.qpos)
+            cached = self.__dict__["_links"] = [self.world_from_root @ link for link in links]
+        return cached
 
 
 class MetaXrHandRetargeter:
@@ -277,6 +286,7 @@ class MetaXrHandRetargeter:
         residual = 0.0
         for _ in range(iterations):
             pts, jac, _ = k.points_and_jacobians(q, self._point_links, self._point_offsets)
+            residual = float(np.sqrt(np.mean(np.sum((pts - targets) ** 2, axis=1))))
             r = ((pts - targets) * w).reshape(-1)
             J = (jac * w[:, :, None]).reshape(-1, k.num_dofs)
             rows_r = [r]
@@ -294,8 +304,8 @@ class MetaXrHandRetargeter:
             H = J_all.T @ J_all + cfg.damping * np.eye(k.num_dofs)
             g = J_all.T @ r_all
             q = np.clip(q - np.linalg.solve(H, g), k.lower, k.upper)
-        pts, _, _ = k.points_and_jacobians(q, self._point_links, self._point_offsets)
-        residual = float(np.sqrt(np.mean(np.sum((pts - targets) ** 2, axis=1))))
+        # The residual is the one before the last update (an upper bound;
+        # re-evaluating it would cost another forward pass per frame).
         self._q_prev = q
         return q, residual
 
@@ -316,13 +326,11 @@ class MetaXrHandRetargeter:
             self._q_filtered = q.copy()
         else:
             self._q_filtered += self.config.output_alpha * (q - self._q_filtered)
-        links, _ = self.kin.forward(self._q_filtered)
-        world_links = [world_from_root @ link for link in links]
         return RetargetResult(
             qpos=self._q_filtered.copy(),
             world_from_root=world_from_root,
-            world_from_links=world_links,
             residual=residual,
+            kinematics=self.kin,
         )
 
     def synthesize_skeleton(

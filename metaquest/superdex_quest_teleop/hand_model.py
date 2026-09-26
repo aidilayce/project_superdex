@@ -68,6 +68,50 @@ def matrix_to_quat(m: np.ndarray) -> np.ndarray:
     return -q if q[3] < 0.0 else q
 
 
+def quats_to_matrices(q: np.ndarray) -> np.ndarray:
+    """Vectorized :func:`quat_to_matrix` for (N, 4) [x, y, z, w] quaternions."""
+    q = np.asarray(q, dtype=np.float64)
+    x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    n = np.einsum("ni,ni->n", q, q)
+    s = np.where(n < 1e-12, 0.0, 2.0 / np.where(n < 1e-12, 1.0, n))
+    m = np.empty((len(q), 3, 3))
+    m[:, 0, 0] = 1 - s * (y * y + z * z)
+    m[:, 0, 1] = s * (x * y - z * w)
+    m[:, 0, 2] = s * (x * z + y * w)
+    m[:, 1, 0] = s * (x * y + z * w)
+    m[:, 1, 1] = 1 - s * (x * x + z * z)
+    m[:, 1, 2] = s * (y * z - x * w)
+    m[:, 2, 0] = s * (x * z - y * w)
+    m[:, 2, 1] = s * (y * z + x * w)
+    m[:, 2, 2] = 1 - s * (x * x + y * y)
+    return m
+
+
+def matrices_to_quats(m: np.ndarray) -> np.ndarray:
+    """Vectorized :func:`matrix_to_quat` for (N, 3, 3) rotations."""
+    m = np.asarray(m, dtype=np.float64)
+    m00, m11, m22 = m[:, 0, 0], m[:, 1, 1], m[:, 2, 2]
+    trace = m00 + m11 + m22
+    # The four branches of matrix_to_quat, each with its own pivot.
+    cands = np.empty((4, len(m), 4))
+    s = np.sqrt(np.maximum(trace + 1.0, 1e-12)) * 2.0
+    cands[0] = np.stack([(m[:, 2, 1] - m[:, 1, 2]) / s, (m[:, 0, 2] - m[:, 2, 0]) / s,
+                         (m[:, 1, 0] - m[:, 0, 1]) / s, 0.25 * s], -1)
+    s = np.sqrt(np.maximum(1.0 + m00 - m11 - m22, 1e-12)) * 2.0
+    cands[1] = np.stack([0.25 * s, (m[:, 0, 1] + m[:, 1, 0]) / s, (m[:, 0, 2] + m[:, 2, 0]) / s,
+                         (m[:, 2, 1] - m[:, 1, 2]) / s], -1)
+    s = np.sqrt(np.maximum(1.0 + m11 - m00 - m22, 1e-12)) * 2.0
+    cands[2] = np.stack([(m[:, 0, 1] + m[:, 1, 0]) / s, 0.25 * s, (m[:, 1, 2] + m[:, 2, 1]) / s,
+                         (m[:, 0, 2] - m[:, 2, 0]) / s], -1)
+    s = np.sqrt(np.maximum(1.0 + m22 - m00 - m11, 1e-12)) * 2.0
+    cands[3] = np.stack([(m[:, 0, 2] + m[:, 2, 0]) / s, (m[:, 1, 2] + m[:, 2, 1]) / s, 0.25 * s,
+                         (m[:, 1, 0] - m[:, 0, 1]) / s], -1)
+    branch = np.where(trace > 0.0, 0, np.where((m00 > m11) & (m00 > m22), 1, np.where(m11 > m22, 2, 3)))
+    q = cands[branch, np.arange(len(m))]
+    q /= np.linalg.norm(q, axis=1, keepdims=True)
+    return np.where(q[:, 3:4] < 0.0, -q, q)
+
+
 def _skew(v: np.ndarray) -> np.ndarray:
     return np.array([[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]])
 
@@ -87,6 +131,33 @@ def rotvec_to_matrix(r: np.ndarray) -> np.ndarray:
             [t * x * z - s * y, t * y * z + s * x, c + t * z * z],
         ]
     )
+
+
+def _rotvecs_to_matrices(r: np.ndarray) -> np.ndarray:
+    """Vectorized :func:`rotvec_to_matrix` for (N, 3) rotation vectors."""
+    theta = np.linalg.norm(r, axis=1)
+    small = theta < 1e-9
+    safe = np.where(small, 1.0, theta)
+    k = r / safe[:, None]
+    s, c = np.sin(theta), np.cos(theta)
+    t = 1.0 - c
+    x, y, z = k[:, 0], k[:, 1], k[:, 2]
+    m = np.empty((len(r), 3, 3))
+    m[:, 0, 0] = c + t * x * x
+    m[:, 0, 1] = t * x * y - s * z
+    m[:, 0, 2] = t * x * z + s * y
+    m[:, 1, 0] = t * x * y + s * z
+    m[:, 1, 1] = c + t * y * y
+    m[:, 1, 2] = t * y * z - s * x
+    m[:, 2, 0] = t * x * z - s * y
+    m[:, 2, 1] = t * y * z + s * x
+    m[:, 2, 2] = c + t * z * z
+    if np.any(small):
+        rx, ry, rz = r[small, 0], r[small, 1], r[small, 2]
+        one = np.ones_like(rx)
+        m[small] = np.stack([np.stack([one, -rz, ry], -1), np.stack([rz, one, -rx], -1),
+                             np.stack([-ry, rx, one], -1)], 1)
+    return m
 
 
 def rotvec_from_matrix(m: np.ndarray) -> np.ndarray:
@@ -113,6 +184,21 @@ def right_jacobian_so3(r: np.ndarray) -> np.ndarray:
     return np.eye(3) - a * k + b * (k @ k)
 
 
+def _right_jacobians_so3(r: np.ndarray) -> np.ndarray:
+    """Vectorized :func:`right_jacobian_so3` for (N, 3) rotation vectors."""
+    theta2 = np.einsum("ni,ni->n", r, r)
+    small = theta2 < 1e-10
+    theta = np.sqrt(np.where(small, 1.0, theta2))
+    t2 = np.where(small, 1.0, theta2)
+    a = np.where(small, 0.5 - theta2 / 24.0, (1.0 - np.cos(theta)) / t2)
+    b = np.where(small, 1.0 / 6.0 - theta2 / 120.0, (theta - np.sin(theta)) / (t2 * theta))
+    k = np.zeros((len(r), 3, 3))
+    k[:, 0, 1], k[:, 0, 2] = -r[:, 2], r[:, 1]
+    k[:, 1, 0], k[:, 1, 2] = r[:, 2], -r[:, 0]
+    k[:, 2, 0], k[:, 2, 1] = -r[:, 1], r[:, 0]
+    return np.eye(3) - a[:, None, None] * k + b[:, None, None] * (k @ k)
+
+
 def transform_to_matrix(t) -> np.ndarray:
     """superdex.physics.TransformRT (or None) to a 4x4 matrix."""
     m = np.eye(4)
@@ -124,6 +210,7 @@ def transform_to_matrix(t) -> np.ndarray:
 
 
 REVOLUTE, SPHERICAL, FIXED = 1, 3, 0
+_EYE4 = np.eye(4)
 
 
 @dataclass
@@ -192,6 +279,27 @@ class BotKinematics:
         self.lower = np.asarray(lower)
         self.upper = np.asarray(upper)
         self._index = {name: i for i, name in enumerate(self.link_names)}
+        self._prepare_batched()
+
+    def _prepare_batched(self) -> None:
+        """Arrays for the vectorized forward pass: joint rotation sources and
+        links grouped by tree depth (parents before children)."""
+        self._parent_from_joint_arr = np.stack(self._parent_from_joint)
+        self._joint_from_link_arr = np.stack(self._joint_from_link)
+        self._parents_arr = np.asarray(self.parents)
+        rev = [i for i, j in enumerate(self._joints) if j.kind == REVOLUTE and self.parents[i] >= 0]
+        sph = [i for i, j in enumerate(self._joints) if j.kind == SPHERICAL and self.parents[i] >= 0]
+        self._rev_links = np.asarray(rev, dtype=np.int64)
+        self._rev_dofs = np.asarray([self._joints[i].dof for i in rev], dtype=np.int64)
+        self._rev_axes = np.asarray([self._joints[i].axis for i in rev]).reshape(-1, 3)
+        self._sph_links = np.asarray(sph, dtype=np.int64)
+        self._sph_dofs = np.asarray([np.arange(self._joints[i].dof, self._joints[i].dof + 3) for i in sph],
+                                    dtype=np.int64).reshape(-1, 3)
+        depth = []
+        for i, parent in enumerate(self.parents):
+            depth.append(0 if parent < 0 else depth[parent] + 1)
+        self._levels = [np.asarray([i for i, d in enumerate(depth) if d == level], dtype=np.int64)
+                        for level in range(max(depth) + 1)]
 
     def link_index(self, name: str) -> int:
         return self._index[name]
@@ -204,28 +312,29 @@ class BotKinematics:
             each joint frame after its own rotation, which is where Jacobian
             axes are expressed.
         """
-        links: list[np.ndarray] = [np.eye(4)] * self.num_links
-        after: list[np.ndarray] = [np.eye(4)] * self.num_links
-        for i in range(self.num_links):
-            parent = self.parents[i]
-            base = self._parent_from_joint[i] if parent < 0 else (
-                links[parent] @ self._parent_from_joint[i]
-            )
-            joint = self._joints[i]
-            if joint.kind == REVOLUTE:
-                rot = np.eye(4)
-                rot[:3, :3] = rotvec_to_matrix(joint.axis * q[joint.dof])
-                base = base @ rot
-            elif joint.kind == SPHERICAL:
-                rot = np.eye(4)
-                rot[:3, :3] = rotvec_to_matrix(q[joint.dof:joint.dof + 3])
-                base = base @ rot
-            if parent < 0:
-                # The root link sits at the root frame (free joint at zero).
-                base = np.eye(4)
-            after[i] = base
-            links[i] = base @ self._joint_from_link[i]
-        return links, after
+        links, after = self._forward_arrays(q)
+        return list(links), list(after)
+
+    def _forward_arrays(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """:meth:`forward` as (num_links, 4, 4) arrays."""
+        q = np.asarray(q, dtype=np.float64)
+        # All joint rotations at once (Rodrigues), then the tree level by level.
+        rotvec = np.zeros((self.num_links, 3))
+        if len(self._rev_links):
+            rotvec[self._rev_links] = self._rev_axes * q[self._rev_dofs, None]
+        if len(self._sph_links):
+            rotvec[self._sph_links] = q[self._sph_dofs]
+        local = self._parent_from_joint_arr.copy()
+        local[:, :3, :3] = local[:, :3, :3] @ _rotvecs_to_matrices(rotvec)
+        after_arr = np.empty((self.num_links, 4, 4))
+        links_arr = np.empty((self.num_links, 4, 4))
+        roots = self._levels[0]
+        after_arr[roots] = _EYE4  # the root link sits at the root frame (free joint at zero)
+        links_arr[roots] = self._joint_from_link_arr[roots]
+        for level in self._levels[1:]:
+            after_arr[level] = links_arr[self._parents_arr[level]] @ local[level]
+            links_arr[level] = after_arr[level] @ self._joint_from_link_arr[level]
+        return links_arr, after_arr
 
     def points_and_jacobians(
         self,
@@ -235,21 +344,24 @@ class BotKinematics:
     ) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
         """Root-frame positions (P, 3) and Jacobians (P, 3, num_dofs) of
         points rigidly attached to links (``point_offsets`` in link frames)."""
-        links, after = self.forward(q)
-        rot = np.stack([links[i][:3, :3] for i in point_links])
-        trans = np.stack([links[i][:3, 3] for i in point_links])
-        positions = np.einsum("pij,pj->pi", rot, point_offsets) + trans
+        q = np.asarray(q, dtype=np.float64)
+        links_arr, after = self._forward_arrays(q)
+        sel = links_arr[np.asarray(point_links)]
+        positions = np.einsum("pij,pj->pi", sel[:, :3, :3], point_offsets) + sel[:, :3, 3]
         # One world-frame rotation axis and pivot per DoF.
         axes = np.zeros((self.num_dofs, 3))
         pivots = np.zeros((self.num_dofs, 3))
-        for i, joint in enumerate(self._joints):
-            if joint.kind == REVOLUTE:
-                axes[joint.dof] = after[i][:3, :3] @ joint.axis
-                pivots[joint.dof] = after[i][:3, 3]
-            elif joint.kind == SPHERICAL:
-                jr = right_jacobian_so3(q[joint.dof:joint.dof + 3])
-                axes[joint.dof:joint.dof + 3] = (after[i][:3, :3] @ jr).T
-                pivots[joint.dof:joint.dof + 3] = after[i][:3, 3]
+        if len(self._rev_links):
+            a = after[self._rev_links]
+            axes[self._rev_dofs] = np.einsum("nij,nj->ni", a[:, :3, :3], self._rev_axes)
+            pivots[self._rev_dofs] = a[:, :3, 3]
+        if len(self._sph_links):
+            a = after[self._sph_links]
+            jr = _right_jacobians_so3(q[self._sph_dofs])
+            # Columns of R @ Jr are the axes of the three DoFs.
+            axes[self._sph_dofs] = np.transpose(a[:, :3, :3] @ jr, (0, 2, 1))
+            pivots[self._sph_dofs] = a[:, None, :3, 3]
+        links = list(links_arr)
         mask = self._ancestor_mask(tuple(point_links))
         jac = np.cross(axes[None, :, :], positions[:, None, :] - pivots[None, :, :])
         jac *= mask[:, :, None]

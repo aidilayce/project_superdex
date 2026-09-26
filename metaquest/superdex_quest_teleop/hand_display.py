@@ -36,7 +36,7 @@ from pathlib import Path
 import numpy as np
 
 from . import hand_skeleton as hs
-from .hand_model import matrix_to_quat, quat_to_matrix
+from .hand_model import matrices_to_quats, quats_to_matrices
 from .retarget import MetaXrHandRetargeter
 
 GENERIC_HAND_DIR = Path(__file__).resolve().parent / "web" / "vendor" / "webxr-input-profiles" / "generic-hand"
@@ -132,7 +132,7 @@ class HandDisplayRig:
 
     def joints(self, link_poses: np.ndarray) -> np.ndarray:
         """(25, 7) joint poses [px py pz qx qy qz qw] from (L, 7) link poses."""
-        rot = np.array([quat_to_matrix(q) for q in link_poses[:, 3:]])
+        rot = quats_to_matrices(link_poses[:, 3:])
         r = rot[self.link]
         pos = np.einsum("jab,jb->ja", r, self.local_pos) + link_poses[self.link, :3]
         # -Z toward the next joint (tips continue the last bone).
@@ -144,6 +144,5 @@ class HandDisplayRig:
         x = np.cross(y, z)
         out = np.zeros((hs.NUM_JOINTS, 7))
         out[:, :3] = pos
-        for j in range(hs.NUM_JOINTS):
-            out[j, 3:] = matrix_to_quat(np.stack([x[j], y[j], z[j]], axis=1))
+        out[:, 3:] = matrices_to_quats(np.stack([x, y, z], axis=2))
         return out

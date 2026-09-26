@@ -116,13 +116,20 @@ def _world_bounds(actors: list[physics.Actor]) -> tuple[np.ndarray, np.ndarray]:
     lo = np.full(3, np.inf)
     hi = np.full(3, -np.inf)
     for actor in actors:
-        box = actor.get_aabb_world()
+        try:
+            box = actor.get_aabb_world()
+        except Exception:  # noqa: BLE001 - actors without collision (e.g. joint-only links)
+            continue
         lo = np.minimum(lo, list(box.min))
         hi = np.maximum(hi, list(box.max))
     return lo, hi
 
 
 _PREFAB_ROTATION = physics.Quaternion.rotation_x(-math.pi / 2)
+
+# Soft rubber and silicone on skin: fingertip friction about 1.0 (objects.py
+# MATERIALS); with the hands' 1.0 the pair coefficient is sqrt(1.0 * 1.0).
+SILICONE_FRICTION = 1.0
 
 # Textured render models of prefab actors, per scene handle:
 # {actor name: GLB path}. Filled by add_prefab, read by the session.
@@ -187,8 +194,12 @@ def add_prefab(
     name: str = "prefab",
     offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
     clearance: float = 0.002,
+    friction: dict[str, float] | None = None,
 ) -> None:
-    """Add a prefab centered on the table, then shifted by ``offset``."""
+    """Add a prefab centered on the table, then shifted by ``offset``.
+
+    ``friction`` overrides the Coulomb coefficient of the prefab's actors
+    named by it (actor name without the prefab prefix)."""
     placement = prefab_placement(prefab_path, clearance) + np.asarray(offset)
     _render_models.setdefault(scene.get_handle().value, {}).update(
         prefab_render_models(prefab_path, name)
@@ -203,6 +214,15 @@ def add_prefab(
             translation=[float(v) for v in placement],
         ),
     )
+    if friction:
+        def override(actor: physics.Actor) -> None:
+            local = actor.get_name().removeprefix(f"{name}/")
+            if local in friction:
+                params = actor.get_contact_params()
+                params.coulomb_friction_coefficient = float(friction[local])
+                actor.set_contact_params(params)
+
+        scene.for_each_actor(override)
 
 
 def _use_robust_solver(scene: physics.Scene) -> None:
@@ -471,8 +491,11 @@ def add_towel(
 _PREFAB_SCENES: tuple[tuple[str, str, str, str, dict], ...] = (
     ("box_and_blocks", "Box and Blocks", "box_and_blocks/box_and_blocks.mochi_prefab",
      "Transfer colored blocks across the partition (rigid).", {}),
+    # Silicone: 1.0 (pair 1.0 with the hand; the asset's 0.25 gives 0.5,
+    # glass-like, and the 545 g lamp slides out of any grasp).
     ("duck_lamp", "Duck Lamp (soft)", "duck_lamp/duck_lamp_recumbent.mochi_prefab",
-     "Squeeze and lift a soft neo-Hookean duck lamp (deformable).", {}),
+     "Squeeze and lift a soft neo-Hookean duck lamp (deformable).",
+     {"friction": {"DuckLamp": SILICONE_FRICTION}}),
     ("sphere", "Sphere", "sphere/sphere.mochi_prefab",
      "Roll, pinch and pick a 3 cm sphere (rigid).", {}),
     ("shape_box", "Shape Sorter Box", "shape_box/shape_box.mochi_prefab",
@@ -521,7 +544,7 @@ def _build_soft_cube(scene: physics.Scene, roots: AssetRoots) -> None:
 def _build_soft_duck(scene: physics.Scene, roots: AssetRoots) -> None:
     add_soft_mesh(
         scene, "soft_duck", roots.physics_assets / "duck" / "duck_730.mochi.h5",
-        size=0.12, position=(0.0, 0.0, 0.0), youngs=2e4, density=200.0,
+        size=0.12, position=(0.0, 0.0, 0.0), youngs=2e4, density=200.0, friction=SILICONE_FRICTION,
     )
 
 

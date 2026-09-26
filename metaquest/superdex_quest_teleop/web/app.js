@@ -173,6 +173,28 @@ function applyLighting() {
   }
 }
 
+// Brightness (tone-mapping exposure), per environment: imported rooms vary a
+// lot (a Victorian study is much darker than a white kitchen).
+const EXPOSURE_STEPS = [0.35, 0.5, 0.65, 0.8, 1.0, 1.25, 1.6, 2.0, 2.5, 3.2];
+function defaultExposure() { return envObject && envObject.lighting === 'room' ? 1.0 : 0.8; }
+function storedExposure() {
+  try {
+    const v = parseFloat(localStorage.getItem(`superdex.exposure.${envName}`));
+    return Number.isFinite(v) ? v : null;
+  } catch { return null; }
+}
+function applyExposure() { renderer.toneMappingExposure = storedExposure() ?? defaultExposure(); }
+function changeExposure(dir) {
+  const cur = renderer.toneMappingExposure;
+  let i = EXPOSURE_STEPS.findIndex((v) => v >= cur - 1e-6);
+  if (i < 0) i = EXPOSURE_STEPS.length - 1;
+  if (EXPOSURE_STEPS[i] > cur + 1e-6 && dir > 0) i -= 1;  // between steps
+  const next = EXPOSURE_STEPS[Math.min(Math.max(i + dir, 0), EXPOSURE_STEPS.length - 1)];
+  renderer.toneMappingExposure = next;
+  try { localStorage.setItem(`superdex.exposure.${envName}`, String(next)); } catch { /* private mode */ }
+  flash(`brightness ${next.toFixed(2)}`);
+}
+
 function rebuildEnvironment() {
   if (envObject) { workspace.remove(envObject.group); envObject = null; }
   const islandRoom = envName === 'kitchen_island' || !!environmentDome;
@@ -188,6 +210,10 @@ function rebuildEnvironment() {
   }
   const button = document.getElementById('envbutton');
   if (button) button.textContent = `Env: ${envName.replace(/_/g, ' ')}`;
+  // Rooms bring their own lights: a dimmer counter fill, and the brightness
+  // the operator chose for this environment.
+  hemi.intensity = envObject && envObject.lighting === 'room' ? 0.1 : 0.25;
+  applyExposure();
   applyLighting();
 }
 function setEnvironment(name) {
@@ -196,9 +222,9 @@ function setEnvironment(name) {
 }
 // The environment is physical: switching asks the server to rebuild the
 // scene in it, and the visuals follow its geometry message.
-function nextEnvironment() {
+function nextEnvironment(step = 1) {
   const list = serverEnvironments;
-  const next = list[(list.indexOf(envName) + 1) % list.length];
+  const next = list[(list.indexOf(envName) + step + list.length) % list.length];
   if (connected) {
     command('set_environment', { environment: next });
     flash(`switching to ${next.replace('_', ' ')}…`);
@@ -817,7 +843,9 @@ window.addEventListener('keydown', (e) => {
   if (e.key === 'c') showContacts = !showContacts;
   if (e.key === 'v') setCamView(!camView);
   if (e.key === 'h') setHandView(handView === 'skin' ? 'robot' : 'skin');
-  if (e.key === 'e') nextEnvironment();
+  if (e.key === 'e') nextEnvironment(e.shiftKey ? -1 : 1);
+  if (e.key === '[') changeExposure(-1);
+  if (e.key === ']') changeExposure(1);
   if (e.key === 'k') toggleColliders();
   if (e.key === 'n') command('next_scene');
   if (e.key === 'p') command('prev_scene');
@@ -932,7 +960,9 @@ function recenter(viewerPose) {
 const panel = new THREE.Group();
 panel.visible = false;
 workspace.add(panel);
-panel.position.set(-0.4, 0.2, 0.05);
+// Every button well above the counter (a fingertip poking a low button
+// also presses into the counter and the simulated hand stops short).
+panel.position.set(-0.44, 0.3, 0.05);
 panel.rotation.y = 0.45;
 const buttons = [];
 function makeButton(label, x, y, action, w = 0.085, h = 0.04) {
@@ -960,28 +990,34 @@ function drawButton(b, text = b.label, active = false) {
   ctx.fillText(text, 128, 62);
   b.tex.needsUpdate = true;
 }
-const recButton = makeButton('● Rec', -0.047, 0.05, () => command('record_toggle'));
-makeButton('Reset', 0.047, 0.05, () => command('reset'));
-makeButton('◀ Scene', -0.047, 0.0, () => command('prev_scene'));
-makeButton('Scene ▶', 0.047, 0.0, () => command('next_scene'));
-makeButton('Cam view', -0.047, -0.05, () => { tableOffset = 0; needsRecenter = true; });
-makeButton('Contacts', 0.047, -0.05, () => { showContacts = !showContacts; });
-makeButton('Table ▲', -0.047, -0.10, () => { tableOffset += 0.03; anchor.elements[13] += 0.03; setAnchor(anchor); });
-makeButton('Table ▼', 0.047, -0.10, () => { tableOffset -= 0.03; anchor.elements[13] -= 0.03; setAnchor(anchor); });
-makeButton('Ghost', -0.047, -0.15, () => { showGhost = !showGhost; });
-makeButton('Hands', -0.047, -0.20, () => setHandView(handView === 'skin' ? 'robot' : 'skin'));
-makeButton('Env ▶', 0.047, -0.20, () => nextEnvironment());
-makeButton('Colliders', -0.047, -0.25, () => toggleColliders());
-makeButton('Calibrate', 0.047, -0.25, () => startCalibration());
-makeButton('Skip', 0.0, -0.30, () => { if (calib.active) stopCalibration('Skipped: using the current hand size'); });
-makeButton('Exit VR', 0.047, -0.15, () => { if (xrSession) xrSession.end(); });
+// Three columns; the lowest row sits 15 cm above the counter.
+const COL = [-0.092, 0.0, 0.092];
+const ROW = [0.05, 0.0, -0.05, -0.10, -0.15];
+const recButton = makeButton('● Rec', COL[0], ROW[0], () => command('record_toggle'));
+makeButton('Reset', COL[1], ROW[0], () => command('reset'));
+makeButton('Exit VR', COL[2], ROW[0], () => { if (xrSession) xrSession.end(); });
+makeButton('◀ Scene', COL[0], ROW[1], () => command('prev_scene'));
+makeButton('Scene ▶', COL[1], ROW[1], () => command('next_scene'));
+makeButton('Contacts', COL[2], ROW[1], () => { showContacts = !showContacts; });
+makeButton('◀ Env', COL[0], ROW[2], () => nextEnvironment(-1));
+makeButton('Env ▶', COL[1], ROW[2], () => nextEnvironment(1));
+makeButton('Cam view', COL[2], ROW[2], () => { tableOffset = 0; needsRecenter = true; });
+makeButton('Light −', COL[0], ROW[3], () => changeExposure(-1));
+makeButton('Light +', COL[1], ROW[3], () => changeExposure(1));
+makeButton('Hands', COL[2], ROW[3], () => setHandView(handView === 'skin' ? 'robot' : 'skin'));
+makeButton('Table ▲', COL[0], ROW[4], () => { tableOffset += 0.03; anchor.elements[13] += 0.03; setAnchor(anchor); });
+makeButton('Table ▼', COL[1], ROW[4], () => { tableOffset -= 0.03; anchor.elements[13] -= 0.03; setAnchor(anchor); });
+makeButton('Ghost', COL[2], ROW[4], () => { showGhost = !showGhost; });
+makeButton('Colliders', COL[0], ROW[4] - 0.05, () => toggleColliders());
+makeButton('Calibrate', COL[1], ROW[4] - 0.05, () => startCalibration());
+makeButton('Skip', COL[2], ROW[4] - 0.05, () => { if (calib.active) stopCalibration('Skipped: using the current hand size'); });
 const infoCanvas = document.createElement('canvas');
 infoCanvas.width = 512; infoCanvas.height = 200;
 const infoTex = new THREE.CanvasTexture(infoCanvas);
 infoTex.colorSpace = THREE.SRGBColorSpace;
-const info = new THREE.Mesh(new THREE.PlaneGeometry(0.18, 0.07),
+const info = new THREE.Mesh(new THREE.PlaneGeometry(0.27, 0.105),
   new THREE.MeshBasicMaterial({ map: infoTex, transparent: true, toneMapped: false }));
-info.position.set(0, 0.118, 0);
+info.position.set(0, 0.135, 0);
 panel.add(info);
 let infoKey = '';
 function drawInfo(lines) {
@@ -1205,7 +1241,7 @@ renderer.setAnimationLoop((time, frame) => {
   }
   const h = lastHeader;
   const lines = [
-    currentScene ? currentScene.name : '…',
+    `${currentScene ? currentScene.name : '…'}  ·  ${envName.replace(/_/g, ' ')}`,
     h ? `t ${h.sim_time.toFixed(1)}s  RTF ${h.rtf.toFixed(2)}  contacts ${h.total_contacts}  ${fps.toFixed(0)} fps` : '',
     statusInfo.recording ? `● REC ${h ? h.recorded_steps : 0} steps` : (connected ? 'idle' : '!not connected to the PC'),
   ];
@@ -1218,7 +1254,7 @@ renderer.setAnimationLoop((time, frame) => {
   const tracked = h ? Object.entries(h.tracked).map(([s, t]) => `${s}:${t ? 'tracked' : '—'}`).join(' ') : '';
   document.getElementById('status').textContent =
     `${lines.slice(0, 3).join('   ')}   hands ${tracked}${h && h.head ? '   headset connected' : ''}\n` +
-    (now < flashUntil ? flashText : 'Space: record  R: reset  V: cam view  H: hands  E: environment  K: colliders  N/P: scene  C: contacts');
+    (now < flashUntil ? flashText : 'Space: record  R: reset  V: cam view  H: hands  E/⇧E: environment  [ ]: brightness  K: colliders  N/P: scene  C: contacts');
   renderer.render(scene, camera);
 });
 

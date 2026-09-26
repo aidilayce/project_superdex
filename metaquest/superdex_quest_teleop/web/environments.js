@@ -453,11 +453,29 @@ function buildRoom(layout) {
   group.add(holder);
   new GLTFLoader().load(layout.model_url, (gltf) => {
     gltf.scene.traverse((o) => {
-      if (o.isMesh) { o.receiveShadow = true; o.castShadow = false; o.frustumCulled = true; }
+      if (!o.isMesh) return;
+      o.receiveShadow = true; o.castShadow = false; o.frustumCulled = true;
+      for (const m of Array.isArray(o.material) ? o.material : [o.material]) {
+        // Scanned and archviz exports often mark whole surfaces fully
+        // metallic without a metalness map: under room lighting (no mirror
+        // world to reflect) they render nearly black.
+        if (m && m.isMeshStandardMaterial && !m.metalnessMap && m.metalness > 0.5) m.metalness = 0.05;
+        if (m && 'envMapIntensity' in m) m.envMapIntensity = 1.0;
+      }
     });
     holder.add(gltf.scene);
   }, undefined, (err) => console.error('room model', err));
-  return { group, setHeight() {}, fixedHeight: layout.counter_height, attribution: layout.attribution };
+  // Rooms are lit from inside (ceiling lights and a soft fill), not only by
+  // the outdoor-ish HDRI and the counter's key light.
+  const size = layout.room_size || [5, 2.6, 5];
+  const fill = new THREE.HemisphereLight(0xfff3e0, 0x6b5a48, 0.55);
+  group.add(fill);
+  for (const [x, z] of [[0, 0.3], [-size[0] / 4, -size[2] / 4], [size[0] / 4, size[2] / 4]]) {
+    const bulb = new THREE.PointLight(0xffe2b8, 4.0, 0, 1.2);
+    bulb.position.set(x, (layout.ceiling_above_counter || 1.7) - 0.25, z);
+    group.add(bulb);
+  }
+  return { group, setHeight() {}, fixedHeight: layout.counter_height, attribution: layout.attribution, lighting: 'room' };
 }
 
 export function buildEnvironment(name, lib, pack, params = {}, layout = null) {

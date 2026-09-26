@@ -144,8 +144,8 @@ has caught up and is out of the counter. Tracking glitches (a hand jumping
 20 cm in one frame) can't yank the simulated hand: its targets move at most
 4 m/s, 25 rad/s at the wrist and 30 rad/s per finger joint.
 
-A button panel floats to the left of the table. Poke a button with an index
-fingertip:
+A button panel floats to the left of the table, its lowest row 10 cm above
+the counter. Poke a button with an index fingertip:
 
 | Button | Action |
 | :-- | :-- |
@@ -157,7 +157,8 @@ fingertip:
 | Contacts | Show or hide contact points and force vectors |
 | Ghost | Show or hide your tracked joints |
 | Hands | Switch between skinned hands and the Meta XR robot-hand meshes |
-| Env ▶ | Next 3D environment (rebuilds the scene in it) |
+| ◀ Env / Env ▶ | Previous or next 3D environment, imported rooms included (rebuilds the scene in it) |
+| Light − / + | Darker or brighter (remembered per environment) |
 | Colliders | Show or hide the physics colliders of the environment |
 | Calibrate / Skip | Redo or skip the hand-size calibration |
 | Exit VR | Leave the immersive session |
@@ -312,7 +313,7 @@ you. On Quest 3, **Enter passthrough** shows your real kitchen.
 | `--hand-models DIR` | WebXR generic hand | Rigged, textured `left.glb`/`right.glb` (e.g. from `bedlam_hands`) |
 | `--hand-scale S` | `1` | Size of the simulated hands (normally set by the in-headset calibration) |
 | `--time-budget F` | `0.8` | Cap each step's solve at this fraction of the time step, so heavy scenes stay real time. `0`: solve to the engine's tolerances even if slower than real time |
-| `--grip-strength F` | `1` | Finger torque cap multiplier (1 = 0.64 N·m per joint). Raise it if heavy objects slip out of a firm grasp |
+| `--grip-strength F` | `1` | Finger torque cap multiplier (1 = 1.5 N·m per joint). Raise it if heavy objects slip out of a firm grasp |
 | `--threads N` | `-1` | SuperDex worker threads |
 
 ## Scenes
@@ -349,7 +350,13 @@ rather than skipping steps. The HUD shows the real-time factor (RTF).
 
 Heavy scenes stay real time with the solve time budget (`--time-budget`,
 default 0.8 of the step): a step's Newton iterations stop when the budget is
-spent. Real-time factors measured on a 4-core cloud VM with one hand grasping
+spent. The budget adapts to the Python side of each step (applying hand
+targets, reading contacts, recording): it shrinks, down to 0.35 of the step,
+while that side is slow, so the whole step still fits in real time. The
+costly Python parts stay off the step: hands are retargeted on the network
+thread as tracking arrives (the engine releases the GIL while it steps), and
+in the default `--contacts hand` mode contacts are read from the hand links
+only, not from every object resting on the counter. Real-time factors measured on a 4-core cloud VM with one hand grasping
 (1.0.0 wheel / current `main`):
 
 * **Real time and faster:** `sphere` (3.7× / 5.3×), `kitchen_sponge`
@@ -492,6 +499,16 @@ The import:
 In VR a room keeps its real proportions: the work surface stays at its
 modeled height above your real floor (0.75 m for a desk), instead of 0.5 m
 below your eyes as in the kitchens. **Table ▲/▼** still adjusts it.
+
+Rooms are lit from inside (a soft fill and three ceiling lights) and
+surfaces that the model marks fully metallic without a metalness map
+(common in archviz exports, and nearly black under room lighting) are made
+non-metallic. **Light − / +** on the panel (`[` / `]` on the desktop) sets
+the brightness per environment.
+
+Imported rooms appear in the **◀ Env / Env ▶** cycle with the built-in
+environments, e.g. `sherlock_221b` after
+`python -m superdex_quest_teleop.rooms add sherlock_221b`.
 
 Each room's license and author are recorded in its `room.json` and shown
 with the scene description. Sketchfab's CC Attribution models require that
@@ -638,19 +655,22 @@ the visionOS AnyDex pipeline:
    grasps close on the bot too.
 4. **Solve.** A damped Gauss-Newton solve with analytic Jacobians,
    joint-limit clamping, warm start and velocity regularization computes the
-   27 DoFs. It takes about 2.5 ms per hand.
+   27 DoFs. It takes about 2.5 ms per hand, on the network thread as
+   tracking arrives, overlapping the physics step.
 
 The physical hand (`hand_rig.py`) ports the visionOS `HandUnit`: 5-frame
 keypoint smoothing, a wrist spring (2000 N/m, 50 N·m/rad), gravity
 compensation, a uniform hand penalty profile on both sides, and no teleporting
 on tracking reacquisition. It differs from the visionOS values in three ways:
 
-* **Finger joints** are stiffer: 0.8 N·m/rad, saturated at 0.8 rad (up to
-  0.64 N·m per joint, twice the visionOS grip). Much stiffer fingers squeeze
-  small objects out of an open-loop grasp.
+* **Finger joints** are stiffer: 1.5 N·m/rad, saturated at 1 rad (up to
+  1.5 N·m per joint, about a human finger's flexion strength and three
+  times the visionOS grip). With the earlier 0.64 N·m a 0.5 kg soft object
+  slipped out of every grasp.
 * **Friction:** the hand's Coulomb coefficient is 1.0, giving 0.7 against
   most objects (the pair uses the geometric mean). The visionOS 2.0 made
-  objects cling to the fingers.
+  objects cling to the fingers. The soft duck and the duck lamp are rubber
+  and silicone (1.0; the lamp's asset says 0.25, glass-like).
 * **Targets** are rate limited, and a stuck hand passes through objects until
   it catches up (see *When a hand gets stuck*).
 

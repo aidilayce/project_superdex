@@ -322,6 +322,9 @@ class Workspace:
                 "colliders_url": f"/rooms/{self.name}/colliders.glb",
                 "attribution": attribution(self.room),
                 "title": self.room.get("title") or self.name,
+                # For the client's ceiling lights.
+                "ceiling_above_counter": float((self.room.get("room_height_m") or 2.5)
+                                               - self.room["counter_height"]),
             })
         return msg
 

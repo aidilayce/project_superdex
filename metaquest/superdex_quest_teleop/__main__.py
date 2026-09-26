@@ -77,7 +77,7 @@ def main(argv: list[str] | None = None) -> None:
                         help="size of the simulated hands relative to the Meta XR hand asset "
                         "(normally set by the in-headset calibration when you enter VR)")
     parser.add_argument("--grip-strength", type=float, default=1.0,
-                        help="finger torque cap multiplier (1 = 0.64 N m per joint); raise it if heavy "
+                        help="finger torque cap multiplier (1 = 1.5 N m per joint); raise it if heavy "
                         "objects slip out of a firm grasp")
     parser.add_argument("--synthetic", action="store_true",
                         help="drive the right hand with a scripted grasp (no headset needed)")

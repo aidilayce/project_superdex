@@ -50,6 +50,7 @@ import signal
 import ssl
 import struct
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -114,7 +115,7 @@ class ServerConfig:
     # Uniform size of the simulated hands (1: the Meta XR hand asset); set by
     # the in-headset calibration (calibrate_hands) or --hand-scale.
     hand_scale: float = 1.0
-    # Finger torque cap multiplier (1: 0.64 N m per joint).
+    # Finger torque cap multiplier (1: 1.5 N m per joint).
     grip_strength: float = 1.0
     synthetic: bool = False  # drive the right hand with a scripted grasp
     autostart_record: bool = False
@@ -172,6 +173,9 @@ class PhysicsRunner(threading.Thread):
     def run(self) -> None:
         import superdex.physics as physics
 
+        # Retargeting runs on the network thread while the engine steps (it
+        # releases the GIL): hand the GIL back quickly when a step returns.
+        sys.setswitchinterval(0.001)
         self._owns_physics = not physics.is_initialized()
         if self._owns_physics:
             physics.initialize(num_worker_threads=self.config.num_threads)
@@ -211,9 +215,10 @@ class PhysicsRunner(threading.Thread):
                 session.set_input({side: hs.HandFrame.untracked() for side in session.hands})
 
             steps_since_contacts += 1
-            want_contacts = steps_since_contacts >= DISPLAY_CONTACT_EVERY
+            want_frame = time.monotonic() >= next_stream
+            want_contacts = want_frame and steps_since_contacts >= DISPLAY_CONTACT_EVERY
             try:
-                data = session.step(with_contacts=want_contacts)
+                data = session.step(with_contacts=want_contacts, gather=want_frame)
             except Exception as exc:  # noqa: BLE001
                 log.exception("physics step failed")
                 self.publish("status", {"type": "status", "error": f"step failed: {exc}"})
@@ -228,8 +233,8 @@ class PhysicsRunner(threading.Thread):
                 self.rtf = window_sim / elapsed
                 window_sim, window_start = 0.0, time.monotonic()
 
-            if time.monotonic() >= next_stream:
-                next_stream = time.monotonic() + stream_period
+            if want_frame and data is not None:
+                next_stream = max(next_stream + stream_period, time.monotonic() - stream_period)
                 self.publish("frame", self._encode_frame(session, data))
 
         if self.session is not None:

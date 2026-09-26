@@ -117,3 +117,11 @@ def test_deformable_node_forces_recorded(roots, tmp_path):
         assert group["surface_positions"].shape[0] == steps
         assert group["node_force_offset"][-1] == len(group["node_index"]) > 0
         assert group["surface_triangles"].shape[1] == 3
+
+
+def test_scripted_grasp_lifts_soft_duck(roots, tmp_path):
+    """Rubber friction and the finger torque cap hold a soft object: with
+    the earlier 0.64 N m fingers or the asset's glass-like friction the duck
+    slipped out of the grasp."""
+    _, _, heights, _ = _run_grasp(roots, "soft_duck", tmp_path, seconds=4.3)
+    assert heights[int(3.9 / (1 / 60)):].max() - heights[0] > 0.04

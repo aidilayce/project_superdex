@@ -22,6 +22,7 @@ the scene (the server's physics thread).
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,6 +47,8 @@ HAND_SPAWN = {"left": (-0.15, 0.2, 0.25), "right": (0.15, 0.2, 0.25)}
 # owns them depends on the collider pair (e.g. a rigid link against a soft
 # body is sampled on the soft body), so both hands and objects are queried.
 CONTACT_MODES = ("hand", "all")
+# The solver always gets at least this share of the step period.
+MIN_SOLVER_SHARE = 0.35
 
 
 @dataclass
@@ -114,6 +117,11 @@ class TeleopSession:
         self.keep_self_contacts = keep_self_contacts
         self.time_step = spec.time_step
         self.scene = build_scene(spec, roots, environment, counter_height, time_budget)
+        # The solver's time cap leaves room for this Python side of the step
+        # (retargeting, contacts, streaming), measured as it runs.
+        self._time_budget = time_budget
+        self._solver_cap = time_budget * spec.time_step if time_budget else None
+        self._step_seconds = 0.0
         self.environment = environment
         self.grip_strength = grip_strength
         self.workspace = workspace_for(self.scene)
@@ -127,7 +135,6 @@ class TeleopSession:
         self.step_count = 0
         self.sim_time = 0.0
         self._lock = threading.Lock()
-        self._input = {side: hs.HandFrame.untracked() for side in sides}
         self._head_pose = np.full(7, np.nan)
         self.recorder: EpisodeRecorder | None = None
         from .scenes import render_models_for
@@ -225,39 +232,67 @@ class TeleopSession:
         hands: dict[str, hs.HandFrame],
         head_pose: np.ndarray | None = None,
     ) -> None:
-        """Latest tracking (thread-safe; the newest input wins)."""
-        with self._lock:
-            for side, frame in hands.items():
-                if side in self._input:
-                    self._input[side] = frame
-            if head_pose is not None:
+        """Latest tracking (thread-safe; the newest input wins). Hands are
+        retargeted here, in the caller's thread: the server calls this as
+        tracking arrives, so retargeting overlaps the physics step."""
+        for side, frame in hands.items():
+            if side in self.hands:
+                self.hands[side].prepare(frame)
+        if head_pose is not None:
+            with self._lock:
                 self._head_pose = np.asarray(head_pose, dtype=np.float64)
 
     # ------------------------------------------------------------------ step
 
-    def step(self, with_contacts: bool = True) -> dict:
+    def step(self, with_contacts: bool = True, gather: bool = True) -> dict | None:
         """Apply the latest hand input, advance one fixed step, gather data
         (and record it when recording). Returns the gathered step data.
 
         Reading per-point contacts costs a few microseconds per point, so
         callers may skip it on steps that are neither recorded nor displayed
-        (recorded steps always include them)."""
+        (recorded steps always include them). With ``gather=False`` and no
+        recording nothing is read back and None is returned."""
+        start = time.perf_counter()
         with self._lock:
-            inputs = dict(self._input)
             head = self._head_pose.copy()
-        for side, hand in self.hands.items():
-            hand.set_input(inputs[side])
-        self.scene.step(self.time_step)
         for hand in self.hands.values():
-            hand.update_unstick()
+            hand.apply()
+        self.scene.step(self.time_step)
+        link_poses = {side: hand.link_poses() for side, hand in self.hands.items()}
+        for side, hand in self.hands.items():
+            hand.update_unstick(link_poses[side])
         self.step_count += 1
+        self._link_poses = (self.step_count, link_poses)
         self.sim_time += self.time_step
-        data = self.gather(head, with_contacts or self.recorder is not None)
-        if self.recorder is not None:
+        if self.recorder is None:
+            data = self.gather(head, with_contacts, full=False) if gather else None
+        else:
+            data = self.gather(head, True)
             self.recorder.write_step(data)
+        self._adapt_budget(time.perf_counter() - start)
         return data
 
-    def gather(self, head_pose: np.ndarray | None = None, with_contacts: bool = True) -> dict:
+    def _adapt_budget(self, step_seconds: float) -> None:
+        """Feedback on the solver's time cap: steer the whole step (Python
+        side included: retargeting, contacts, recording) toward 92 % of the
+        step period, within [MIN_SOLVER_SHARE, time_budget] of it, so the
+        simulation keeps up with real time."""
+        self._step_seconds += 0.1 * (step_seconds - self._step_seconds)  # average step time
+        if not self._time_budget or self.step_count % 15:
+            return
+        dt = self.time_step
+        cap = self._solver_cap + 0.5 * (0.92 * dt - self._step_seconds)
+        cap = min(self._time_budget * dt, max(MIN_SOLVER_SHARE * dt, cap))
+        if abs(cap - self._solver_cap) > 0.2e-3:
+            params = self.scene.get_solver_params()
+            params.non_linear_solver.max_elapsed_time_seconds = float(cap)
+            self.scene.set_solver_params(params)
+            self._solver_cap = cap
+
+    def gather(self, head_pose: np.ndarray | None = None, with_contacts: bool = True,
+               full: bool = True) -> dict:
+        """The current state. ``full=False`` reads only what the viewer draws
+        (no velocities or total forces; contacts without their details)."""
         n = len(self.actors)
         pose = np.zeros((n, 7), np.float32)
         lin = np.full((n, 3), np.nan, np.float32)
@@ -271,15 +306,15 @@ class TeleopSession:
                 pose[r.index, 3:] = _vec(t.rotation)
             else:
                 pose[r.index, 6] = 1.0
-            if r.is_static:
-                continue
+            if r.is_static or not full:
+                continue  # velocities and total forces: recorded steps only
             if not r.deformable:
                 lin[r.index] = _vec(a.get_linear_velocity())
                 ang[r.index] = _vec(a.get_angular_velocity())
             if self._has_total_force.get(r.index):
                 force[r.index] = _vec(a.get_contact_force_world())
 
-        contacts = self._gather_contacts() if with_contacts else None
+        contacts = self._gather_contacts(full) if with_contacts else None
         if contacts is not None:
             self.last_contacts = contacts
 
@@ -303,9 +338,10 @@ class TeleopSession:
             )
 
         hands = {}
+        step, cached = getattr(self, "_link_poses", (-1, {}))
         for side, hand in self.hands.items():
             frame = hand.last_input
-            link_pose = hand.link_poses()
+            link_pose = cached[side] if step == self.step_count and side in cached else hand.link_poses()
             hands[side] = {
                 "display_joints": hand.display.joints(link_pose),
                 "tracked": hand.tracked,
@@ -332,20 +368,36 @@ class TeleopSession:
             "head_pose": head_pose if head_pose is not None else np.full(7, np.nan),
         }
 
-    def _gather_contacts(self) -> dict:
+    def _gather_contacts(self, full: bool = True) -> dict:
+        """Contact rows; ``full=False`` reads only what the viewer draws
+        (owner, other, force, position, normal) and zero-fills the rest."""
         rows: dict[str, list] = {k: [] for k in _empty_contacts()}
         threshold = self.min_contact_force
         index_of = self._index_of_handle
         side_of = self._side_of
         hand_only = self.contact_mode == "hand"
         keep_self = self.keep_self_contacts
-        for r in self._contact_sources:
-            owner_side = r.hand_side
+        # Every contact is reported to both of its actors (the queried one as
+        # actor_a or actor_b). Rows use the actor_a side as the owner and are
+        # read from the actor_a source, except in "hand" mode, where the hand
+        # links alone see every contact of interest: reading objects there
+        # would walk all their contacts with the counter (thousands of points
+        # for a soft body) only to discard them.
+        sources = [r for r in self._contact_sources if r.hand_side] if hand_only else self._contact_sources
+        for r in sources:
+            handle = r.actor.get_handle().value
             for c in r.actor.get_contact_points_world():
+                a = c.actor_a.value
+                owner = index_of.get(a, -1)
                 other = index_of.get(c.actor_b.value, -1)
-                other_side = side_of[other]
-                if other == r.index and not r.deformable:
+                if a != handle:
+                    # Reported to its actor_b: read here only if actor_a is
+                    # not read (an object, in "hand" mode).
+                    if not hand_only or side_of[owner] or owner < 0:
+                        continue
+                elif other == owner and not r.deformable:
                     continue  # rigid self pairs carry no information
+                owner_side, other_side = side_of[owner], side_of[other]
                 if owner_side and other_side == owner_side and not keep_self:
                     continue  # the hand touching itself
                 if hand_only and not owner_side and not other_side:
@@ -353,12 +405,14 @@ class TeleopSession:
                 f = c.force.tolist()
                 if threshold > 0.0 and (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]) < threshold**2:
                     continue
-                rows["owner"].append(r.index)
+                rows["owner"].append(owner)
                 rows["other"].append(other)
                 rows["force"].append(f)
                 rows["pos_owner"].append(c.pos_a.tolist())
-                rows["pos_other"].append(c.pos_b.tolist())
                 rows["normal"].append(c.normal.tolist())
+                if not full:
+                    continue
+                rows["pos_other"].append(c.pos_b.tolist())
                 rows["vel_owner"].append(c.point_velocity_a.tolist())
                 rows["vel_other"].append(c.point_velocity_b.tolist())
                 rows["barycentric"].append(c.parametric_coords.tolist())
@@ -367,9 +421,13 @@ class TeleopSession:
                 rows["element"].append(c.element_index)
                 rows["sample"].append(c.sample_index)
         out = {}
+        n = len(rows["owner"])
         for key, values in rows.items():
             template = _EMPTY[key]
-            out[key] = np.asarray(values, template.dtype).reshape((-1, *template.shape[1:]))
+            if len(values) != n:  # not read for display
+                out[key] = np.zeros((n, *template.shape[1:]), template.dtype)
+            else:
+                out[key] = np.asarray(values, template.dtype).reshape((-1, *template.shape[1:]))
         return out
 
     # ------------------------------------------------------------------ display

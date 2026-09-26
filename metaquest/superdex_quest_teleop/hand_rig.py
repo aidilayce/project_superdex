@@ -24,6 +24,7 @@ with the scene, so hand/object forces come from the contact solver.
 
 from __future__ import annotations
 
+import threading
 from collections import deque
 from pathlib import Path
 
@@ -52,10 +53,10 @@ HAND_FRICTION = 1.0
 # counter sink through it (instead, see the unstick logic below).
 WRIST_POS_GAINS = (2000.0, 60.0)
 WRIST_ROT_GAINS = (50.0, 1.5)
-# Finger joints [N m/rad]: up to 0.64 N m per joint, about twice the visionOS
-# gains (0.5/0.6) for a firmer squeeze. Much stiffer fingers overpower small
-# objects (a 3 cm sphere squirts out of a closing grasp).
-FINGER_JOINT_GAINS = (0.8, 0.06, 0.8)
+# Finger joints [N m/rad]: up to 1.5 N m per joint (about a human finger's
+# MCP flexion strength), three times the visionOS gains (0.5/0.6): enough
+# squeeze to hold a 0.5 kg soft object, which (0.8, 0.8) could not lift.
+FINGER_JOINT_GAINS = (1.5, 0.1, 1.0)
 
 # Target rate limits: real hands rarely exceed these, tracking glitches
 # (a hand jumping 20 cm in one frame, fingers flipping) do. Unlimited jumps
@@ -215,6 +216,9 @@ class HandUnit:
         self.tracked = False
         self.last_input: hs.HandFrame = hs.HandFrame.untracked()
         self.last_result: RetargetResult | None = None
+        self._pending: tuple[hs.HandFrame, RetargetResult | None] = (hs.HandFrame.untracked(), None)
+        self._prepare_lock = threading.Lock()
+        self._pending_lock = threading.Lock()
 
     def _neutral_rotation(self) -> np.ndarray:
         right = self.side == "right"
@@ -243,22 +247,40 @@ class HandUnit:
         return np.tensordot(weights / weights.sum(), stack, axes=1)
 
     def set_input(self, frame: hs.HandFrame) -> None:
-        """Retarget the latest tracked hand and set the controller targets.
+        """Retarget ``frame`` now, then set the controller targets: one call
+        per physics step, before stepping (``prepare`` + ``apply``)."""
+        self.prepare(frame)
+        self.apply()
 
-        Call once per physics step, before stepping."""
+    def prepare(self, frame: hs.HandFrame) -> None:
+        """Retarget a tracked hand frame (the costly part). Thread-safe: the
+        server calls it as tracking arrives, off the physics thread, so it
+        runs while the engine steps (the step releases the GIL)."""
+        with self._prepare_lock:
+            result = None
+            if frame.tracked:
+                result = self.retargeter.retarget(self._smooth(frame.joints))
+            else:
+                self._frames.clear()
+                self.retargeter.reset()
+            with self._pending_lock:
+                self._pending = (frame, result)
+
+    def apply(self) -> None:
+        """Set the controller targets from the latest prepared frame (rate
+        limited). Physics thread, once per step, before stepping."""
+        with self._pending_lock:
+            frame, result = self._pending
         self.last_input = frame
         if not frame.tracked:
             if self.tracked:
                 # Do not infer a target velocity across the tracking gap and
                 # never teleport on reacquisition (the hand may be touching
                 # something): hold the last targets until tracking returns.
-                self._frames.clear()
                 self._reset_targets = True
-                self.retargeter.reset()
             self.tracked = False
             return
         self.tracked = True
-        result = self.retargeter.retarget(self._smooth(frame.joints))
         if result is None:
             return
         self.last_result = result
@@ -320,13 +342,14 @@ class HandUnit:
         overlap = np.minimum(hi, self._static_boxes[None, :, 1]) - np.maximum(lo, self._static_boxes[None, :, 0])
         return float(max(np.max(np.min(overlap, axis=-1)), 0.0))
 
-    def update_unstick(self) -> None:
-        """Call after each step: switch contact off while the simulated hand is
-        stuck far from the tracked one, and back on once it has caught up."""
+    def update_unstick(self, link_poses: np.ndarray | None = None) -> None:
+        """Call after each step (with this step's :meth:`link_poses`, if
+        already read): switch contact off while the simulated hand is stuck
+        far from the tracked one, and back on once it has caught up."""
         if self._cmd_root is None or not self.tracked:
             self._stuck_time = 0.0
             return
-        wrist = self.link_poses()[0]
+        wrist = (self.link_poses() if link_poses is None else link_poses)[0]
         err = float(np.linalg.norm(wrist[:3] - self._cmd_root[:3, 3]))
         rot = quat_to_matrix(wrist[3:])
         ang = float(np.linalg.norm(rotvec_from_matrix(rot.T @ self._cmd_root[:3, :3])))
