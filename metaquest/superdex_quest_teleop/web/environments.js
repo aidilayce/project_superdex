@@ -443,7 +443,25 @@ function buildStudio(lib, params = {}) {
   return { group: g, setHeight, background: 'studio' };
 }
 
-export function buildEnvironment(name, lib, pack, params = {}) {
+// An imported room (rooms.py): the model, placed with the same transform as
+// its physics colliders. It keeps its modeled height (fixedHeight).
+function buildRoom(layout) {
+  const group = new THREE.Group();
+  const holder = new THREE.Group();
+  holder.matrixAutoUpdate = false;
+  holder.matrix.fromArray(layout.physics_from_model);
+  group.add(holder);
+  new GLTFLoader().load(layout.model_url, (gltf) => {
+    gltf.scene.traverse((o) => {
+      if (o.isMesh) { o.receiveShadow = true; o.castShadow = false; o.frustumCulled = true; }
+    });
+    holder.add(gltf.scene);
+  }, undefined, (err) => console.error('room model', err));
+  return { group, setHeight() {}, fixedHeight: layout.counter_height, attribution: layout.attribution };
+}
+
+export function buildEnvironment(name, lib, pack, params = {}, layout = null) {
+  if (layout && layout.kind === 'room' && layout.name === name) return buildRoom(layout);
   if (name === 'studio') return buildStudio(lib, params);
   return buildKitchenSink(lib, pack, params);
 }
@@ -454,6 +472,19 @@ export function buildColliderView(layout) {
   const group = new THREE.Group();
   if (!layout) return group;
   const material = new THREE.LineBasicMaterial({ color: 0x00e5ff, transparent: true, opacity: 0.8, depthTest: false });
+  if (layout.colliders_url) {
+    // Imported room: its convex collider pieces.
+    new GLTFLoader().load(layout.colliders_url, (gltf) => {
+      gltf.scene.traverse((o) => {
+        if (!o.isMesh) return;
+        const lines = new THREE.LineSegments(new THREE.EdgesGeometry(o.geometry, 20), material);
+        o.updateWorldMatrix(true, false);
+        lines.applyMatrix4(o.matrixWorld);
+        lines.renderOrder = 10;
+        group.add(lines);
+      });
+    });
+  }
   for (const b of layout.boxes || []) {
     // Colliders reaching below the floor are drawn down to it.
     const bottom = Math.max(b.center[1] - b.size[1] / 2, -layout.counter_height);

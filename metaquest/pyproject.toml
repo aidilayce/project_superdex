@@ -36,6 +36,8 @@ dependencies = [
 test = ["pytest"]
 # replay --mp4: headless rendering and H.264 encoding.
 video = ["playwright", "imageio-ffmpeg"]
+# objects.py / rooms.py: converting objects and importing rooms.
+assets = ["trimesh", "scipy", "scikit-image", "rtree", "fast-simplification", "coacd", "huggingface_hub"]
 
 [project.scripts]
 superdex-quest-teleop = "superdex_quest_teleop.__main__:main"

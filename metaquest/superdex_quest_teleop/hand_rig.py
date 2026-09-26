@@ -134,6 +134,7 @@ class HandUnit:
         display_model: Path | None = None,
         time_step: float = 1.0 / 60.0,
         scale: float = 1.0,
+        grip_strength: float = 1.0,
     ) -> None:
         self.side = side
         self.scene = scene
@@ -189,7 +190,10 @@ class HandUnit:
         for i in range(1, n):
             kind = str(prefab.joints[i].type).rsplit(".", 1)[-1].upper()
             if kind in ("REVOLUTE", "SPHERICAL"):
-                joints[i] = _gains(*FINGER_JOINT_GAINS)
+                # grip_strength raises the torque cap (saturation), not the
+                # stiffness: light touches feel the same, squeezes go further.
+                k, d, sat = FINGER_JOINT_GAINS
+                joints[i] = _gains(k, d, sat * grip_strength)
         # PoseControllerParams exposes copies of its arrays: pass them whole.
         self.actor.add_articulated_pose_controller(
             physics.PoseControllerParams(

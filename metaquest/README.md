@@ -54,15 +54,26 @@ uv run --no-project python -m superdex_quest_teleop --list-scenes
 ```
 
 The PC serves everything the headset needs, including a bundled copy of
-three.js, so the headset doesn't need internet access.
+three.js, so the headset doesn't need internet access. Optional extras:
+`uv pip install -e "metaquest[assets]"` for the object and room importers,
+`"metaquest[video]"` for MP4 export.
 
-**Latest SuperDex.** `uv pip install superdex` installs the 1.0.0 wheels from
-PyPI. The teleop works with them and with the current `main` branch, which is
-faster (about 20–40 % per step here) and fixes a t-shirt solver explosion.
-To use `main`, build it from source as described in the repository README
-(`uv sync --extra core`, Clang 17+), or build wheels with
-`tools/build_wheels.py --fast --skip-fp64 --only superdex_python --only
-superdex_robotics --only superdex_lab` and install those.
+**Latest SuperDex (optional).** `uv pip install superdex` installs the 1.0.0
+wheels from PyPI, and everything here works with them. The current `main`
+branch is about 20–40 % faster per step and fixes a t-shirt solver explosion;
+to use it, build wheels from a separate clone of upstream `main` (the wheel
+build refuses to run inside this branch because of the `metaquest` package)
+and install them into your environment (Xcode command line tools on macOS,
+Clang 17+ on Linux; roughly 15–60 minutes):
+
+```bash
+git clone https://github.com/facebookresearch/project_superdex superdex_main && cd superdex_main
+uv venv -p 3.12 .venv-build
+uv pip install --python .venv-build scikit-build-core cmake ninja build wheel setuptools nanobind numpy
+.venv-build/bin/python tools/build_wheels.py --fast --skip-fp64 \
+    --only superdex_python --only superdex_robotics --only superdex_lab --output wheelhouse
+cd ../project_superdex && uv pip install --reinstall ../superdex_main/wheelhouse/*.whl
+```
 
 ## Run
 
@@ -296,6 +307,7 @@ you. On Quest 3, **Enter passthrough** shows your real kitchen.
 | `--hand-models DIR` | WebXR generic hand | Rigged, textured `left.glb`/`right.glb` (e.g. from `bedlam_hands`) |
 | `--hand-scale S` | `1` | Size of the simulated hands (normally set by the in-headset calibration) |
 | `--time-budget F` | `0.8` | Cap each step's solve at this fraction of the time step, so heavy scenes stay real time. `0`: solve to the engine's tolerances even if slower than real time |
+| `--grip-strength F` | `1` | Finger torque cap multiplier (1 = 0.64 N·m per joint). Raise it if heavy objects slip out of a firm grasp |
 | `--threads N` | `-1` | SuperDex worker threads |
 
 ## Scenes
@@ -346,6 +358,113 @@ spent. Real-time factors measured on a 4-core cloud VM with one hand grasping
 
 More cores help. Recording costs a few microseconds per contact point, so
 contact-dense moments slow the loop down while recording.
+
+## Objects with measured weight and realistic friction
+
+Force data is only as good as the objects' mass and friction. `objects.py`
+converts simulation assets with measured or identified physical parameters
+into SuperDex prefabs (`.mochi_prefab` + `.mochi.h5` collision shape +
+textured render GLB) in `~/.superdex_quest_teleop/objects`, and every
+converted object becomes a scene.
+
+```bash
+uv pip install trimesh scipy scikit-image rtree fast-simplification coacd huggingface_hub
+python -m superdex_quest_teleop.objects fetch ycb          # 17 YCB objects (about 2 min)
+python -m superdex_quest_teleop.objects fetch real2sim     # Scalable Real2Sim benchmark objects
+python -m superdex_quest_teleop.objects fetch scenesmith --limit 50 [--match mug]
+python -m superdex_quest_teleop.objects convert my_model.sdf --set mine [--material plastic]
+python -m superdex_quest_teleop.objects list
+```
+
+Then pick `obj_ycb_011_banana` (one object) or `objects_ycb_1`… (six
+objects on the counter) from the scene menu.
+
+| Set | Objects | Mass | Geometry |
+| :-- | :-- | :-- | :-- |
+| `ycb` | The 16 YCB-Video objects (cans, boxes, mustard bottle, banana, pear, strawberry, drill, hammer, scissors, clamp, tennis ball, foam brick, …) and the sugar box | Measured, from the YCB paper (Calli et al. 2015); model files that disagree are corrected (the foam brick file says 28 g; YCB measured 59 g) | Textured scans (pybullet-object-models, Drake models) |
+| `real2sim` | Scalable Real2Sim benchmark objects (Pfaff et al. 2025) | Identified from robot joint torques, with center of mass and inertia | Photometric reconstructions |
+| `scenesmith` | SceneSmith SAM-3D objects (Pfaff et al. 2026) | Estimated by a vision-language model: plausible, not measured | Generated meshes |
+| any `.sdf`/`.urdf` | Drake/Gazebo/pybullet models | From `<inertial>` | From the file |
+
+**Friction.** No open object dataset measures friction (simulator URDFs carry
+placeholders: every pybullet YCB object says 0.8; SceneSmith writes
+same-material values such as steel on steel 0.74). Since hand contacts are
+what gets recorded, each object gets the measured friction of dry fingertip
+skin against its material (central values from the skin tribology
+literature: Derler & Gerhardt 2012, Tomlinson et al. 2007, Skedung et al.
+2010):
+
+| Material | Fingertip μ | | Material | Fingertip μ |
+| :-- | :-- | :-- | :-- | :-- |
+| cardboard | 0.57 | | glass, ceramic | 0.45 |
+| paper | 0.55 | | fabric | 0.45 |
+| plastic | 0.50 | | fruit peel | 0.55 |
+| metal | 0.40 | | foam | 0.90 |
+| wood | 0.50 | | rubber | 1.20 |
+
+The material comes from the object's name (or SceneSmith's friction value, or
+`--material`); `--mu` sets the fingertip friction directly. SuperDex combines
+two actors' coefficients by their geometric mean and the hands use 1.0, so an
+object's coefficient is μ²: finger contacts then have exactly the table's μ,
+and the object slides on the countertop (0.6) at 0.77 μ (cardboard on stone
+0.44). Skin friction varies about ±40 % with moisture.
+
+**Collision shapes.** SuperDex samples contact on both surfaces, so the
+collision shape follows the real surface. Primitives are kept where they fit
+the scan within 1.2 cm (the sugar box). Otherwise the scanned mesh is
+re-meshed through its signed distance field into a closed mesh of about 3000
+triangles (0.2–0.8 mm from the scan, concave shapes such as a banana or a
+clamp preserved), or kept as is for thin shells (plates, scissors). Contact
+uses a 1 mm smoothing band, so objects rest within a millimetre of the
+counter. Each object's `physics.json` records its mass, inertia, material,
+friction, collision shape and source.
+
+## Rooms (Sketchfab or any glTF) as physical environments
+
+Beyond the built-in kitchens, any room model can be the environment: the
+Sketchfab rooms below, or any glTF/GLB/zip. `rooms.py` imports a room into
+`~/.superdex_quest_teleop/rooms` and makes it physical around a table or desk:
+
+```bash
+export SKETCHFAB_API_TOKEN=...   # sketchfab.com -> Settings -> Password & API
+python -m superdex_quest_teleop.rooms add retro_apartment   # "Modern Retro Apartment"
+python -m superdex_quest_teleop.rooms add sherlock_221b     # "221B Baker Street - Sherlock - Archilogic"
+python -m superdex_quest_teleop.rooms add living_room       # "Living Room"
+python -m superdex_quest_teleop.rooms add ~/Downloads/some_room.zip --name den   # a downloaded glTF
+python -m superdex_quest_teleop.rooms surfaces sherlock_221b            # work-surface candidates
+python -m superdex_quest_teleop.rooms add sherlock_221b --surface 2     # use another one
+python -m superdex_quest_teleop --environment sherlock_221b --scene objects_ycb_1
+```
+
+The presets also import on first use with `--environment NAME` when
+`SKETCHFAB_API_TOKEN` is set. **Env** cycles through the built-in and
+imported environments.
+
+The import:
+
+1. **Units and floor.** It finds the floor (the lowest large upward-facing
+   area) and the ceiling, and picks the unit (m, cm, mm, inch, ft) that
+   makes the room 2.2–4.5 m high.
+2. **Work surface.** It lists upward-facing areas 0.35–1.15 m above the
+   floor that are at least 45 × 30 cm (tables, desks, counters), preferring
+   0.7–0.95 m. The physics origin goes on the chosen one, its long side
+   along X, and you stand on its freer side.
+3. **Colliders.** Everything within 1.4 m becomes static convex colliders:
+   a CoACD decomposition near the surface, convex hulls further out, wall
+   slabs behind the walls, an analytic floor, and an exact slab for the
+   work surface. `K` shows them over the model. Props that are part of the
+   room model (a vase on the desk) are static obstacles; the objects you
+   manipulate come from the scene.
+
+In VR a room keeps its real proportions: the work surface stays at its
+modeled height above your real floor (0.75 m for a desk), instead of 0.5 m
+below your eyes as in the kitchens. **Table ▲/▼** still adjusts it.
+
+Each room's license and author are recorded in its `room.json` and shown
+with the scene description. Sketchfab's CC Attribution models require that
+credit; check the license before sharing recordings or videos. Very detailed
+models can be heavy for the Quest browser: prefer models under about 500k
+triangles.
 
 ## Recorded data
 
@@ -517,6 +636,10 @@ The tests cover:
 * objects land in the sink, on the counter and on the floor, which follows the
   counter height; the island and studio table have edges;
 * hand-size calibration and the scaled hand bot;
+* SDFormat/URDF objects become prefabs with their mass, material friction and
+  closed collision shape; SceneSmith friction values map back to materials;
+* a room imports with the right units, work surface and facing, and
+  objects land on the desk, on the floor and against the wall;
 * the unstick logic, and rate limiting of tracking jumps;
 * an episode replays frame-exactly;
 * per-point forces reconstruct the total contact force;

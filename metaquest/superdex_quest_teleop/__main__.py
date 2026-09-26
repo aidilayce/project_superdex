@@ -23,7 +23,7 @@ from pathlib import Path
 from .scenes import AssetRoots, default_repo_root, scene_registry
 from .server import ServerConfig, TeleopServer, lan_addresses
 from .session import CONTACT_MODES
-from .workspace import ENVIRONMENTS
+from .workspace import available_environments
 
 
 
@@ -43,7 +43,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--no-https", action="store_true", help="serve plain HTTP only")
     parser.add_argument("--environment", default="kitchen_sink",
                         help="physical 3D environment: kitchen_sink (default: countertop, sink, "
-                        "cabinets, floor), kitchen_island or studio (switchable with the Env button), "
+                        "cabinets, floor), kitchen_island, studio, an imported room (rooms.py; the "
+                        "presets retro_apartment, sherlock_221b and living_room import on first use "
+                        "with SKETCHFAB_API_TOKEN set), all switchable with the Env button, or "
                         "table (a bare infinite tabletop); or a file shown as backdrop around the "
                         "island: an .hdr, an equirectangular 360 photo (.jpg/.png, e.g. of your own "
                         "kitchen) or a .glb/.gltf model")
@@ -74,6 +76,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--hand-scale", type=float, default=1.0,
                         help="size of the simulated hands relative to the Meta XR hand asset "
                         "(normally set by the in-headset calibration when you enter VR)")
+    parser.add_argument("--grip-strength", type=float, default=1.0,
+                        help="finger torque cap multiplier (1 = 0.64 N m per joint); raise it if heavy "
+                        "objects slip out of a firm grasp")
     parser.add_argument("--synthetic", action="store_true",
                         help="drive the right hand with a scripted grasp (no headset needed)")
     parser.add_argument("--record", action="store_true", help="start recording immediately")
@@ -96,11 +101,22 @@ def main(argv: list[str] | None = None) -> None:
 
     environment = None
     scene_environment = args.environment
-    if args.environment not in ENVIRONMENTS + ("table",):
+    from .rooms import PRESETS
+
+    if args.environment in PRESETS and args.environment not in available_environments():
+        # A preset room that isn't imported yet: import it now (Sketchfab token needed).
+        import os
+
+        from .rooms import import_room
+
+        print(f"importing the {args.environment} room (one-time)...")
+        import_room(args.environment, args.environment, os.environ.get("SKETCHFAB_API_TOKEN"))
+    if args.environment not in available_environments() + ["table"]:
         environment = Path(args.environment).expanduser().resolve()
         if not environment.is_file():
             parser.error(f"unknown environment {args.environment!r}: use one of "
-                         f"{', '.join(ENVIRONMENTS)} or an existing file")
+                         f"{', '.join(available_environments())} or an existing file "
+                         "(import rooms with `python -m superdex_quest_teleop.rooms add`)")
         scene_environment = "kitchen_island"
     if args.hand_models is not None and not (args.hand_models / "right.glb").exists():
         parser.error(f"{args.hand_models} must contain left.glb and right.glb")
@@ -125,6 +141,7 @@ def main(argv: list[str] | None = None) -> None:
         num_threads=args.threads,
         time_budget=args.time_budget if args.time_budget > 0 else None,
         hand_scale=args.hand_scale,
+        grip_strength=args.grip_strength,
         synthetic=args.synthetic,
         autostart_record=args.record,
     )

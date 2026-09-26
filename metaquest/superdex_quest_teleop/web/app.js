@@ -124,7 +124,9 @@ const island = makeIsland();
 workspace.add(island.group);
 let pack = CONFIG.pack || null;
 let materials = new MaterialLibrary(pack);
-let envName = ENVIRONMENTS.includes(CONFIG.sceneEnvironment) ? CONFIG.sceneEnvironment : 'kitchen_sink';
+let serverEnvironments = [...ENVIRONMENTS];  // + imported rooms, from the server
+let envName = CONFIG.sceneEnvironment || 'kitchen_sink';
+let fixedTableHeight = null;  // an imported room keeps its modeled surface height
 let envObject = null;
 let envLayout = null;      // the server's physical environment (colliders)
 let colliderView = null;   // debug wireframes of those colliders (K)
@@ -179,13 +181,13 @@ function rebuildEnvironment() {
   island.group.visible = islandRoom;
   if (!islandRoom) {
     const params = envLayout && envLayout.name === envName ? envLayout.params : {};
-    envObject = buildEnvironment(envName, materials, pack, params);
+    envObject = buildEnvironment(envName, materials, pack, params, envLayout);
     envObject.group.visible = !inPassthrough;
     workspace.add(envObject.group);
     envObject.setHeight(tableHeight);
   }
   const button = document.getElementById('envbutton');
-  if (button) button.textContent = `Env: ${envName.replace('_', ' ')}`;
+  if (button) button.textContent = `Env: ${envName.replace(/_/g, ' ')}`;
   applyLighting();
 }
 function setEnvironment(name) {
@@ -195,7 +197,8 @@ function setEnvironment(name) {
 // The environment is physical: switching asks the server to rebuild the
 // scene in it, and the visuals follow its geometry message.
 function nextEnvironment() {
-  const next = ENVIRONMENTS[(ENVIRONMENTS.indexOf(envName) + 1) % ENVIRONMENTS.length];
+  const list = serverEnvironments;
+  const next = list[(list.indexOf(envName) + 1) % list.length];
   if (connected) {
     command('set_environment', { environment: next });
     flash(`switching to ${next.replace('_', ' ')}…`);
@@ -210,7 +213,17 @@ function applyServerEnvironment(layout) {
   colliderView = buildColliderView(layout);
   colliderView.visible = showColliders;
   workspace.add(colliderView);
-  if (ENVIRONMENTS.includes(layout.name)) setEnvironment(layout.name);
+  const room = layout.kind === 'room';
+  const heightChanged = (room ? layout.counter_height : null) !== fixedTableHeight;
+  fixedTableHeight = room ? layout.counter_height : null;
+  if (room || ENVIRONMENTS.includes(layout.name)) setEnvironment(layout.name);
+  const desc = document.getElementById('desc');
+  if (room && desc && layout.attribution) desc.textContent = `${desc.textContent}  ·  Room: ${layout.attribution}`;
+  if (heightChanged) {
+    // A room stands on the real floor: its surface at the modeled height.
+    if (xrSession) needsRecenter = true;
+    else setAnchor(new THREE.Matrix4().makeTranslation(0, fixedTableHeight ?? DESKTOP_TABLE_HEIGHT, 0));
+  }
 }
 function toggleColliders() {
   showColliders = !showColliders;
@@ -560,6 +573,7 @@ function connect() {
       applyEnvironment(msg.environment);
       if (msg.pack && !pack) setPack(msg.pack);
       if (msg.replay) setupReplay(msg.replay);
+      if (Array.isArray(msg.environments) && msg.environments.length) serverEnvironments = msg.environments;
     } else if (msg.type === 'export') {
       if (exportReply) { exportReply(msg); exportReply = null; }
     } else if (msg.type === 'environment') {
@@ -908,7 +922,8 @@ function recenter(viewerPose) {
   forward.normalize();
   const yaw = Math.atan2(-forward.x, -forward.z);
   const m = new THREE.Matrix4().makeRotationY(yaw);
-  m.setPosition(p.x + forward.x * TABLE_AHEAD, p.y - TABLE_BELOW_HEAD + tableOffset, p.z + forward.z * TABLE_AHEAD);
+  const tableY = fixedTableHeight !== null ? fixedTableHeight : p.y - TABLE_BELOW_HEAD;
+  m.setPosition(p.x + forward.x * TABLE_AHEAD, tableY + tableOffset, p.z + forward.z * TABLE_AHEAD);
   setAnchor(m);
   panel.visible = true;
 }

@@ -166,10 +166,22 @@ LAYOUTS = {
 }
 
 
+def available_environments() -> list[str]:
+    """Built-in environments, then imported rooms (rooms.py)."""
+    from .rooms import installed_rooms
+
+    return list(ENVIRONMENTS) + [r for r in installed_rooms() if r not in ENVIRONMENTS]
+
+
 def layout_for(name: str) -> Layout:
-    if name not in LAYOUTS:
-        raise ValueError(f"unknown environment {name!r}; use one of {', '.join(LAYOUTS)}")
-    return LAYOUTS[name]()
+    if name in LAYOUTS:
+        return LAYOUTS[name]()
+    from .rooms import installed_rooms
+
+    if name in installed_rooms():
+        return Layout(name, [], [], {"room": True})
+    raise ValueError(f"unknown environment {name!r}; use one of {', '.join(available_environments())} "
+                     "(import rooms with `python -m superdex_quest_teleop.rooms add`)")
 
 
 # ----------------------------------------------------------------------------
@@ -197,8 +209,14 @@ def box_mesh(size) -> tuple[np.ndarray, np.ndarray]:
     return _BOX_NODES * np.asarray(size, np.float64), _BOX_TRIS.copy()
 
 
+# Contact smoothing band of the environment colliders [m] (default 5 mm): with
+# 1 mm, objects rest within a millimetre of the surface.
+ENV_CONTACT_SMOOTHING = 1e-3
+
+
 def _contact() -> physics.ContactParams:
-    return physics.ContactParams(coulomb_friction_coefficient=ENV_FRICTION)
+    return physics.ContactParams(coulomb_friction_coefficient=ENV_FRICTION,
+                                 penalty_smoothing_half_distance=ENV_CONTACT_SMOOTHING)
 
 
 def add_box(scene: physics.Scene, box: Box) -> physics.Actor:
@@ -252,6 +270,23 @@ class Workspace:
         self.layout = layout_for(name)
         self.name = name
         self.actors: list[physics.Actor] = []
+        self.room: dict | None = None
+        if self.layout.params.get("room"):
+            # An imported room: convex colliders and the work-surface slab;
+            # the floor stays at the modeled height below the surface.
+            from .rooms import load_room
+
+            self.room, pieces, (slab_v, slab_f) = load_room(name)
+            counter_height = float(self.room["counter_height"])
+            lo, hi = slab_v.min(0), slab_v.max(0)
+            self.layout.boxes.append(Box("work_surface", tuple(float(x) for x in (lo + hi) / 2),
+                                         tuple(float(x) for x in hi - lo), "room"))
+            for i, (v, f) in enumerate(pieces):
+                shape = physics.create_tri_mesh_shape(
+                    coordinates=np.asarray(v, np.float32).ravel(), connectivity=np.asarray(f, np.int32).ravel())
+                self.actors.append(scene.create_rigid_actor(
+                    name=f"{ENV_PREFIX}room_{i:03d}", shape=shape, collider_type=physics.ColliderType.SDF,
+                    is_static=True, contact=_contact()))
         for box in self.layout.boxes:
             self.actors.append(add_box(scene, box))
         for plane in self.layout.planes:
@@ -267,13 +302,28 @@ class Workspace:
         self.set_counter_height(counter_height)
 
     def set_counter_height(self, height: float) -> None:
-        """Put the floor ``height`` below the work surface (clamped to 0.3-1.6 m)."""
+        """Put the floor ``height`` below the work surface (clamped to 0.3-1.6 m).
+        Rooms keep their modeled height."""
+        if self.room is not None:
+            height = float(self.room["counter_height"])
         self.counter_height = float(min(max(height, 0.3), 1.6))
         self.floor.set_root_transform(physics.TransformRT(translation=[0.0, -self.counter_height, 0.0]))
 
     def message(self) -> dict:
         """The layout for the client (it builds matching visuals)."""
-        return layout_message(self.layout, self.counter_height)
+        msg = layout_message(self.layout, self.counter_height)
+        if self.room is not None:
+            from .rooms import attribution
+
+            msg.update({
+                "kind": "room", "fixed_height": True,
+                "model_url": f"/rooms/{self.name}/{self.room['model']}",
+                "physics_from_model": np.asarray(self.room["physics_from_model"]).T.ravel().tolist(),
+                "colliders_url": f"/rooms/{self.name}/colliders.glb",
+                "attribution": attribution(self.room),
+                "title": self.room.get("title") or self.name,
+            })
+        return msg
 
 
 def layout_message(layout: Layout, counter_height: float = DEFAULT_COUNTER_HEIGHT) -> dict:

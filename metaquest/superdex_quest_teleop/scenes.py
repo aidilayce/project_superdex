@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,6 +66,13 @@ class AssetRoots:
     def physics_assets(self) -> Path:
         """superdex_physics/assets (meshes used by the physics examples)."""
         return self.repo / "superdex_physics" / "assets"
+
+    @property
+    def objects(self) -> Path:
+        """Converted object library (python -m superdex_quest_teleop.objects)."""
+        from .objects import OBJECTS_DIR
+
+        return OBJECTS_DIR
 
 
 @dataclass
@@ -628,10 +636,60 @@ def discover_prefab_scenes(roots: AssetRoots) -> list[SceneSpec]:
     return specs
 
 
+def _object_builder(prefab: Path, name: str, offset=(0.0, 0.0, 0.0)):
+    def build(scene: physics.Scene, roots: AssetRoots) -> None:
+        add_prefab(scene, prefab, name, offset)
+
+    return build
+
+
+def _object_group_builder(prefabs: list[Path]):
+    """Up to 6 objects in two rows on the work surface."""
+    slots = [(-0.2, -0.09), (0.0, -0.09), (0.2, -0.09), (-0.2, 0.09), (0.0, 0.09), (0.2, 0.09)]
+
+    def build(scene: physics.Scene, roots: AssetRoots) -> None:
+        for prefab, (x, z) in zip(prefabs, slots):
+            add_prefab(scene, prefab, prefab.stem.split(".")[0], (x, 0.0, z))
+
+    return build
+
+
+def discover_object_scenes(library: Path) -> list[SceneSpec]:
+    """Scenes for the converted object library: one per object
+    (``obj_<set>_<name>``) and groups of six (``objects_<set>_<n>``)."""
+    from .objects import installed_objects
+
+    specs: list[SceneSpec] = []
+    try:
+        sets = installed_objects(library)
+    except OSError:
+        return specs
+    for set_name, prefabs in sets.items():
+        for prefab in prefabs:
+            name = prefab.stem.split(".")[0]
+            try:
+                info = json.loads((prefab.parent / "physics.json").read_text())
+            except (OSError, ValueError):
+                info = {}
+            mu = info.get("fingertip_friction", info.get("coulomb_friction", float("nan")))
+            desc = (f"{info.get('mass_kg', float('nan')) * 1000:.0f} g, fingertip friction {mu:.2f} "
+                    f"({info.get('material', '?')}) from the {set_name} set.")
+            pretty = re.sub(r"^\d+_", "", name).replace("_", " ").title()
+            specs.append(SceneSpec(f"obj_{set_name}_{name}", f"{pretty} ({set_name.upper()})", "rigid",
+                                   desc, _object_builder(prefab, name)))
+        for i in range(0, len(prefabs), 6):
+            group = prefabs[i:i + 6]
+            names = ", ".join(re.sub(r"^\d+_", "", p.stem.split(".")[0]).replace("_", " ") for p in group)
+            specs.append(SceneSpec(f"objects_{set_name}_{i // 6 + 1}",
+                                   f"{set_name.upper()} objects {i // 6 + 1}", "rigid",
+                                   f"{names} (measured masses).", _object_group_builder(group)))
+    return specs
+
+
 def scene_registry(roots: AssetRoots | None = None) -> dict[str, SceneSpec]:
     """All scenes by id, in menu order."""
     roots = roots or AssetRoots()
-    specs = discover_prefab_scenes(roots) + list(_BUILTIN)
+    specs = discover_prefab_scenes(roots) + list(_BUILTIN) + discover_object_scenes(roots.objects)
     return {spec.id: spec for spec in specs}
 
 

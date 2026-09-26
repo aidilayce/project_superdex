@@ -61,7 +61,7 @@ from aiohttp import WSCloseCode, WSMsgType, web
 from . import hand_skeleton as hs
 from .scenes import AssetRoots, SceneSpec, scene_registry
 from .session import TeleopSession
-from .workspace import DEFAULT_COUNTER_HEIGHT, ENVIRONMENTS
+from .workspace import DEFAULT_COUNTER_HEIGHT, available_environments
 
 log = logging.getLogger("superdex_quest_teleop")
 
@@ -114,6 +114,8 @@ class ServerConfig:
     # Uniform size of the simulated hands (1: the Meta XR hand asset); set by
     # the in-headset calibration (calibrate_hands) or --hand-scale.
     hand_scale: float = 1.0
+    # Finger torque cap multiplier (1: 0.64 N m per joint).
+    grip_strength: float = 1.0
     synthetic: bool = False  # drive the right hand with a scripted grasp
     autostart_record: bool = False
 
@@ -267,7 +269,7 @@ class PhysicsRunner(threading.Thread):
                         self._record_start(cmd.get("metadata"))
                 elif name == "set_environment":
                     env = cmd.get("environment")
-                    if env not in ENVIRONMENTS and env != "table":
+                    if env not in available_environments() and env != "table":
                         raise ValueError(f"unknown environment {env!r}")
                     if env != self.environment:
                         self.environment = env
@@ -304,6 +306,7 @@ class PhysicsRunner(threading.Thread):
             counter_height=self.counter_height,
             time_budget=self.config.time_budget,
             hand_scale=self.hand_scale,
+            grip_strength=self.config.grip_strength,
         )
         self._synthetic = None
         if self.config.synthetic:
@@ -592,7 +595,8 @@ class TeleopServer:
              "synthetic": self.config.synthetic,
              "environment": self._environment_info(),
              "pack": self._pack_info(),
-             "replay": self.runner.replay_info() if hasattr(self.runner, "replay_info") else None}
+             "replay": self.runner.replay_info() if hasattr(self.runner, "replay_info") else None,
+             "environments": available_environments()}
         )
         geometry = self.runner.geometry_message()
         if geometry is not None:
@@ -656,6 +660,12 @@ class TeleopServer:
             app.router.add_static("/hand_assets/", hand_dir)
         if (self.roots.assets / "prefabs").exists():
             app.router.add_static("/prefab_assets/", self.roots.assets / "prefabs")
+        from .rooms import ROOMS_DIR
+
+        if ROOMS_DIR.exists():
+            app.router.add_static("/rooms/", ROOMS_DIR)
+        if self.roots.objects.exists():
+            app.router.add_static("/object_assets/", self.roots.objects)
         if self._ibl_dir().exists():
             app.router.add_static("/ibl/", self._ibl_dir())
         self.config.pack_dir.mkdir(parents=True, exist_ok=True)

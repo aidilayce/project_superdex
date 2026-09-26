@@ -103,6 +103,7 @@ class TeleopSession:
         counter_height: float = DEFAULT_COUNTER_HEIGHT,
         time_budget: float | None = None,
         hand_scale: float = 1.0,
+        grip_strength: float = 1.0,
     ) -> None:
         if contact_mode not in CONTACT_MODES:
             raise ValueError(f"contact_mode must be one of {CONTACT_MODES}")
@@ -114,11 +115,12 @@ class TeleopSession:
         self.time_step = spec.time_step
         self.scene = build_scene(spec, roots, environment, counter_height, time_budget)
         self.environment = environment
+        self.grip_strength = grip_strength
         self.workspace = workspace_for(self.scene)
         self.hands: dict[str, HandUnit] = {
             side: HandUnit(
                 self.scene, roots, side, HAND_SPAWN[side], hand_variant, retarget_config,
-                (display_hand_models or {}).get(side), spec.time_step, hand_scale,
+                (display_hand_models or {}).get(side), spec.time_step, hand_scale, grip_strength,
             )
             for side in sides
         }
@@ -393,16 +395,19 @@ class TeleopSession:
                     }
             model = self._render_models.get(r.name)
             if model is not None:
-                # Upstream prefab GLBs are Y-up exports of Z-up actor frames,
-                # like the hand GLBs: rotate +90 deg about X into the actor.
-                try:
-                    rel = model.relative_to((self.roots.assets / "prefabs").resolve())
+                # Prefab GLBs are Y-up exports of Z-up actor frames, like the
+                # hand GLBs: rotate +90 deg about X into the actor.
+                for root, route in ((self.roots.assets / "prefabs", "/prefab_assets"),
+                                    (self.roots.objects, "/object_assets")):
+                    try:
+                        rel = model.relative_to(Path(root).resolve())
+                    except ValueError:
+                        continue
                     entry["render"] = {
-                        "url": f"/prefab_assets/{rel.as_posix()}",
+                        "url": f"{route}/{rel.as_posix()}",
                         "rotation": [float(np.sin(np.pi / 4)), 0.0, 0.0, float(np.cos(np.pi / 4))],
                     }
-                except ValueError:
-                    pass
+                    break
             if r.mesh_kind in ("surface", "visual"):
                 view = r.actor.get_visual_mesh() if r.mesh_kind == "visual" else r.actor.get_surface_mesh()
                 coords = np.asarray(view.coordinates, np.float32)
@@ -443,6 +448,7 @@ class TeleopSession:
             "precision": physics.PRECISION_NAME,
             "hand_bot": "oculus_xr (Meta XR Hand)",
             "hand_scale": {s: h.scale for s, h in self.hands.items()},
+            "grip_strength": self.grip_strength,
             "hand_link_names": {s: h.link_names for s, h in self.hands.items()},
             "hand_dof_names": hand.kinematics.dof_names if hand else [],
             "joint_names": list(hs.JOINT_NAMES),
