@@ -165,6 +165,10 @@ CONTACT_SMOOTHING = 1e-3  # [m] penalty smoothing half distance
 COLLISION_FACES = 2500
 # Render meshes are simplified to this many triangles (Quest-friendly).
 RENDER_FACES = 40000
+# Dataset fetches keep hand-held objects only (SceneSmith also has beds,
+# sofas and wardrobes): at most this heavy and this large (longest side).
+HANDHELD_MAX_KG = 5.0
+HANDHELD_MAX_SIZE = 0.6  # [m]
 
 
 def material_for(name: str, model_mu: float | None = None) -> str:
@@ -756,7 +760,8 @@ def _ycb_prefab(obj: ObjectModel, out_root: Path, origin: str) -> Path:
 
 def fetch_hf(repo: str, prefix: str, out_root: Path, cache: Path, match: str | None = None,
              limit: int | None = None, license_note: str = "", max_gb: float = 10.0,
-             keep_archives: bool = False) -> list[Path]:
+             keep_archives: bool = False, max_mass: float | None = HANDHELD_MAX_KG,
+             max_size: float | None = HANDHELD_MAX_SIZE) -> list[Path]:
     """Convert the models of a Hugging Face dataset, downloading only what they
     reference: every ``.sdf``/``.urdf`` under ``prefix`` (filtered by
     ``match``/``limit``), the meshes they name, and the materials and
@@ -807,14 +812,8 @@ def fetch_hf(repo: str, prefix: str, out_root: Path, cache: Path, match: str | N
                  sum(f.endswith((".sdf", ".urdf")) for f in files))
         for rel in models:
             get_with_deps(rel)
-        prefabs = []
-        for rel in models:
-            try:
-                prefabs.append(convert(cache / rel, out_root, extra={"license": license_note, "origin": repo}))
-            except Exception as exc:  # noqa: BLE001 - report and continue
-                log.warning("skipping %s: %s", rel, exc)
-        _write_license(out_root, license_note)
-        return prefabs
+        return convert_tree(cache, out_root, license_note=license_note, max_mass=max_mass, max_size=max_size,
+                            models=[cache / rel for rel in models])
     # Real2Sim-style folders: textured mesh + inertial parameters.
     params = sorted(f for f in files if f.endswith("inertial_params.json"))
     if match:
@@ -831,11 +830,12 @@ def fetch_hf(repo: str, prefix: str, out_root: Path, cache: Path, match: str | N
     if not params:
         tars = sorted(f for f in files if f.endswith((".tar", ".tar.gz", ".tgz")))
         if tars:
-            return _fetch_hf_archives(repo, prefix, tars, out_root, cache, match, limit, license_note,
-                                      max_gb, keep_archives, get)
+            return _fetch_hf_archives(repo, tars, out_root, cache, match, limit, license_note,
+                                      max_gb, keep_archives, get, max_mass, max_size)
         raise SystemExit(f"{repo}: no SDF/URDF models or inertial-parameter files under {prefix!r}; "
                          f"file types: {sorted({Path(f).suffix for f in files})}")
-    return convert_tree(cache / prefix, out_root, license_note=license_note)
+    return convert_tree(cache / prefix, out_root, license_note=license_note, max_mass=max_mass,
+                        max_size=max_size)
 
 
 # Files worth extracting from dataset archives (model files; textures next to meshes).
@@ -843,19 +843,20 @@ _MODEL_EXT = (".sdf", ".urdf", ".obj", ".mtl", ".gltf", ".glb", ".bin", ".ply", 
 _IMAGE_EXT = (".png", ".jpg", ".jpeg")
 
 
-def _fetch_hf_archives(repo, prefix, tars, out_root, cache, match, limit, license_note, max_gb,
-                       keep_archives, get) -> list[Path]:
-    """Datasets packed as tar archives: list them with sizes, download within
-    ``max_gb``, extract only model files (and the textures beside them),
-    convert, and report what archives without models contain."""
+def _fetch_hf_archives(repo, tars, out_root, cache, match, limit, license_note, max_gb,
+                       keep_archives, get, max_mass, max_size) -> list[Path]:
+    """Datasets packed as tar archives: list them with sizes, then download
+    them one at a time (within ``max_gb``), extract only model files (and the
+    textures beside them) and convert until ``limit`` objects are done.
+    ``match`` picks archives by name, or else models by path. Reports what
+    archives without models contain."""
     import tarfile
 
     from huggingface_hub import HfApi
 
     sizes = {}
     try:
-        for entry in HfApi().list_repo_tree(repo, path_in_repo=prefix.rstrip("/") or None,
-                                            repo_type="dataset", recursive=True):
+        for entry in HfApi().list_repo_tree(repo, repo_type="dataset", recursive=True):
             if getattr(entry, "size", None) is not None:
                 sizes[entry.path] = entry.size
     except Exception as exc:  # noqa: BLE001 - sizes are informational
@@ -866,54 +867,65 @@ def _fetch_hf_archives(repo, prefix, tars, out_root, cache, match, limit, licens
         print(f"  {t:70s} {size / 1e9:8.2f} GB" if size else f"  {t}")
     if len(tars) > 60:
         print(f"  ... {len(tars) - 60} more")
-    chosen = [t for t in tars if not match or match.lower() in t.lower()]
-    if limit:
-        chosen = chosen[:limit]
-    budget, picked = max_gb * 1e9, []
-    for t in chosen:
-        size = sizes.get(t, 0)
-        if picked and budget - size < 0:
-            break
-        if not picked and size > budget:
-            raise SystemExit(f"{t} is {size / 1e9:.1f} GB, over --max-gb {max_gb:g}: raise --max-gb "
-                             "or pick smaller archives with --match")
-        budget -= size
-        picked.append(t)
-    log.info("downloading %d archive(s), %.2f GB", len(picked), sum(sizes.get(t, 0) for t in picked) / 1e9)
+    by_name = [t for t in tars if match and match.lower() in t.lower()]
+    chosen, model_match = (by_name, None) if by_name else (tars, match)
     extracted_root = cache / "extracted"
-    report = {}
-    for t in picked:
-        archive = get(t)
-        if archive is None:
-            continue
+    budget, prefabs, report = max_gb * 1e9, [], {}
+    for t in chosen:
+        if limit and len(prefabs) >= limit:
+            break
+        size = sizes.get(t, 0)
+        if size > budget:
+            if not report:
+                raise SystemExit(f"{t} is {size / 1e9:.1f} GB, over --max-gb {max_gb:g}: raise --max-gb "
+                                 "or pick smaller archives with --match")
+            log.info("stopping: %s (%.1f GB) is over the remaining --max-gb budget", t, size / 1e9)
+            break
+        budget -= size
         dest = extracted_root / Path(t).name.split(".")[0]
-        counts: dict[str, int] = {}
-        with tarfile.open(archive) as tar:
-            members = [m for m in tar.getmembers() if m.isfile()]
-            model_dirs = {str(Path(m.name).parent) for m in members if m.name.lower().endswith(_MODEL_EXT)}
-            keep = []
-            for m in members:
-                name = m.name.lower()
-                ext = Path(name).suffix
-                counts[ext] = counts.get(ext, 0) + 1
-                if name.endswith(_MODEL_EXT) or ("inertial" in name and name.endswith(".json")) or \
-                        (ext in _IMAGE_EXT and str(Path(m.name).parent) in model_dirs):
-                    if ".." not in Path(m.name).parts and not m.name.startswith("/"):
-                        keep.append(m)
-            dest.mkdir(parents=True, exist_ok=True)
-            for m in keep:
-                tar.extract(m, dest)
-        report[t] = (len(keep), counts)
-        if not keep_archives:
-            Path(archive).unlink(missing_ok=True)
-    prefabs = convert_tree(extracted_root, out_root, license_note=license_note) if extracted_root.exists() else []
+        if not dest.exists():
+            log.info("downloading %s%s", t, f" ({size / 1e9:.2f} GB)" if size else "")
+            archive = get(t)
+            if archive is None:
+                continue
+            counts: dict[str, int] = {}
+            with tarfile.open(archive) as tar:
+                members = [m for m in tar.getmembers() if m.isfile()]
+                model_dirs = {str(Path(m.name).parent) for m in members if m.name.lower().endswith(_MODEL_EXT)}
+                keep = []
+                for m in members:
+                    name = m.name.lower()
+                    ext = Path(name).suffix
+                    counts[ext] = counts.get(ext, 0) + 1
+                    if name.endswith(_MODEL_EXT) or ("inertial" in name and name.endswith(".json")) or \
+                            (ext in _IMAGE_EXT and str(Path(m.name).parent) in model_dirs):
+                        if ".." not in Path(m.name).parts and not m.name.startswith("/"):
+                            keep.append(m)
+                tmp = dest.with_name(dest.name + ".partial")
+                shutil.rmtree(tmp, ignore_errors=True)
+                tmp.mkdir(parents=True)
+                safe = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+                for m in keep:
+                    tar.extract(m, tmp, **safe)
+                tmp.rename(dest)
+            report[t] = (len(keep), counts)
+            if not keep_archives:
+                Path(archive).unlink(missing_ok=True)
+        else:
+            report[t] = (sum(1 for f in dest.rglob("*") if f.is_file()), None)
+        prefabs += convert_tree(dest, out_root, license_note=license_note, match=model_match,
+                                limit=limit - len(prefabs) if limit else None,
+                                max_mass=max_mass, max_size=max_size)
     for t, (kept, counts) in report.items():
+        if counts is None:
+            print(f"  {Path(t).name}: already extracted ({kept} files)")
+            continue
         top = ", ".join(f"{n} {e or '(no ext)'}" for e, n in sorted(counts.items(), key=lambda x: -x[1])[:6])
         print(f"  {Path(t).name}: extracted {kept} model files (archive: {top})")
     if not prefabs:
-        print(f"No SDF/URDF models (or meshes with *inertial_params.json) in these archives: they hold "
-              f"the files listed above. Their extracted content is in {extracted_root}; convert "
-              "models there with `objects convert <folder>`.")
+        print(f"No hand-held SDF/URDF models (or meshes with *inertial_params.json) converted from these "
+              f"archives. Their extracted content is in {extracted_root}; convert models there with "
+              "`objects convert <folder>`.")
     return prefabs
 
 
@@ -929,30 +941,115 @@ def fetch_real2sim(out_root: Path = OBJECTS_DIR / "real2sim", cache: Path | None
 
 def fetch_scenesmith(out_root: Path = OBJECTS_DIR / "scenesmith", cache: Path | None = None,
                      match: str | None = None, limit: int | None = 30, max_gb: float = 10.0,
-                     keep_archives: bool = False) -> list[Path]:
+                     keep_archives: bool = False, **filters) -> list[Path]:
     """SceneSmith's generated objects (SAM-3D geometry; VLM-estimated mass and
     material, so plausible rather than measured)."""
     return fetch_hf(SCENESMITH_REPO, "", out_root, cache or out_root.parent / "_downloads" / "scenesmith",
                     match, limit, f"SceneSmith SAM-3D objects (Pfaff et al. 2026), huggingface.co/datasets/{SCENESMITH_REPO}",
-                    max_gb, keep_archives)
+                    max_gb, keep_archives, **filters)
 
 
-def convert_tree(root: Path, out_root: Path, license_note: str = "") -> list[Path]:
-    """Convert every model under ``root``: SDF/URDF files, else meshes with a
-    ``*inertial_params.json`` next to them."""
+_MASS_RE = re.compile(r"<mass>\s*([-+0-9.eE]+)\s*</mass>|<mass\s+value=\"([-+0-9.eE]+)\"")
+_NAME_RE = re.compile(r"<(?:model|robot)\s+name=\"([^\"]+)\"")
+
+
+def _declared_mass(path: Path) -> float | None:
+    m = _MASS_RE.search(path.read_text(errors="ignore"))
+    return float(m.group(1) or m.group(2)) if m else None
+
+
+def _declared_name(path: Path) -> str:
+    m = _NAME_RE.search(path.read_text(errors="ignore"))
+    name = m.group(1) if m else path.stem
+    if re.sub(r"\.(urdf|sdf)$", "", name.lower()) in ("model", "object", "robot"):
+        name = path.parent.name
+    return _slug(name)
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_]+", "_", text).strip("_") or "object"
+
+
+def _visual_size(obj: ObjectModel) -> float:
+    """Longest side [m] of the object's bounding box (visual, else collision)."""
+    import trimesh
+
+    pts = []
+    for scene, T in obj.visual:
+        if scene.bounds is not None:
+            corners = trimesh.bounds.corners(scene.bounds)
+            pts.append(corners @ T[:3, :3].T + T[:3, 3])
+    if not pts:
+        for _, _, T, mesh in obj.collision:
+            if mesh is not None and getattr(mesh, "bounds", None) is not None:
+                pts.append(trimesh.bounds.corners(mesh.bounds) @ T[:3, :3].T + T[:3, 3])
+    if not pts:
+        return 0.0
+    pts = np.concatenate(pts)
+    return float(np.max(pts.max(0) - pts.min(0)))
+
+
+def convert_tree(root: Path, out_root: Path, license_note: str = "", match: str | None = None,
+                 limit: int | None = None, max_mass: float | None = None, max_size: float | None = None,
+                 models: list[Path] | None = None) -> list[Path]:
+    """Convert every model under ``root`` (or the given ``models``): SDF/URDF
+    files, else meshes with a ``*inertial_params.json`` next to them.
+
+    ``match`` filters model paths, ``limit`` caps the conversions, and
+    ``max_mass``/``max_size`` skip objects too heavy or too large to handle
+    (furniture). Models that share a name (SceneSmith names every bed
+    "bed") get their folder name appended, so none overwrites another."""
     root = Path(root)
-    prefabs, done = [], set()
-    for model in sorted(list(root.rglob("*.sdf")) + list(root.rglob("*.urdf"))):
-        if model.stem.endswith("_scaled"):
-            continue  # SceneSmith's rescaled duplicate of the same model
+    if models is None:
+        models = sorted(list(root.rglob("*.sdf")) + list(root.rglob("*.urdf")))
+        # SceneSmith's rescaled duplicate of the same model.
+        models = [m for m in models if not m.stem.endswith("_scaled")]
+    if match:
+        models = [m for m in models if match.lower() in str(m.relative_to(root)).lower()]
+    names = {m: _declared_name(m) for m in models}
+    counts: dict[str, int] = {}
+    for n in names.values():
+        counts[n] = counts.get(n, 0) + 1
+    prefabs, done, skipped = [], set(), []
+
+    def unique(model: Path, name: str) -> str:
+        if counts.get(name, 0) <= 1:
+            return name
+        folder = _slug(model.parent.name if model.parent != root else model.stem)
+        return folder if name.lower() in folder.lower() else f"{name}_{folder[:24]}"
+
+    def fits(label: str, mass: float | None, size: float | None = None) -> bool:
+        if max_mass and mass is not None and mass > max_mass:
+            skipped.append(f"{label} ({mass:g} kg)")
+            return False
+        if max_size and size is not None and size > max_size:
+            skipped.append(f"{label} ({size:.2f} m)")
+            return False
+        return True
+
+    for model in models:
+        if limit and len(prefabs) >= limit:
+            break
+        name = names[model]
         try:
-            prefabs.append(convert(model, out_root, extra={"license": license_note}))
+            if not fits(name, _declared_mass(model)):
+                continue
+            obj = parse_sdf(model) if model.suffix == ".sdf" else parse_urdf(model)
+            if not fits(name, obj.mass, _visual_size(obj)):
+                continue
+            obj.name = unique(model, name)
+            prefabs.append(write_prefab(obj, out_root, extra={"license": license_note}))
             done.add(model.parent)
         except Exception as exc:  # noqa: BLE001 - report and continue
             log.warning("skipping %s: %s", model, exc)
-    for params in sorted(root.rglob("*inertial_params.json")):
+    params_files = [] if models and done else sorted(root.rglob("*inertial_params.json"))
+    for params in params_files:
+        if limit and len(prefabs) >= limit:
+            break
         folder = params.parent
         if folder in done or any(d in folder.parents for d in done):
+            continue
+        if match and match.lower() not in str(folder.relative_to(root)).lower():
             continue
         meshes = sorted(folder.rglob("textured_mesh.obj")) or sorted(folder.rglob("*.obj"))
         if not meshes:
@@ -960,10 +1057,15 @@ def convert_tree(root: Path, out_root: Path, license_note: str = "") -> list[Pat
         try:
             obj = parse_mesh_with_inertia(meshes[0], params)
             obj.name = folder.name
+            if not fits(obj.name, obj.mass, _visual_size(obj)):
+                continue
             prefabs.append(write_prefab(obj, out_root, extra={"license": license_note}))
         except Exception as exc:  # noqa: BLE001
             log.warning("skipping %s: %s", folder, exc)
-    if license_note:
+    if skipped:
+        log.info("skipped %d objects too heavy (> %g kg) or large (> %g m) to handle: %s%s", len(skipped),
+                 max_mass or 0, max_size or 0, ", ".join(skipped[:8]), " ..." if len(skipped) > 8 else "")
+    if license_note and prefabs:
         _write_license(out_root, license_note)
     return prefabs
 
@@ -991,7 +1093,11 @@ def main(argv: list[str] | None = None) -> None:
     f = sub.add_parser("fetch", help="download and convert an object set")
     f.add_argument("set", choices=("ycb", "real2sim", "scenesmith", "all"))
     f.add_argument("--match", default=None, help="only models whose path contains this text")
-    f.add_argument("--limit", type=int, default=None, help="at most this many models/archives (scenesmith: 30)")
+    f.add_argument("--limit", type=int, default=None, help="convert at most this many objects (scenesmith: 30)")
+    f.add_argument("--max-mass", type=float, default=HANDHELD_MAX_KG,
+                   help="skip objects heavier than this [kg] (default %(default)g; 0: keep all)")
+    f.add_argument("--max-size", type=float, default=HANDHELD_MAX_SIZE,
+                   help="skip objects whose longest side exceeds this [m] (default %(default)g; 0: keep all)")
     f.add_argument("--max-gb", type=float, default=10.0, help="download budget for archive datasets [GB]")
     f.add_argument("--keep-archives", action="store_true", help="keep downloaded archives after extraction")
     c = sub.add_parser("convert", help="convert SDF/URDF files or folders")
@@ -1010,12 +1116,13 @@ def main(argv: list[str] | None = None) -> None:
     if args.cmd == "fetch":
         if args.set in ("ycb", "all"):
             fetch_ycb(args.out / "ycb")
+        filters = dict(max_mass=args.max_mass or None, max_size=args.max_size or None)
         if args.set in ("real2sim", "all"):
             fetch_real2sim(args.out / "real2sim", match=args.match, limit=args.limit, max_gb=args.max_gb,
-                           keep_archives=args.keep_archives)
+                           keep_archives=args.keep_archives, **filters)
         if args.set in ("scenesmith", "all"):
             fetch_scenesmith(args.out / "scenesmith", match=args.match, limit=args.limit or 30,
-                             max_gb=args.max_gb, keep_archives=args.keep_archives)
+                             max_gb=args.max_gb, keep_archives=args.keep_archives, **filters)
     elif args.cmd == "convert":
         for p in args.paths:
             if p.is_dir():

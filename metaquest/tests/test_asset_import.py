@@ -183,3 +183,57 @@ def test_room_import_and_physics(tmp_path, monkeypatch, superdex_initialized):
     finally:
         forget_scene(scene)
         physics.destroy_scene(scene)
+
+
+def _sdf_object(folder, name, mass, size):
+    folder.mkdir(parents=True)
+    _box((size, size * 0.8, size * 0.6), (0, 0, 0)).export(folder / "mesh.obj")
+    (folder / f"{name}.sdf").write_text(SDF.format(name=name, mass=mass, visual="mesh.obj", mu=0.5))
+
+
+def test_dataset_archive_filters_and_names(tmp_path, monkeypatch, superdex_initialized):
+    """SceneSmith-style archives: furniture is skipped, same-named objects
+    get distinct prefabs, and --limit counts objects across archives."""
+    import sys
+    import tarfile
+    import types
+
+    from superdex_quest_teleop import objects
+
+    src = tmp_path / "src"
+    for i in range(3):
+        _sdf_object(src / "a" / f"bed_{i:03d}", "bed", 70.0, 2.0)  # furniture: skipped
+    for i in range(3):
+        _sdf_object(src / "a" / f"mug_{i:03d}", "mug", 0.3, 0.1)
+    _sdf_object(src / "b" / "bowl_000", "bowl", 0.4, 0.15)
+    archives = {}
+    for part in ("a", "b"):
+        archives[f"objects_{part}.tar"] = tmp_path / f"objects_{part}.tar"
+        with tarfile.open(archives[f"objects_{part}.tar"], "w") as tar:
+            tar.add(src / part, arcname=part)
+
+    class FakeApi:
+        def list_repo_tree(self, *a, **k):
+            return [types.SimpleNamespace(path=t, size=1000) for t in archives]
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeApi))
+    fetched = []
+
+    def get(rel):
+        fetched.append(rel)
+        return archives[rel]
+
+    out = tmp_path / "library" / "scenesmith"
+    prefabs = objects._fetch_hf_archives("repo", sorted(archives), out, tmp_path / "cache", None, 2, "note",
+                                         10.0, True, get, objects.HANDHELD_MAX_KG, objects.HANDHELD_MAX_SIZE)
+    assert [p.parent.name for p in prefabs] == ["mug_000", "mug_001"]
+    assert fetched == ["objects_a.tar"]  # the limit was reached in the first archive
+
+    prefabs = objects._fetch_hf_archives("repo", sorted(archives), out, tmp_path / "cache", None, 10, "note",
+                                         10.0, True, get, objects.HANDHELD_MAX_KG, objects.HANDHELD_MAX_SIZE)
+    assert sorted(p.parent.name for p in prefabs) == ["bowl", "mug_000", "mug_001", "mug_002"]
+    assert fetched == ["objects_a.tar", "objects_b.tar"]  # a was already extracted
+    assert not any("bed" in p.name for p in out.iterdir())
+
+    beds = objects.convert_tree(tmp_path / "cache" / "extracted", tmp_path / "all", match="bed")
+    assert sorted(p.parent.name for p in beds) == ["bed_000", "bed_001", "bed_002"]

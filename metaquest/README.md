@@ -376,7 +376,7 @@ converted object becomes a scene.
 uv pip install trimesh scipy scikit-image rtree fast-simplification coacd huggingface_hub
 uv run --no-project python -m superdex_quest_teleop.objects fetch ycb          # 17 YCB objects (about 2 min)
 uv run --no-project python -m superdex_quest_teleop.objects fetch real2sim     # Scalable Real2Sim benchmark objects
-uv run --no-project python -m superdex_quest_teleop.objects fetch scenesmith --limit 50 [--match mug]
+uv run --no-project python -m superdex_quest_teleop.objects fetch scenesmith --limit 30 [--match mug]
 uv run --no-project python -m superdex_quest_teleop.objects convert my_model.sdf --set mine [--material plastic]
 uv run --no-project python -m superdex_quest_teleop.objects list
 ```
@@ -385,11 +385,18 @@ Then pick `obj_ycb_011_banana` (one object) or `objects_ycb_1`… (six
 objects on the counter) from the scene menu.
 
 The Real2Sim and SceneSmith datasets are packed as tar archives. `fetch`
-lists them with their sizes, downloads up to `--max-gb` (default 10 GB;
-`--match TEXT` and `--limit N` pick archives), extracts only model files
-(SDF/URDF, meshes, their textures, `*inertial_params.json`), converts them
-and deletes the archives (`--keep-archives` keeps them). Archives that hold
-raw capture data instead of models are reported with their contents.
+lists them with their sizes, then downloads them one at a time (up to
+`--max-gb`, default 10 GB), extracts only model files (SDF/URDF, meshes,
+their textures, `*inertial_params.json`) and converts until `--limit N`
+objects are done (SceneSmith default: 30). `--match TEXT` picks archives by
+name, or else objects by path. The archives are deleted after extraction
+(`--keep-archives` keeps them); a rerun reuses what was extracted.
+
+Only hand-held objects are converted: SceneSmith also contains beds, sofas
+and wardrobes, so objects heavier than `--max-mass` (default 5 kg) or longer
+than `--max-size` (default 0.6 m) are skipped (`0` keeps everything).
+Objects that share a name (SceneSmith names every mug "mug") get their
+folder name appended (`mug_0a1b…`), so none overwrites another.
 
 | Set | Objects | Mass | Geometry |
 | :-- | :-- | :-- | :-- |
