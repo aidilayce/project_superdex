@@ -384,6 +384,13 @@ uv run --no-project python -m superdex_quest_teleop.objects list
 Then pick `obj_ycb_011_banana` (one object) or `objects_ycb_1`… (six
 objects on the counter) from the scene menu.
 
+The Real2Sim and SceneSmith datasets are packed as tar archives. `fetch`
+lists them with their sizes, downloads up to `--max-gb` (default 10 GB;
+`--match TEXT` and `--limit N` pick archives), extracts only model files
+(SDF/URDF, meshes, their textures, `*inertial_params.json`), converts them
+and deletes the archives (`--keep-archives` keeps them). Archives that hold
+raw capture data instead of models are reported with their contents.
+
 | Set | Objects | Mass | Geometry |
 | :-- | :-- | :-- | :-- |
 | `ycb` | The 16 YCB-Video objects (cans, boxes, mustard bottle, banana, pear, strawberry, drill, hammer, scissors, clamp, tennis ball, foam brick, …) and the sugar box | Measured, from the YCB paper (Calli et al. 2015); model files that disagree are corrected (the foam brick file says 28 g; YCB measured 59 g) | Textured scans (pybullet-object-models, Drake models) |
@@ -426,15 +433,29 @@ friction, collision shape and source.
 
 ## Rooms (Sketchfab or any glTF) as physical environments
 
-Beyond the built-in kitchens, any room model can be the environment: the
-Sketchfab rooms below, or any glTF/GLB/zip. `rooms.py` imports a room into
-`~/.superdex_quest_teleop/rooms` and makes it physical around a table or desk:
+Beyond the built-in kitchens, any room model can be the environment: a
+downloadable Sketchfab model, or any glTF/GLB/zip. `rooms.py` imports a room
+into `~/.superdex_quest_teleop/rooms` and makes it physical around a table or
+desk. Only models whose authors allow downloads can be imported: the
+Archilogic "221B Baker Street", "Modern Retro Apartment" and "Living Room"
+(08c0ae41…) have downloads disabled, so the presets are downloadable rooms
+in the same spirit:
+
+| Preset | Sketchfab model |
+| :-- | :-- |
+| `sherlock_221b` | [Isometric Room - 221B Baker Street](https://sketchfab.com/3d-models/isometric-room-221b-baker-street-d72ffc510efe48d48bf519612bbaac42) (cjbarron) |
+| `victorian_living_room` | [Victorian Living Room](https://sketchfab.com/3d-models/victorian-living-room-31855a7fc439491c97d621eb25c59bcc) (justynkrupa15) |
+| `retro_apartment` | [Modern apartment interior](https://sketchfab.com/3d-models/modern-apartment-interior-400c9069181a4342a7142433dfa3466e), old style (Katydid) |
+| `apartment` | [Living room + kitchen + bedroom](https://sketchfab.com/3d-models/living-roomkitchenbedroom-1f9a624a807f457488b9ae8e101d76d0) (Katydid) |
+| `living_room` | [Modern Living Room](https://sketchfab.com/3d-models/modern-living-room-ec7179648b1e43739104994d64e95673) (Visthétique) |
+| `cozy_living_room` | [Cozy living room baked](https://sketchfab.com/3d-models/cozy-living-room-baked-581238dc5fda4dc990571cdc02827783) (ChristyHsu) |
 
 ```bash
 export SKETCHFAB_API_TOKEN=...   # sketchfab.com -> Settings -> Password & API
-uv run --no-project python -m superdex_quest_teleop.rooms add retro_apartment   # "Modern Retro Apartment"
-uv run --no-project python -m superdex_quest_teleop.rooms add sherlock_221b     # "221B Baker Street - Sherlock - Archilogic"
-uv run --no-project python -m superdex_quest_teleop.rooms add living_room       # "Living Room"
+uv run --no-project python -m superdex_quest_teleop.rooms search "victorian study"   # downloadable models only
+uv run --no-project python -m superdex_quest_teleop.rooms add <uid> --name study
+uv run --no-project python -m superdex_quest_teleop.rooms add sherlock_221b
+uv run --no-project python -m superdex_quest_teleop.rooms add living_room
 uv run --no-project python -m superdex_quest_teleop.rooms add ~/Downloads/some_room.zip --name den   # a downloaded glTF
 uv run --no-project python -m superdex_quest_teleop.rooms surfaces sherlock_221b            # work-surface candidates
 uv run --no-project python -m superdex_quest_teleop.rooms add sherlock_221b --surface 2     # use another one

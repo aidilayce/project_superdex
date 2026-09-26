@@ -67,22 +67,41 @@ log = logging.getLogger("superdex_quest_teleop")
 ROOMS_DIR = Path(os.environ.get("SUPERDEX_TELEOP_ROOMS", Path.home() / ".superdex_quest_teleop" / "rooms"))
 SKETCHFAB_API = "https://api.sketchfab.com/v3/models"
 
-# The rooms asked for, by Sketchfab uid.
+# Downloadable ("Download Free 3D model") Sketchfab rooms, by uid. The rooms
+# first asked for (Archilogic's "221B Baker Street", "Modern Retro
+# Apartment", "Living Room" 08c0ae41...) have downloads disabled by their
+# authors, so these are the closest downloadable alternatives; find more with
+# `rooms search`.
 PRESETS = {
-    "retro_apartment": {
-        "uid": "dbca6b52dd154e648a8df9931d92ef3d",
-        "title": "Modern Retro Apartment",
-        "url": "https://sketchfab.com/3d-models/modern-retro-apartment-dbca6b52dd154e648a8df9931d92ef3d",
-    },
     "sherlock_221b": {
-        "uid": "69be107ca5234ca8a9fcff6ba6851e9e",
-        "title": "221B Baker Street - Sherlock - Archilogic",
-        "url": "https://sketchfab.com/3d-models/221b-baker-street-sherlock-archilogic-69be107ca5234ca8a9fcff6ba6851e9e",
+        "uid": "d72ffc510efe48d48bf519612bbaac42",
+        "title": "Isometric Room - 221B Baker Street (cjbarron)",
+        "url": "https://sketchfab.com/3d-models/isometric-room-221b-baker-street-d72ffc510efe48d48bf519612bbaac42",
+    },
+    "victorian_living_room": {
+        "uid": "31855a7fc439491c97d621eb25c59bcc",
+        "title": "Victorian Living Room (justynkrupa15)",
+        "url": "https://sketchfab.com/3d-models/victorian-living-room-31855a7fc439491c97d621eb25c59bcc",
+    },
+    "retro_apartment": {
+        "uid": "400c9069181a4342a7142433dfa3466e",
+        "title": "Modern apartment interior, old style (Katydid)",
+        "url": "https://sketchfab.com/3d-models/modern-apartment-interior-400c9069181a4342a7142433dfa3466e",
+    },
+    "apartment": {
+        "uid": "1f9a624a807f457488b9ae8e101d76d0",
+        "title": "Living room + kitchen + bedroom (Katydid)",
+        "url": "https://sketchfab.com/3d-models/living-roomkitchenbedroom-1f9a624a807f457488b9ae8e101d76d0",
     },
     "living_room": {
-        "uid": "08c0ae4197244e6db2fef87d3cf0a473",
-        "title": "Living Room",
-        "url": "https://sketchfab.com/3d-models/living-room-08c0ae4197244e6db2fef87d3cf0a473",
+        "uid": "ec7179648b1e43739104994d64e95673",
+        "title": "Modern Living Room (Visthetique)",
+        "url": "https://sketchfab.com/3d-models/modern-living-room-ec7179648b1e43739104994d64e95673",
+    },
+    "cozy_living_room": {
+        "uid": "581238dc5fda4dc990571cdc02827783",
+        "title": "Cozy living room baked (ChristyHsu)",
+        "url": "https://sketchfab.com/3d-models/cozy-living-room-baked-581238dc5fda4dc990571cdc02827783",
     },
 }
 
@@ -126,7 +145,10 @@ def sketchfab_download(uid: str, dest: Path, token: str | None) -> tuple[Path, d
         "downloadable": meta.get("isDownloadable"),
     }
     if not meta.get("isDownloadable"):
-        raise SystemExit(f"{info['title']!r} ({info['source']}) is not downloadable on Sketchfab")
+        raise SystemExit(
+            f"{info['title']!r} ({info['source']}) is not downloadable: its author disabled downloads on "
+            "Sketchfab, so no token can fetch it. Find downloadable rooms with "
+            "`rooms search \"living room\"` (or pick a preset: " + ", ".join(PRESETS) + ").")
     if not token:
         raise SystemExit(
             "Sketchfab downloads need your API token: sketchfab.com -> Settings -> Password & API -> "
@@ -143,6 +165,26 @@ def sketchfab_download(uid: str, dest: Path, token: str | None) -> tuple[Path, d
     with urllib.request.urlopen(choice["url"], timeout=600) as r, open(archive, "wb") as f:
         shutil.copyfileobj(r, f)
     return archive, info
+
+
+def sketchfab_search(query: str, count: int = 24, token: str | None = None) -> list[dict]:
+    """Downloadable Sketchfab models matching ``query`` (most liked first)."""
+    import urllib.parse
+
+    params = urllib.parse.urlencode({"type": "models", "q": query, "downloadable": "true",
+                                     "count": count, "sort_by": "-likeCount"})
+    data = _http_json(f"https://api.sketchfab.com/v3/search?{params}", token)
+    out = []
+    for m in data.get("results", []):
+        lic = m.get("license")
+        out.append({
+            "uid": m.get("uid"), "name": m.get("name"),
+            "author": (m.get("user") or {}).get("displayName") or (m.get("user") or {}).get("username"),
+            "license": lic.get("label") if isinstance(lic, dict) else lic,
+            "faces": m.get("faceCount"), "likes": m.get("likeCount"),
+            "url": m.get("viewerUrl") or f"https://sketchfab.com/3d-models/{m.get('uid')}",
+        })
+    return out
 
 
 def _extract(path: Path, dest: Path) -> Path:
@@ -592,9 +634,21 @@ def main(argv: list[str] | None = None) -> None:
     srf = sub.add_parser("surfaces", help="list the work-surface candidates of an imported room")
     srf.add_argument("name")
     sub.add_parser("list", help="list imported rooms")
+    sea = sub.add_parser("search", help="search Sketchfab for downloadable rooms")
+    sea.add_argument("query", nargs="+")
+    sea.add_argument("--count", type=int, default=24)
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
+    if args.cmd == "search":
+        results = sketchfab_search(" ".join(args.query), args.count, os.environ.get("SKETCHFAB_API_TOKEN"))
+        for r in results:
+            faces = f"{r['faces'] / 1000:.0f}k tris" if r.get("faces") else ""
+            print(f"{r['uid']}  {str(r['name'])[:40]:40s} {str(r['author'])[:18]:18s} "
+                  f"{str(r['license'] or '')[:22]:22s} {faces:>10s}  {r['url']}")
+        print("Import one: python -m superdex_quest_teleop.rooms add <uid> --name my_room"
+              "   (under ~500k triangles runs best on the Quest)")
+        return
     if args.cmd == "add":
         name = args.name or (args.source if args.source in PRESETS or args.source in installed_rooms(args.root)
                              else re.sub(r"[^A-Za-z0-9_]+", "_", Path(args.source).stem).strip("_").lower())
