@@ -53,6 +53,11 @@ cd metaquest
 uv run --no-project python -m superdex_quest_teleop --list-scenes
 ```
 
+All commands below run from `metaquest/` with `uv run --no-project python
+...`, which uses the repository's `.venv` (macOS has no plain `python`
+command; alternatively `source ../.venv/bin/activate` once per terminal and
+drop the `uv run --no-project` prefix).
+
 The PC serves everything the headset needs, including a bundled copy of
 three.js, so the headset doesn't need internet access. Optional extras:
 `uv pip install -e "metaquest[assets]"` for the object and room importers,
@@ -202,8 +207,8 @@ into `~/.superdex_quest_teleop/assets` in the background, and connected
 headsets switch to it as soon as it's ready. You can also fetch it yourself:
 
 ```bash
-python -m superdex_quest_teleop.environment              # 1k textures (Quest)
-python -m superdex_quest_teleop.environment --resolution 2k
+uv run --no-project python -m superdex_quest_teleop.environment              # 1k textures (Quest)
+uv run --no-project python -m superdex_quest_teleop.environment --resolution 2k
 ```
 
 It contains:
@@ -255,11 +260,11 @@ from a SMPL-X model and a BEDLAM (or BEDLAM 2.0) scanned skin texture. It:
 Run it where BEDLAM lives (e.g. your cluster):
 
 ```bash
-python -m superdex_quest_teleop.bedlam_hands --smplx /path/to/smplx/SMPLX_NEUTRAL.npz \
+uv run --no-project python -m superdex_quest_teleop.bedlam_hands --smplx /path/to/smplx/SMPLX_NEUTRAL.npz \
     --bedlam-root /CT/datasets10/static00/BEDLAM --list            # list skin textures
-python -m superdex_quest_teleop.bedlam_hands --smplx /path/to/smplx/SMPLX_NEUTRAL.npz \
+uv run --no-project python -m superdex_quest_teleop.bedlam_hands --smplx /path/to/smplx/SMPLX_NEUTRAL.npz \
     --bedlam-root /CT/datasets26/static00/BEDLAM_2 --texture-match <name> --out ~/bedlam_hands
-python -m superdex_quest_teleop --hand-models ~/bedlam_hands
+uv run --no-project python -m superdex_quest_teleop --hand-models ~/bedlam_hands
 ```
 
 Notes:
@@ -369,11 +374,11 @@ converted object becomes a scene.
 
 ```bash
 uv pip install trimesh scipy scikit-image rtree fast-simplification coacd huggingface_hub
-python -m superdex_quest_teleop.objects fetch ycb          # 17 YCB objects (about 2 min)
-python -m superdex_quest_teleop.objects fetch real2sim     # Scalable Real2Sim benchmark objects
-python -m superdex_quest_teleop.objects fetch scenesmith --limit 50 [--match mug]
-python -m superdex_quest_teleop.objects convert my_model.sdf --set mine [--material plastic]
-python -m superdex_quest_teleop.objects list
+uv run --no-project python -m superdex_quest_teleop.objects fetch ycb          # 17 YCB objects (about 2 min)
+uv run --no-project python -m superdex_quest_teleop.objects fetch real2sim     # Scalable Real2Sim benchmark objects
+uv run --no-project python -m superdex_quest_teleop.objects fetch scenesmith --limit 50 [--match mug]
+uv run --no-project python -m superdex_quest_teleop.objects convert my_model.sdf --set mine [--material plastic]
+uv run --no-project python -m superdex_quest_teleop.objects list
 ```
 
 Then pick `obj_ycb_011_banana` (one object) or `objects_ycb_1`… (six
@@ -427,13 +432,13 @@ Sketchfab rooms below, or any glTF/GLB/zip. `rooms.py` imports a room into
 
 ```bash
 export SKETCHFAB_API_TOKEN=...   # sketchfab.com -> Settings -> Password & API
-python -m superdex_quest_teleop.rooms add retro_apartment   # "Modern Retro Apartment"
-python -m superdex_quest_teleop.rooms add sherlock_221b     # "221B Baker Street - Sherlock - Archilogic"
-python -m superdex_quest_teleop.rooms add living_room       # "Living Room"
-python -m superdex_quest_teleop.rooms add ~/Downloads/some_room.zip --name den   # a downloaded glTF
-python -m superdex_quest_teleop.rooms surfaces sherlock_221b            # work-surface candidates
-python -m superdex_quest_teleop.rooms add sherlock_221b --surface 2     # use another one
-python -m superdex_quest_teleop --environment sherlock_221b --scene objects_ycb_1
+uv run --no-project python -m superdex_quest_teleop.rooms add retro_apartment   # "Modern Retro Apartment"
+uv run --no-project python -m superdex_quest_teleop.rooms add sherlock_221b     # "221B Baker Street - Sherlock - Archilogic"
+uv run --no-project python -m superdex_quest_teleop.rooms add living_room       # "Living Room"
+uv run --no-project python -m superdex_quest_teleop.rooms add ~/Downloads/some_room.zip --name den   # a downloaded glTF
+uv run --no-project python -m superdex_quest_teleop.rooms surfaces sherlock_221b            # work-surface candidates
+uv run --no-project python -m superdex_quest_teleop.rooms add sherlock_221b --surface 2     # use another one
+uv run --no-project python -m superdex_quest_teleop --environment sherlock_221b --scene objects_ycb_1
 ```
 
 The presets also import on first use with `--environment NAME` when
